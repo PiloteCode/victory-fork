@@ -58,7 +58,7 @@ shaders and emulates the one instruction.
    for box nodes; a watertight ray/triangle test for triangle nodes; both forms
    of the instruction. A plain Rust reference lives in
    `crates/victory-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
-   over 311 ray/node cases and compare with the reference bit for bit.
+   over 313 ray/node cases and compare with the reference bit for bit.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
@@ -194,11 +194,12 @@ shaders and emulates the one instruction.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
-  of two boxes entered at the same distance, and the result for a ray exactly
-  through an edge; that `USE_THREAD_DIMENSIONS` launches exactly the counted
-  threads, the last group cut short (the flags carry no `PARTIAL_TG_EN`, but
-  the box stages place their payloads by the lanes in EXEC, which only a cut
-  short wave makes right).
+  of two boxes entered at the same distance, the result for a ray exactly
+  through an edge, and what a child that is not there returns when the ray
+  enters its box (here: a miss); that `USE_THREAD_DIMENSIONS` launches exactly
+  the counted threads, the last group cut short (the flags carry no
+  `PARTIAL_TG_EN`, but the box stages place their payloads by the lanes in
+  EXEC, which only a cut short wave makes right).
 - Cost on the GPU is unmeasured.
 
 ## Where to look
