@@ -496,8 +496,10 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. While the title's window has focus, the keyboard
+supplements the first connected pad (including Enter = A). With none
+connected, it drives a stand-in pad. Keyboard directions take priority
+while pressed; releasing them restores the controller's stick values:
 
 | Keys | Pad |
 |------|-----|
