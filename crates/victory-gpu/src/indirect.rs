@@ -2523,8 +2523,15 @@ void main(uint3 g : SV_GroupID) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
-        let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
+        // Three records of 65,535 x 16 groups (about half the budget each)
+        // and a small one after them, clamped together: a group charges its
+        // records in lane order, so the small one is charged after the big
+        // ones have spent the budget. (Clamped apart, in two clamps, they
+        // were not ordered on the card: a clamp into the list's ring has no
+        // barrier before it, and the one after it orders the indirect read,
+        // not the next clamp; the card ran the small one's charge first and
+        // the record ran, RTX 5090. The software adapter kept the order.)
+        let Some((big, big_ptr)) = host.shared_buffer(4 * u64::from(STRIDE)) else {
             return;
         };
         let Some((small, small_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
@@ -2543,15 +2550,17 @@ void main(uint3 g : SV_GroupID) {
                     12,
                 );
             }
+            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), big_ptr.add(3 * STRIDE as usize), 12);
             std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
             std::ptr::write_bytes(hits_ptr, 0, 256);
         }
         // SAFETY: a live buffer.
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
-            // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
-            let (scratch, at) = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            // Spends the budget (the big records, clamped, not executed),
+            // then the small record after them, executed: one group.
+            let (scratch, at) = bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 4)).unwrap();
+            let at = at + 3 * u64::from(STRIDE);
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
             unsafe {
