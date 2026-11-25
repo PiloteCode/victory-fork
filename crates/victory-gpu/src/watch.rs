@@ -586,8 +586,9 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
-/// Held shared by a read of title memory in place, and alone by the runtime
-/// while it changes what title memory shows.
+/// The ranges of title memory read in place, and those whose mapping the
+/// runtime is changing ([`title_memory_reading_range`],
+/// [`title_memory_remapping_range`]).
 ///
 /// The runtime does not change a mapping in one step. To unmap one page of
 /// a view it unmaps the whole view and maps what stays again
@@ -599,40 +600,144 @@ pub fn writing(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+///
+/// That was one lock over all of title memory, shared by the reads and
+/// taken alone by each change, which let no read begin while a change
+/// waited. While the world streams in, the title's threads change mappings
+/// without pause, and the submitting thread's texture refreshes waited
+/// 1.0-6.7 s a frame for the lock (the first run on an RTX 5090: 95-99 %
+/// of the frame line's "textures", frames of 2-8 s). A read and a change
+/// only have to wait for each other where their ranges meet, and they
+/// seldom do: the texture read is one the title draws with, the pages
+/// changed are others streaming in. Each now holds its own range here.
+struct Holders {
+    /// `[start, end)` of each read in place under way.
+    reading: Vec<(usize, usize)>,
+    /// `[start, end)` of each change of mapping under way, or waiting for
+    /// the reads that meet it: a read that meets one waits, so reads that
+    /// keep beginning do not hold a change off.
+    changing: Vec<(usize, usize)>,
+    /// Threads waiting for a holder to go (no wake-up when there are none).
+    waiting: usize,
+}
+
+static HOLDERS: Mutex<Holders> = Mutex::new(Holders {
+    reading: Vec::new(),
+    changing: Vec::new(),
+    waiting: 0,
+});
+static HOLDER_GONE: std::sync::Condvar = std::sync::Condvar::new();
+
+fn holders() -> std::sync::MutexGuard<'static, Holders> {
+    HOLDERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a held range meets `[start, end)`; an empty range meets none.
+fn meets(held: &[(usize, usize)], start: usize, end: usize) -> bool {
+    start < end && held.iter().any(|&(s, e)| s < end && start < e)
+}
+
+/// Waits while `busy` holds of the holders.
+fn wait_while<'a>(
+    mut h: std::sync::MutexGuard<'a, Holders>,
+    busy: impl Fn(&Holders) -> bool,
+) -> std::sync::MutexGuard<'a, Holders> {
+    while busy(&h) {
+        h.waiting += 1;
+        h = HOLDER_GONE.wait(h).unwrap_or_else(|e| e.into_inner());
+        h.waiting -= 1;
+    }
+    h
+}
+
+/// A range held, let go when dropped.
+struct Held {
+    start: usize,
+    end: usize,
+    change: bool,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut h = holders();
+        let list = if self.change { &mut h.changing } else { &mut h.reading };
+        if let Some(i) = list.iter().position(|&r| r == (self.start, self.end)) {
+            list.swap_remove(i);
+        }
+        if h.waiting > 0 {
+            HOLDER_GONE.notify_all();
+        }
+    }
+}
+
+/// `[at, at + len)`, cut at the end of the address space.
+fn span(at: usize, len: usize) -> (usize, usize) {
+    (at, at.saturating_add(len))
+}
 
 /// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+/// ([`title_memory_remapping_range`]).
+pub struct Remapping(#[allow(dead_code)] Held);
 
 /// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
+/// memory, anywhere: [`title_memory_remapping_range`] over all of it.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    title_memory_remapping_range(0, usize::MAX)
 }
 
-/// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
-
-/// For reading title memory in place: until what it returns is dropped,
-/// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
-pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+/// The runtime is about to map, unmap or move physical pages of title
+/// memory within `[at, at + len)`: until what it returns is dropped, no
+/// read in place of that range is under way and none begins
+/// ([`title_memory_reading_range`]). Taken around the whole change, the
+/// unmapping and the mapping again, over every byte that goes away for a
+/// moment (the whole of each view the change takes away and maps again).
+pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
+    let (start, end) = span(at, len);
+    // Changes are one at a time where they meet (the runtime makes them
+    // under its own lock anyway); then this one keeps new reads of its
+    // range out, and waits for those under way.
+    let mut h = wait_while(holders(), |h| meets(&h.changing, start, end));
+    if start < end {
+        h.changing.push((start, end));
     }
+    let h = wait_while(h, |h| meets(&h.reading, start, end));
+    drop(h);
+    Remapping(Held { start, end, change: true })
+}
+
+/// What a read of title memory in place holds ([`title_memory_reading_range`]).
+pub struct Reading(#[allow(dead_code)] Held);
+
+/// For reading any of title memory in place:
+/// [`title_memory_reading_range`] over all of it.
+pub fn title_memory_reading() -> Reading {
+    title_memory_reading_range(0, usize::MAX)
+}
+
+/// For reading title memory `[at, at + len)` in place: until what it
+/// returns is dropped, the runtime changes no mapping there, so memory
+/// found mapped stays mapped. Not to be taken twice by one thread, nor
+/// held across anything that maps title memory.
+pub fn title_memory_reading_range(at: usize, len: usize) -> Reading {
+    let (start, end) = span(at, len);
+    let mut h = wait_while(holders(), |h| meets(&h.changing, start, end));
+    h.reading.push((start, end));
+    drop(h);
+    Reading(Held { start, end, change: false })
+}
+
+/// [`title_memory_reading_range`] if it can be had at once: `None` while
+/// the runtime changes a mapping in the range (or waits to), for a caller
+/// that has another way to read and would rather not wait.
+pub fn title_memory_reading_range_now(at: usize, len: usize) -> Option<Reading> {
+    let (start, end) = span(at, len);
+    let mut h = holders();
+    if meets(&h.changing, start, end) {
+        return None;
+    }
+    h.reading.push((start, end));
+    drop(h);
+    Some(Reading(Held { start, end, change: false }))
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1059,15 +1164,34 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{
+        title_memory_reading, title_memory_reading_range, title_memory_reading_range_now,
+        title_memory_remapping, title_memory_remapping_range,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
+
+    /// The holders are the process's: these tests take turns.
+    static TURN: Mutex<()> = Mutex::new(());
+
+    const MIB: usize = 1 << 20;
+
+    /// Runs `f` on another thread; true if it returned within five seconds.
+    fn done_soon(f: impl FnOnce() + Send + 'static) -> bool {
+        let (done, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = done.send(());
+        });
+        wait.recv_timeout(Duration::from_secs(5)).is_ok()
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
@@ -1104,5 +1228,65 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// Reads in place and changes of mapping wait for each other only where
+    /// their ranges meet: a change elsewhere neither waits for a read nor
+    /// holds one off (one lock for all of title memory kept the submitting
+    /// thread waiting seconds a frame while the world streamed in).
+    #[test]
+    fn only_ranges_that_meet_wait_for_each_other() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        // A read under way: a change elsewhere goes ahead.
+        let reading = title_memory_reading_range(16 * MIB, MIB);
+        assert!(done_soon(|| drop(title_memory_remapping_range(32 * MIB, MIB))));
+        // Ranges are half open: one that ends where the read begins does
+        // not meet it.
+        assert!(done_soon(|| drop(title_memory_remapping_range(15 * MIB, MIB))));
+        drop(reading);
+        // A change under way: reads elsewhere begin, reads of its range do
+        // not.
+        let changing = title_memory_remapping_range(32 * MIB, MIB);
+        assert!(done_soon(|| drop(title_memory_reading_range(16 * MIB, MIB))));
+        assert!(title_memory_reading_range_now(16 * MIB, MIB).is_some());
+        assert!(title_memory_reading_range_now(32 * MIB + 4096, 1).is_none());
+        assert!(title_memory_reading_range_now(31 * MIB, 2 * MIB).is_none());
+        drop(changing);
+        assert!(title_memory_reading_range_now(32 * MIB, MIB).is_some());
+        // Nothing to change changes nothing, and waits for no read.
+        let all = title_memory_reading();
+        assert!(done_soon(|| drop(title_memory_remapping_range(32 * MIB, 0))));
+        drop(all);
+    }
+
+    /// A change that waits for a read of its range keeps new reads of that
+    /// range out, so reads that keep beginning cannot hold it off; reads
+    /// elsewhere still begin.
+    #[test]
+    fn a_waiting_change_is_not_held_off() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let reading = title_memory_reading_range(0, MIB);
+        let changed = Arc::new(AtomicBool::new(false));
+        let change = {
+            let changed = changed.clone();
+            std::thread::spawn(move || {
+                let _changing = title_memory_remapping_range(0, 2 * MIB);
+                changed.store(true, Ordering::SeqCst);
+            })
+        };
+        // Until the change is waiting, a read of its second half begins.
+        let mut tries = 0;
+        while let Some(read) = title_memory_reading_range_now(MIB, MIB) {
+            drop(read);
+            tries += 1;
+            assert!(tries < 5_000, "the change never began waiting");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!changed.load(Ordering::SeqCst), "the change went ahead of a read under way");
+        assert!(title_memory_reading_range_now(4 * MIB, MIB).is_some());
+        drop(reading);
+        change.join().unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        assert!(title_memory_reading_range_now(MIB, MIB).is_some());
     }
 }

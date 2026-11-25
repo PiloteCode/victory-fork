@@ -292,12 +292,17 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (three quarters of the logical processors, 2 to 24)
+/// on first use. They were half, at most 8: on a 32-thread processor the
+/// first run of a new translator had 1,117 pipelines queued as the opening
+/// cutscene began and took four minutes to make them, with thousands of
+/// draws a frame dropped meanwhile and 24 threads idle. The workers run
+/// below the title's threads, so these only take time the title leaves.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() * 3 / 4).clamp(2, 24));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))

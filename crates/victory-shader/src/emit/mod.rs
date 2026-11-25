@@ -118,6 +118,17 @@ pub use shader::{
     set_view_heap_limit,
 };
 
+/// The host's settings a translation depends on, as they are now: its widest
+/// wave ([`set_host_max_wave`]) and its view heap's null slot
+/// ([`set_view_heap_limit`]). Part of what keys a translation kept on disk.
+pub fn host_settings() -> [u32; 2] {
+    [lower::host_max_wave(), shader::view_heap_limit()]
+}
+
+/// Whether this translator was built with its debugging switches
+/// (`diagnostics`), which some translations follow.
+pub const DIAGNOSTICS: bool = cfg!(feature = "diagnostics");
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
