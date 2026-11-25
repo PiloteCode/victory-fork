@@ -1593,6 +1593,8 @@ pub(crate) fn remap_hooks_line(frames: f64) {
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::uheap::remapped(at, len);
+    // Texture read-backs whose title memory this was are dropped.
+    crate::texback::remapped(at, len);
     #[cfg(feature = "diagnostics")]
     let mut part = std::time::Instant::now();
     // A placed texture there arrives, goes or changes with no descriptor
