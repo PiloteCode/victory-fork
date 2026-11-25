@@ -504,7 +504,13 @@ mod tests {
         // `detach_all` first, then `report_detached`.
         unsafe { super::atexit(report_detached) };
         super::attached(0);
-        std::process::exit(0);
+        unsafe extern "C" {
+            fn exit(status: i32) -> !;
+        }
+        // SAFETY: `std::process::exit` calls Win32 `ExitProcess`, which skips
+        // CRT `atexit` handlers on MSVC; call the CRT `exit` that `atexit`
+        // registered into.
+        unsafe { exit(0) };
     }
 
     #[test]
