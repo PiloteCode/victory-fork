@@ -359,6 +359,21 @@ pub fn emit(
     if r.is_ok() && !permutes_outside_sections(p) {
         return r;
     }
+    // A lane mask parked in two lanes of a VGPR, one of which holds a single scalar at other
+    // times, came back as two scalars: once more with the program built so that it comes back
+    // as the mask it is ([`ir::with_shared_slots`]). The original's error if that does not
+    // translate either.
+    if matches!(&r, Err(ShaderError::Unsupported { what, .. }) if *what == "an opaque lane mask") {
+        let again = ir::with_shared_slots(|| crate::spill::build(native)).and_then(|q| {
+            let st = structure::structure(&q)?;
+            let io = io::raise(&q, native)?;
+            let res = resource::track(&q, &native.layout, native.stage, Some(&st))?;
+            emit_any(c, native, &q, &st, &io, &res)
+        });
+        if again.is_ok() {
+            return again;
+        }
+    }
     // A whole-wave section that a jump splits (two reductions a branch chooses between that
     // share their end): once more with each such section in one block
     // ([`ir::whole_sections`]), where the simulation follows it. The original's result if that

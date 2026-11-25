@@ -123,6 +123,27 @@ impl Inst {
     }
 }
 
+thread_local! {
+    /// See [`with_shared_slots`].
+    static SHARED_SLOTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with programs built so that a register pair parked in two lanes of a VGPR moves
+/// as a pair wherever its save or restore comes together, also where the lower lane holds a
+/// single scalar at other times ([`unspill`] otherwise moves every half alone then). Each
+/// save and restore keeps its meaning either way (a pair move is the two moves at once, where
+/// nothing in between sees the difference); what changes is that a parked lane mask then comes
+/// back as the mask it is. `PS_VoxelizeVisiblity` parks a lane mask in lanes 3 and 4 of v56 and
+/// later a single scalar in lane 3: its mask came back as two scalars, a mask the
+/// structurisation cannot see into ("an opaque lane mask"). A retry ([`crate::emit::emit`]),
+/// so that the programs that translate as they are keep their form.
+pub fn with_shared_slots<R>(f: impl FnOnce() -> R) -> R {
+    let was = SHARED_SLOTS.replace(true);
+    let r = f();
+    SHARED_SLOTS.set(was);
+    r
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
@@ -245,7 +266,9 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// A register pair parked in two neighbouring lanes (a lane mask, a 64-bit
 /// address) moves as a pair (`s_mov_b64`) when every save and every restore
 /// of the two lanes come together, so a parked lane mask comes back as the
-/// mask it is; otherwise its halves come back as two scalars.
+/// mask it is; otherwise its halves come back as two scalars (with
+/// [`with_shared_slots`], the saves and restores that come together still
+/// move as pairs).
 fn unspill(
     list: &mut [gfx10::Instruction],
     leaders: &[usize],
@@ -386,6 +409,9 @@ fn unspill(
         }
     };
     let mut pairs: Vec<(u8, u32)> = Vec::new();
+    // ([`with_shared_slots`]) the upper lanes' parks that move with a lower one
+    let mut taken: Vec<usize> = Vec::new();
+    let shared = SHARED_SLOTS.get();
     for &(reg, lane) in &slots {
         if !wave64 || pairs.iter().any(|&(r, l)| r == reg && l + 1 == lane) || !slots.contains(&(reg, lane + 1)) {
             continue;
@@ -396,8 +422,12 @@ fn unspill(
         let mut distinct: Vec<usize> = partners.iter().flatten().copied().collect();
         distinct.sort_unstable();
         distinct.dedup();
-        if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len() {
+        let found = partners.iter().flatten().count();
+        if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len()
+            || shared && found > 0 && distinct.len() == found
+        {
             pairs.push((reg, lane));
+            taken.extend(distinct);
         }
     }
     // Codes for the parked scalars: the trap temporaries (108..=123), then
@@ -450,7 +480,8 @@ fn unspill(
             continue;
         };
         let Some(slot) = code_of(reg, lane) else { return Vec::new() };
-        if pairs.contains(&(reg, lane)) {
+        let alone = shared && (pairs.contains(&(reg, lane)) && partner(i).is_none() || lane > 0 && pairs.contains(&(reg, lane - 1)) && !taken.contains(&i));
+        if pairs.contains(&(reg, lane)) && !alone {
             let Some(j) = partner(i) else { return Vec::new() };
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
@@ -458,7 +489,7 @@ fn unspill(
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((at, Some((true, dst, src))));
             edits.push((gone, None));
-        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
+        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) && !alone {
             // the upper half of a pair: moved with the lower
         } else {
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
@@ -2103,5 +2134,53 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    /// `PS_VoxelizeVisiblity`'s parking (0xa18-0xa38, 0xe44-0xe4c, 0x2df8, 0x3184): a lane
+    /// mask parked in lanes 3 and 4 of v56 and taken back to make EXEC, later a single scalar
+    /// parked in lane 3. Built as it is, the mask comes back as two scalars, which the
+    /// structurisation cannot see into; with [`with_shared_slots`] it comes back as the pair
+    /// it is, and EXEC as the compare's lanes.
+    #[test]
+    fn a_mask_parked_in_lanes_another_scalar_shares_comes_back_whole_with_shared_slots() {
+        let writelane = |lane: u32, s: u32| [0xD761_0038, s | (128 + lane) << 9]; // v_writelane_b32 v56, s, lane
+        let readlane = |s: u32, lane: u32| [0xD760_0000 | s, (256 + 56) | (128 + lane) << 9]; // v_readlane_b32 s, v56, lane
+        let mut w = vec![
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBEA2_046A, // s_mov_b64 s[34:35], vcc
+        ];
+        w.extend(writelane(3, 34));
+        w.extend(writelane(4, 35));
+        w.push(0xBEA2_0480); // s_mov_b64 s[34:35], 0
+        w.extend(readlane(34, 3));
+        w.extend(readlane(35, 4));
+        let restore = 4 * (w.len() - 4) as u64; // (the first restore's offset)
+        w.extend([
+            0xBE82_2422, // s_and_saveexec_b64 s[2:3], s[34:35]
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        ]);
+        w.extend(writelane(3, 1));
+        w.push(0xBE81_0380); // s_mov_b32 s1, 0
+        w.extend(readlane(1, 3));
+        w.push(S_ENDPGM);
+        let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let at = |p: &Program| {
+            let i = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.machine.offset as u64 == restore).expect("the restore");
+            i.name()
+        };
+        let alone = build(&code, true, 64).unwrap();
+        assert_eq!(at(&alone), "s_mov_b32");
+        let shared = with_shared_slots(|| build(&code, true, 64)).unwrap();
+        assert_eq!(at(&shared), "s_mov_b64");
+        let opaque = |p: &Program| {
+            let st = crate::structure::structure(p).unwrap();
+            let v1 = p.blocks.iter().enumerate().flat_map(|(b, blk)| blk.insts.iter().enumerate().map(move |(i, inst)| (b, i, inst)));
+            let (b, i, _) = v1.into_iter().find(|(_, _, inst)| inst.name() == "v_mov_b32").expect("the guarded move");
+            let guard = st.guards[b][i].expect("a guard");
+            st.bools.support(guard).iter().any(|a| matches!(a, crate::structure::Atom::Opaque(_)))
+        };
+        assert!(opaque(&alone), "two scalars make an opaque mask");
+        assert!(!opaque(&shared), "the pair is the compare's mask");
     }
 }
