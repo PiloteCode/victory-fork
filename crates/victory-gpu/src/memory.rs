@@ -481,6 +481,10 @@ impl Memory {
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted (and, with `writes`, copied back after). None if the host
 /// cannot hold it; the draw is then dropped.
+/// The key a list's [`crate::host::HostList::first_use`] is asked with when one of its
+/// dispatches may store into title memory by address ([`ready`] with `writes`).
+pub(crate) const WRITE: usize = usize::MAX - 0x6e;
+
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
@@ -548,7 +552,6 @@ pub(crate) fn ready(
     // numbers meanwhile is brought up to date by that list's submission,
     // which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     if first_read {
