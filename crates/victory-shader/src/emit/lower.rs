@@ -17,7 +17,7 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, DRIVER, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
@@ -63,6 +63,10 @@ mod dispatch_threads;
 /// them, a child module so it shares the emitter's state.
 #[path = "guarded.rs"]
 mod guarded;
+/// A geometry program's LDS rings as its inputs and outputs, a child module so it shares the
+/// emitter's state.
+#[path = "rings.rs"]
+mod rings;
 
 type Why = &'static str;
 
@@ -386,6 +390,8 @@ struct Lower<'a> {
     /// is left out (empty when not linking).
     drop_in: Vec<bool>,
     drop_out: Vec<bool>,
+    /// A geometry program's vertices so far ([`rings`]).
+    emitted: rings::Emitted,
 }
 
 #[derive(Default)]
@@ -909,6 +915,9 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.geometry = x.io.geometry.as_ref().map(|g| super::shader::Geometry {
+            max_vertices: g.max_vertices,
+        });
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
@@ -1271,6 +1280,7 @@ impl<'a> Lower<'a> {
             raw_meets: Default::default(),
             drop_in,
             drop_out,
+            emitted: Default::default(),
         }
     }
 
@@ -2188,6 +2198,10 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            Input::PrimitiveId if self.s.geometry.is_some() => {
+                let (entry, i32t) = (self.s.entry, self.s.t.i32);
+                return Val::I32(self.s.op(entry, "primitiveID.i32", Attr::ReadNone, i32t, 108, &[]));
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -4505,6 +4519,9 @@ impl<'a> Lower<'a> {
         if *gds {
             return Err("GDS");
         }
+        if self.x.io.geometry.is_some() {
+            return self.ring(inst, b, i);
+        }
         let name = inst.name();
         // Lanes past a DispatchX count neither read nor write LDS; a
         // swizzle or permute moves registers only, under its own guard.
@@ -5004,6 +5021,10 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
+            }
+            // A geometry program's emit or cut: a refusal at once, as for the node test.
+            Fields::Sopp { .. } if self.x.io.geometry.is_some() && name.starts_with("s_sendmsg") => {
+                return self.ring_message(b, i).map_err(|why| unsupported(offset, why));
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -5761,6 +5782,10 @@ impl<'a> Lower<'a> {
         }
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
+        }
+        if self.scalar.get(&site).is_some_and(|a| a.param == DRIVER) {
+            // (where a geometry program's ring lies in LDS: no ring on the host)
+            return Err("the console driver's table");
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
