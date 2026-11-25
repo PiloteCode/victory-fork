@@ -3244,6 +3244,138 @@ mod fill_ahead {
 
 pub(crate) use fill_ahead::wrote as shaders_write;
 
+/// Diagnostics: the time of the thread that submits inside
+/// [`Host::submit`] (and after it in [`Host::execute_late`]), by part,
+/// since the last frame-rate line, in nanoseconds.
+///
+/// The frame waits for that thread: in wave 2's settled gameplay the card
+/// stood idle behind it 50 to 70 ms a frame, and of its ~250 ms a frame
+/// ~225 were inside submissions. The frame line's "preparing" and the copy
+/// statistics' "waiting for the submission lock" (which runs from the call
+/// to the start of preparing: settles, the descriptor sync and the sweep
+/// are in it) each hold several of these parts together; here each is on
+/// its own, and they add up to the time spent inside.
+#[cfg(feature = "diagnostics")]
+mod submit_parts {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Waiting for the submission lock (held by another thread's settle).
+    pub(super) const LOCK: usize = 0;
+    /// Standing for flights or the card: settles and waits inside or right
+    /// after the submission, and the wait of a submission that is waited
+    /// for.
+    pub(super) const WAITS: usize = 1;
+    /// The descriptor records the title copied into its heaps.
+    pub(super) const HEAPS: usize = 2;
+    /// The sweep, and the slots that waited for a texture's host copy.
+    pub(super) const SWEEP: usize = 3;
+    /// The submission's one write-watch asking, and the title bytes under
+    /// flights' shader writes (`stale_under_flights`; its settle is a wait).
+    pub(super) const STALE: usize = 4;
+    /// Fills of upload memory and title buffer copies.
+    pub(super) const FILLS: usize = 5;
+    /// Refreshes of host copies (with `VICTORY_WIDE_TEXTURES=1` the
+    /// textures refreshed beside them too).
+    pub(super) const REFRESH: usize = 6;
+    /// Texture refreshes one at a time, where a list asks.
+    pub(super) const TEXTURES: usize = 7;
+    /// Ranges given to shaders (their snapshots).
+    pub(super) const WRITES: usize = 8;
+    /// Steps of ours.
+    pub(super) const RUNS: usize = 9;
+    /// The lists' preludes recorded.
+    pub(super) const PRELUDES: usize = 10;
+    /// Snapshots left for the end (`crate::shadow::wide_back`).
+    pub(super) const SNAPSHOTS: usize = 11;
+    /// Copies in the card's memory: their sends and compares recorded.
+    pub(super) const CARD: usize = 12;
+    /// The lists sent, and the signal behind them.
+    pub(super) const SEND: usize = 13;
+    /// After the send: what the flight hands back gathered and the line of
+    /// flights (sent ahead), or the copy-back (waited for); landed lists
+    /// given back.
+    pub(super) const AFTER: usize = 14;
+    const N: usize = 15;
+    const NAMES: [&str; N] = [
+        "the lock",
+        "waits for flights or the card",
+        "descriptor sync",
+        "sweep",
+        "title bytes under flights' writes",
+        "fills and title copies",
+        "refreshes of copies",
+        "texture refreshes",
+        "ranges given to shaders",
+        "steps of ours",
+        "preludes",
+        "snapshots",
+        "card copies' sends and compares",
+        "the send",
+        "after the send",
+    ];
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    thread_local! {
+        /// Nanoseconds of refreshes counted on this thread so far: a step
+        /// whose time holds a flush of them leaves that part to [`REFRESH`].
+        static FLUSHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn add(i: usize, d: std::time::Duration) {
+        NS[i].fetch_add(d.as_nanos() as u64, Relaxed);
+    }
+
+    /// Adds the time since `from` to part `i`; the next part starts now.
+    pub(super) fn to(i: usize, from: &mut std::time::Instant) {
+        let now = std::time::Instant::now();
+        add(i, now - *from);
+        *from = now;
+    }
+
+    /// A flush of refreshes took `d`.
+    pub(super) fn flushed(d: std::time::Duration) {
+        add(REFRESH, d);
+        FLUSHED.with(|f| f.set(f.get() + d.as_nanos() as u64));
+    }
+
+    /// One step of a list's at submission, counted to its part when it
+    /// ends, without the refreshes it flushed.
+    pub(super) struct Step {
+        part: usize,
+        started: std::time::Instant,
+        flushed: u64,
+    }
+
+    impl Step {
+        pub(super) fn new(part: usize) -> Step {
+            Step {
+                part,
+                started: std::time::Instant::now(),
+                flushed: FLUSHED.with(|f| f.get()),
+            }
+        }
+    }
+
+    impl Drop for Step {
+        fn drop(&mut self) {
+            let flushed = FLUSHED.with(|f| f.get()).saturating_sub(self.flushed);
+            NS[self.part].fetch_add((self.started.elapsed().as_nanos() as u64).saturating_sub(flushed), Relaxed);
+        }
+    }
+
+    /// With the frame line.
+    pub(super) fn line(frames: f64) {
+        let ms: Vec<f64> = NS.iter().map(|n| n.swap(0, Relaxed) as f64 / 1e6 / frames).collect();
+        let all: f64 = ms.iter().sum();
+        if all == 0.0 {
+            return;
+        }
+        let parts: Vec<String> = NAMES.iter().zip(&ms).map(|(name, ms)| format!("{name} {ms:.1}")).collect();
+        tracing::info!("the thread that submits, in submissions, per frame: {all:.1} ms; by part: {}", parts.join(", "));
+    }
+}
+
 /// Diagnostics: the fills of upload memory that made a submission wait for
 /// flights (`blocked_by`), which one they are, and whether the wait was
 /// needed: the bytes the fill reads are kept when it blocks and compared
@@ -5734,6 +5866,8 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        let mut part = std::time::Instant::now();
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
@@ -5755,6 +5889,8 @@ impl Host {
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::AFTER, &mut part);
         if told && !late_writes() {
             self.settle(&mut submitted, WHY_WRITES);
         } else if most && relay_exact() {
@@ -5765,8 +5901,12 @@ impl Host {
         } else {
             LINE_MOVED.notify_one();
         }
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::WAITS, &mut part);
         drop(submitted);
         land();
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::AFTER, &mut part);
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -5971,6 +6111,10 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let mut part = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        submit_parts::add(submit_parts::LOCK, part - called);
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -5987,9 +6131,13 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::WAITS, &mut part);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::HEAPS, &mut part);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6010,6 +6158,8 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::SWEEP, &mut part);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -6059,16 +6209,29 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            submit_parts::add(submit_parts::STALE, part.elapsed().saturating_sub(settled));
+            submit_parts::add(submit_parts::WAITS, settled);
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            #[cfg(feature = "diagnostics")]
+            let preluding = std::time::Instant::now();
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
+            #[cfg(feature = "diagnostics")]
+            submit_parts::add(submit_parts::PRELUDES, preluding.elapsed());
             lists.push(list.list.cast().ok());
         }
         batch.flush();
         crate::watch::ask_once_end();
+        #[cfg(feature = "diagnostics")]
+        {
+            part = std::time::Instant::now();
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -6079,6 +6242,8 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::SNAPSHOTS, &mut part);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -6088,10 +6253,14 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::WAITS, &mut part);
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::CARD, &mut part);
         let prepared = std::time::Instant::now();
         let compare = card.as_ref().is_some_and(|c| c.check.is_some());
         if late {
@@ -6105,10 +6274,14 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            #[cfg(feature = "diagnostics")]
+            submit_parts::to(submit_parts::SEND, &mut part);
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
+            #[cfg(feature = "diagnostics")]
+            submit_parts::to(submit_parts::AFTER, &mut part);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
             let sent = Sent {
@@ -6181,6 +6354,9 @@ impl Host {
             }
             let _ = (i, started);
         }
+        // (The send and the wait for the card together, as one wait.)
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::WAITS, &mut part);
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -6253,14 +6429,16 @@ impl Host {
         }
         self.log_messages();
         submitting(0, 0);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::submission_ends(lock);
         // With the relay: nothing is in the air now, so no fetch still to
         // be merged is older than the sends to card copies so far, and
         // their notes can go.
         if relay() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         }
+        #[cfg(feature = "diagnostics")]
+        submit_parts::to(submit_parts::AFTER, &mut part);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::submission_ends(lock);
         working(was_working);
         None
     }
@@ -7656,6 +7834,14 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let _part = submit_parts::Step::new(match step {
+                Step::Copy(..) | Step::Fill(..) => submit_parts::FILLS,
+                Step::Refresh(..) => submit_parts::REFRESH,
+                Step::Run(_) | Step::Host(_) => submit_parts::RUNS,
+                Step::GpuWrite(..) => submit_parts::WRITES,
+                Step::Texture(_) => submit_parts::TEXTURES,
+            });
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7870,6 +8056,8 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        let flushing = std::time::Instant::now();
         let (shadow, from, to) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
@@ -7877,6 +8065,8 @@ impl Batch {
         }
         Self::update(&shadow, from, to);
         Self::brought(&mut self.current, &shadow, from, to);
+        #[cfg(feature = "diagnostics")]
+        submit_parts::flushed(flushing.elapsed());
     }
 
     /// With [`refresh_once`]: `[from, to)` of `shadow`'s copy was brought
@@ -7951,6 +8141,14 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let flushing = std::time::Instant::now();
+        self.flush_all();
+        #[cfg(feature = "diagnostics")]
+        submit_parts::flushed(flushing.elapsed());
+    }
+
+    fn flush_all(&mut self) {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -8466,6 +8664,8 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        #[cfg(feature = "diagnostics")]
+        submit_parts::line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::fence::event_waits_line(frames);
