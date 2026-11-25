@@ -960,6 +960,12 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_WAVE_PAIRS=0` | no paired form for console wave64 compute programs (on by default where the host's widest wave is under 64 lanes; `=1` on everywhere) |
 | `VICTORY_WAVE_SPLIT=0` | wave64 compute programs that use their wave values only to allocate take the forms they took before (two host waves meeting at group barriers, or the paired form), not two host waves of their own (own shader cache entries) |
 | `VICTORY_WAVE_RAW=0` | the paired form selects every guarded write, as before, also where only lanes inside the guard read it (own shader cache entries) |
+| `VICTORY_CARD_TITLE_COPIES=0` | a title copy whose source the list's shaders wrote by address is done at submission, as before, not on the card behind them (the structure builder's sizes) |
+| `VICTORY_REMAP_LAND=0` | a remap of title memory does not wait for the flights whose declared writes touch its range |
+| `VICTORY_BVH_TRACE=<file>` | a line per event of the ray-tracing structure builder: its dispatches and those of programs that reach title memory by address, the upload memory they read, every range put back into title memory, page mappings and copies (unbuffered; diagnostics builds) |
+| `VICTORY_BVH_CHECK=<hash>[,<hash>]` | with the trace, walks the structures the header stage (and the in-place rebuild's header stage) start, once their headers are put back, and reports bad nodes (`V` lines) |
+| `VICTORY_BVH_DRY=1` | the builder's dispatches are bound (copies made ready, writes declared) and not run (diagnostics builds) |
+| `VICTORY_CRASH_MEMORY=1` | a crash report adds the title memory around each register that holds a title address, and one pointer further |
 | `VICTORY_LOOP_NOTES=1` | translated loops count the lanes that reach their limit (own shader cache entries); every five seconds the log names the programs and loops whose counts grew (`loop notes:` lines; helper lanes of pixel shaders are never counted) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
