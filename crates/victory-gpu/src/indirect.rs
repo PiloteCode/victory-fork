@@ -2005,13 +2005,18 @@ void main(uint3 g : SV_GroupID) {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        // The two groups (64 records each) charge the budget in an order of
+        // the device's: within the group that charges first its first two
+        // real draws fit (records 1 and 2, record 0 being no draw, or 64
+        // and 65), and nothing of the other group does. (Asked to be 1 and
+        // 2, the test failed on this machine's software adapter in 20 runs
+        // of 20 alone and some in five of the whole suite.)
+        let mut kept_at = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept_at.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -2021,7 +2026,11 @@ void main(uint3 g : SV_GroupID) {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        assert!(
+            kept_at == [1, 2] || kept_at == [64, 65],
+            "the first two real draws of one group fit the budget, none other: {kept_at:?}"
+        );
+        assert_eq!(zeroed, (RECORDS as usize) - 2);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's
