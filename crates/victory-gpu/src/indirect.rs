@@ -250,6 +250,8 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| "clamp (ours) of indirect records".into());
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, (dst, read)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, count, spec, false).then_some(dst)
@@ -276,6 +278,8 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| "clamp (ours) of a window of indirect records".into());
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, (dst, read)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, None, spec, true).then_some(dst)
