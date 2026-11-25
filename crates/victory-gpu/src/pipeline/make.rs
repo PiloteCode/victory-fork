@@ -62,8 +62,11 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        // Mesh pipelines have no vertex input either: never a pass over the
+        // screen (the world's 8,000 mesh programs are the bulk to make).
+        let mesh = shaders.iter().any(|s| matches!(s.stage, "mesh" | "amplification"));
         Pending {
-            screen: !shaders.is_empty() && graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            screen: !shaders.is_empty() && !mesh && graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
