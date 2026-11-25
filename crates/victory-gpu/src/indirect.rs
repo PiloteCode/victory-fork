@@ -1536,7 +1536,7 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let masked = compile_cs(&warp.device, crate::host::CARD_MASKED).expect("the masked pass must compile on WARP");
+        let masked = compile_cs(&warp.device, crate::masked::CARD_MASKED).expect("the masked pass must compile on WARP");
         const SIZE: usize = 4 * (64 << 10);
         let (_card, card_ptr, card_gpu) = warp.shared_buffer(SIZE as u64);
         let (_cpu, cpu_ptr, cpu_gpu) = warp.shared_buffer(SIZE as u64);

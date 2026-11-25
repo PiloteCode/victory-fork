@@ -1823,16 +1823,8 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
-    /// With `VICTORY_MERGE_MASKED=1` (`crate::shadow::merge_masked`): the
-    /// pass that writes the title's bytes into card sides by their masks
-    /// ([`CARD_MASKED`]), if it was made.
-    masked: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
-    /// Upload buffers for the masks, not in use (buffer, mapping, bytes): a
-    /// plan takes one ...
-    masks: Vec<(ID3D12Resource, usize, u64)>,
-    /// ... held here, by the plan's number in the queue's order, until
-    /// `Host::card_done` gives it back with the plan's lists.
-    masks_out: Vec<(u64, (ID3D12Resource, usize, u64))>,
+    /// The masked pass (`crate::masked`), with `VICTORY_MERGE_MASKED=1`.
+    masked: Option<crate::masked::Pass>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -1959,46 +1951,6 @@ pub(crate) fn card_wide_hash() -> bool {
 /// The groups a card compare or hash pass over `pieces` pieces dispatches.
 pub(crate) fn card_groups(pieces: u32) -> u32 {
     if card_wide_hash() { pieces.min(65535) } else { pieces.div_ceil(64) }
-}
-
-/// The title's bytes into a copy's card side by their mask
-/// (`crate::shadow::merge_masked`): a thread a dword from dword `first` on,
-/// `dwords` of them; the mask is a bit per byte (four per dword, dword `j`'s
-/// in bits `4 (j % 8)` of mask word `j / 8`, from mask word `mask_at`). A
-/// dword with all four bits takes the CPU side's dword; one with some takes
-/// those bytes and keeps the card's others; one with none is not touched.
-pub(crate) const CARD_MASKED: &str = r#"
-#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), SRV(t1), UAV(u0)"
-cbuffer What : register(b0) {
-    uint first;    // the first dword of the copy
-    uint dwords;
-    uint mask_at;  // the first mask word
-};
-ByteAddressBuffer cpu : register(t0);
-ByteAddressBuffer masks : register(t1);
-RWByteAddressBuffer card : register(u0);
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint j = id.x;
-    if (j >= dwords) return;
-    uint four = (masks.Load((mask_at + (j >> 3)) * 4u) >> ((j & 7u) * 4u)) & 0xFu;
-    if (four == 0u) return;
-    uint at = (first + j) * 4u;
-    uint mine = cpu.Load(at);
-    if (four == 0xFu) {
-        card.Store(at, mine);
-        return;
-    }
-    uint m = ((four & 1u) != 0u ? 0x000000FFu : 0u) | ((four & 2u) != 0u ? 0x0000FF00u : 0u)
-        | ((four & 4u) != 0u ? 0x00FF0000u : 0u) | ((four & 8u) != 0u ? 0xFF000000u : 0u);
-    card.Store(at, (card.Load(at) & ~m) | (mine & m));
-}
-"#;
-
-/// The groups of [`CARD_MASKED`] for a mask of `dwords` dwords.
-fn masked_groups(dwords: usize) -> u32 {
-    dwords.div_ceil(64).clamp(1, 65535) as u32
 }
 
 /// The compare as it was, one thread per 64 KiB piece walking its 16-byte
@@ -4515,16 +4467,7 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
-        if crate::shadow::merge_masked() {
-            let [pages, bytes, sent, hidden] =
-                [0, 1, 2, 3].map(|i| crate::shadow::MASKED_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            tracing::info!(
-                "title bytes under flights' shader writes by byte masks per frame (VICTORY_MERGE_MASKED=1): {pages:.1} pages \
-                 ({:.3} MB changed) went up by their masks, {sent:.1} masks sent, {hidden:.1} merges of fetched pieces left \
-                 masked bytes out",
-                bytes / (1 << 20) as f64
-            );
-        }
+        crate::masked::line(frames);
     }
     // What the waits above found ahead of them (coh-submit).
     crate::waits::line(frames);
@@ -5116,45 +5059,8 @@ impl Host {
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(results) } else { None },
-                masked: if crate::shadow::merge_masked() { self.make_card_masked() } else { None },
-                masks: Vec::new(),
-                masks_out: Vec::new(),
+                masked: crate::masked::Pass::make(&self.device),
             })
-        }
-    }
-
-    /// The pass of [`CARD_MASKED`] (`crate::shadow::merge_masked`); `None`,
-    /// and pages refused as before, if it cannot be made.
-    fn make_card_masked(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
-        let made = (|| -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
-            let code = compile(CARD_MASKED, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
-            // SAFETY: the blob's own bytes; the root signature is inside the
-            // shader.
-            unsafe {
-                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &code)?;
-                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                })?;
-                Ok((root, pso))
-            }
-        })();
-        crate::shadow::masked_ready(made.is_ok());
-        match made {
-            Ok(pass) => {
-                tracing::info!(
-                    "title bytes under flights' shader writes go up by their byte masks when a page holds many changed runs                      (VICTORY_MERGE_MASKED=1)"
-                );
-                Some(pass)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "no masked pass (VICTORY_MERGE_MASKED=1): such pages settle the flights as before");
-                None
-            }
         }
     }
 
@@ -5308,11 +5214,7 @@ impl Host {
         // Title bytes that go up by their masks (`crate::shadow::merge_masked`),
         // taken in the same hold of the queue's order as the ranges.
         let masked = crate::shadow::card_masked(sent_as);
-        for (shadow, _) in &masked {
-            if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                dirty.push((shadow.clone(), Vec::new()));
-            }
-        }
+        crate::masked::join(&mut dirty, &masked);
         // With fetches on a copy queue (`crate::queue2`, bit 1 of
         // `VICTORY_QUEUE2`): the send's number is signalled on the direct
         // queue behind the send, so that a fetch knows which sends the card
@@ -5346,28 +5248,8 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
-        // The masks' upload memory: one buffer for the plan, in use until
-        // its submission has run (`Host::card_done` gives it back).
-        let mask_words: usize = masked.iter().flat_map(|(_, m)| m.iter().map(|m| m.bits.len())).sum();
-        let masks: Option<(ID3D12Resource, usize, u64)> = if mask_words == 0 {
-            None
-        } else {
-            if work.masked.is_none() {
-                fail(format_args!("title bytes to go up by their masks, and no masked pass (VICTORY_MERGE_MASKED=1)"));
-            }
-            let bytes = (mask_words * 4) as u64;
-            match work.masks.iter().position(|m| m.2 >= bytes) {
-                Some(at) => Some(work.masks.swap_remove(at)),
-                None => {
-                    let size = bytes.next_power_of_two().max(64 << 10);
-                    let Some((buffer, data)) = self.upload_buffer(size) else {
-                        fail(format_args!("no upload memory for {bytes} bytes of masks (VICTORY_MERGE_MASKED=1)"));
-                    };
-                    name(&buffer, || "title bytes' masks for card copies".into());
-                    Some((buffer, data as usize, size))
-                }
-            }
-        };
+        // The masks' upload memory, the plan's until it is done.
+        let masks = crate::masked::take(work.masked.as_mut(), &masked, self);
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
         // 2): the landing buffer they are in, in the order of `dirty`'s
         // ranges, once the direct queue has waited. `None`: straight from
@@ -5450,41 +5332,18 @@ impl Host {
                             ranges.iter().map(|&(a, b)| (b - a) as u64).sum(),
                             ranges.len() as u64,
                         );
-                        // The title's bytes by their masks, after the ranges
-                        // (`crate::shadow::merge_masked`): only the bytes the
-                        // title changed, whatever the flights before wrote
-                        // beside them. Then the card side is read by the hash.
-                        let mine: &[crate::shadow::Masked] =
-                            masked.iter().find(|(s, _)| Arc::ptr_eq(s, shadow)).map_or(&[], |(_, m)| &m[..]);
-                        let mut readable = false;
-                        if !mine.is_empty()
-                            && let (Some((root, pso)), Some((buffer, data, _))) = (&work.masked, &masks)
-                        {
-                            let was = if ranges.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_DEST };
-                            list.ResourceBarrier(&[transition(&shadow.buffer, was, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
-                            list.SetComputeRootSignature(root);
-                            list.SetPipelineState(pso);
-                            list.SetComputeRootShaderResourceView(1, staging.GetGPUVirtualAddress());
-                            list.SetComputeRootShaderResourceView(2, buffer.GetGPUVirtualAddress());
-                            list.SetComputeRootUnorderedAccessView(3, shadow.buffer.GetGPUVirtualAddress());
-                            for m in mine {
-                                // The plan's own buffer, sized for every mask
-                                // of it; the card reads it when the list runs.
-                                std::ptr::copy_nonoverlapping(m.bits.as_ptr(), (*data as *mut u32).add(mask_at), m.bits.len());
-                                let constants = [(m.base / 4) as u32, m.dwords as u32, mask_at as u32];
-                                list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
-                                list.Dispatch(masked_groups(m.dwords), 1, 1);
-                                mask_at += m.bits.len();
-                            }
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
-                            #[cfg(feature = "diagnostics")]
-                            crate::barrier::ours(crate::barrier::Ours::CardUpload, 2);
-                            readable = true;
-                        }
+                        // The title's bytes by their masks, after the ranges;
+                        // then the card side is read by the hash.
+                        let mine = crate::masked::of(&masked, shadow);
+                        let readable = crate::masked::record(
+                            list,
+                            shadow,
+                            staging,
+                            !ranges.is_empty(),
+                            mine,
+                            (work.masked.as_ref(), masks.as_ref()),
+                            &mut mask_at,
+                        );
                         let Some(before) = before else {
                             continue;
                         };
@@ -5514,7 +5373,7 @@ impl Host {
                             ranges
                                 .iter()
                                 .map(|&(a, b)| shadow.card_run(a, b))
-                                .chain(mine.iter().map(|m| shadow.card_run(m.base, m.base + 4 * m.dwords)))
+                                .chain(crate::masked::runs(shadow, mine))
                                 .collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
@@ -5550,9 +5409,7 @@ impl Host {
             inflight_landed: 0,
         };
         // (Masks are sent with the relay only: `sent_as` names the plan.)
-        if let Some(masks) = masks {
-            work.masks_out.push((sent_as, masks));
-        }
+        crate::masked::hold(work.masked.as_mut(), sent_as, masks);
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
@@ -5696,10 +5553,7 @@ impl Host {
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
-        while let Some(at) = work.masks_out.iter().position(|m| m.0 == plan.sent_as) {
-            let (_, masks) = work.masks_out.swap_remove(at);
-            work.masks.push(masks);
-        }
+        crate::masked::done(work.masked.as_mut(), plan.sent_as);
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
         // not read yet: the area starts again only when none is out.
@@ -11514,151 +11368,7 @@ void main() {
         }
         drop(lists);
     }
-
-    /// `VICTORY_MERGE_MASKED=1` end to end on the software adapter: two long
-    /// flights write a dword each of page P, one where the title writes
-    /// nothing, one whose first byte the title rewrites; behind them four
-    /// short flights elsewhere. The title rewrites every eighth byte of P
-    /// (8,191 changed runs, over the budget of runs) and a flight C refreshes
-    /// P and reads a rewritten dword of it on the card. No settle for "title
-    /// memory changed under shader writes": the page goes up by its mask.
-    /// Title memory ends with the title's bytes, the flights' writes (the
-    /// second one's three bytes the title did not rewrite), and what C read
-    /// was the title's.
-    ///
-    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_RELAY=2
-    ///  VICTORY_MERGE_MASKED=1 cargo test -p victory-gpu --features
-    ///  diagnostics warp_title_bytes_under -- --test-threads=1`
-    #[test]
-    fn warp_title_bytes_under_shader_writes_go_up_by_their_masks() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
-        if !crate::shadow::merge_masked() {
-            eprintln!("queue2_tests: masked skipped, VICTORY_MERGE_MASKED=1 is not set");
-            return;
-        }
-        let Some(host) = host() else {
-            return;
-        };
-        // SAFETY: a plain query.
-        let software = host
-            .adapter
-            .as_ref()
-            .and_then(|a| unsafe { a.GetDesc1() }.ok())
-            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
-        if !software || !relay() || !late_exact() {
-            eprintln!(
-                "queue2_tests: masked skipped, needs the software adapter and the relay (VICTORY_D3D12_WARP=1 VICTORY_RELAY=2, diagnostics)"
-            );
-            return;
-        }
-        const PIECE: usize = 64 << 10;
-        const LEN: usize = 4 << 20;
-        const P: usize = 5;
-        // SAFETY: a plain allocation of our own.
-        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
-        assert!(!title.is_null());
-        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
-        let old = |at: usize| 0x5A00_0000 | (at / 4) as u32;
-        for i in 0..LEN / 4 {
-            // SAFETY: inside the allocation.
-            unsafe { dword(i * 4).write_volatile(old(i * 4)) };
-        }
-        crate::shadow::register(0x51_5153, title as u64, LEN as u64);
-        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
-        if !shadow.carded() {
-            eprintln!("queue2_tests: masked skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
-            return;
-        }
-        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
-        // SAFETY: the shader's own root signature; plain creation.
-        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
-            let pso = host
-                .device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                })
-                .expect("a pipeline");
-            (root, pso)
-        };
-        let send = |page: usize, to: usize, from: usize, add: u32, spin: u32| {
-            let list = host.new_list().expect("a host list");
-            shadow.refresh(&list, title as u64, LEN as u64);
-            shadow.gpu_writes(&list, (title as usize + page * PIECE) as u64, PIECE as u64);
-            // SAFETY: an open list; the copy's buffer, with unordered
-            // access; the shader's own root signature.
-            unsafe {
-                list.list.SetComputeRootSignature(&root);
-                list.list.SetPipelineState(&pso);
-                let constants = [to as u32, from as u32, add, spin];
-                list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
-                list.list.Dispatch(1, 1, 1);
-            }
-            list.close();
-            host.execute_own(&list);
-            list
-        };
-        let stale = LATE_STATS[WHY_STALE].load(Ordering::Relaxed);
-        let masked = crate::shadow::MASKED_STATS[0].load(Ordering::Relaxed);
-        // A1 and A2, long: a dword of page P each (A2's first byte is one
-        // the title rewrites). Then four short flights elsewhere.
-        let (a1_to, a2_to) = (P * PIECE + 256, P * PIECE + 1024);
-        let mut lists = vec![send(P, a1_to, PIECE, 1, 2_000_000), send(P, a2_to, PIECE, 2, 1_000_000)];
-        let b_to = |k: usize| (40 + k) * PIECE + 64;
-        for k in 0..4 {
-            lists.push(send(40 + k, b_to(k), 2 * PIECE, k as u32, 1_000));
-        }
-        let rewritten = |i: usize| (i.is_multiple_of(8) && !(256..260).contains(&i)).then_some((i / 8) as u8 ^ 0xC3);
-        for i in 0..PIECE {
-            if let Some(byte) = rewritten(i) {
-                // SAFETY: inside the allocation.
-                unsafe { title.add(P * PIECE + i).write_volatile(byte) };
-            }
-        }
-        let c_from = P * PIECE + 512;
-        let c_to = 50 * PIECE + 32;
-        lists.push(send(50, c_to, c_from, 5, 1));
-        settle_now(WHY_SYNC);
-        assert_eq!(
-            LATE_STATS[WHY_STALE].load(Ordering::Relaxed),
-            stale,
-            "the flights were settled for title memory changed under shader writes"
-        );
-        assert!(crate::shadow::MASKED_STATS[0].load(Ordering::Relaxed) > masked, "no page went up by its mask");
-        let mut expected: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
-        for at in (P * PIECE..(P + 1) * PIECE).step_by(4) {
-            let mut bytes = old(at).to_le_bytes();
-            for (j, b) in bytes.iter_mut().enumerate() {
-                if let Some(byte) = rewritten(at - P * PIECE + j) {
-                    *b = byte;
-                }
-            }
-            expected.insert(at, u32::from_le_bytes(bytes));
-        }
-        expected.insert(a1_to, old(PIECE) + 1);
-        // A2's dword: the title's first byte, A2's other three.
-        let mut a2 = (old(PIECE) + 2).to_le_bytes();
-        a2[0] = rewritten(a2_to - P * PIECE).expect("a rewritten byte");
-        expected.insert(a2_to, u32::from_le_bytes(a2));
-        for k in 0..4 {
-            expected.insert(b_to(k), old(2 * PIECE) + k as u32);
-        }
-        let c_read = expected[&c_from];
-        expected.insert(c_to, c_read + 5);
-        for i in 0..LEN / 4 {
-            let at = i * 4;
-            // SAFETY: inside the allocation.
-            let got = unsafe { dword(at).read_volatile() };
-            let want = expected.get(&at).copied().unwrap_or_else(|| old(at));
-            assert_eq!(got, want, "title memory at {at:#x}: {got:#x}, not {want:#x}");
-        }
-        drop(lists);
-    }
 }
+
+#[cfg(test)]
+mod masked_tests;
