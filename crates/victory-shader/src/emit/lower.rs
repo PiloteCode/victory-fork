@@ -2420,6 +2420,9 @@ impl<'a> Lower<'a> {
             }
             self.fill_phis()?;
         }
+        // (the reads have given the pixel inputs their modes)
+        super::container::one_mode_per_register(&mut self.s.inputs, self.s.pixel);
+        super::container::one_mode_per_register(&mut self.s.outputs, false);
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();

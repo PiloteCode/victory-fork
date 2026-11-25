@@ -2028,6 +2028,160 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    /// The `PSV0` interpolation mode of the element at `row`, `col` with `cols` columns and
+    /// signature component type `comp` (1 u32, 3 f32).
+    fn mode_at(shader: &HostShader, row: u8, col: u8, cols: u8, comp: u8) -> u8 {
+        let c = Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let element = [1, row, 0x40 | col << 4 | cols, 0, comp];
+        let at = psv.windows(5).position(|w| w == element).unwrap();
+        psv[at + 5]
+    }
+
+    /// A program of `stage` with the signature parts `isg1`, `osg1` and stage data `io`.
+    fn translate_with(
+        stage: HwStage,
+        words: &[u32],
+        io: StageIo,
+        isg1: &[SigElement],
+        osg1: &[SigElement],
+    ) -> HostShader {
+        let native = NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io,
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let isg1 = container::signature(isg1, true);
+        let osg1 = container::signature(osg1, false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).unwrap()
+    }
+
+    fn packed(name: &str, kind: u8, comp: u8, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            col,
+            cols,
+            comp,
+            ..element(name, kind, row)
+        }
+    }
+
+    /// VS_Transform_VfxVBuffer_AlphaClip's register 1: a float2 the console declared
+    /// `nointerpolation` beside a uint2. The float's default, linear, packed two modes into
+    /// the register (refused by the validator); it takes the uint's.
+    #[test]
+    fn a_vertex_output_beside_an_integer_takes_its_mode() {
+        use crate::native::VsOutput;
+        let words = [
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x7E04_0287, // v_mov_b32 v2, 7
+            0xF800_020F,
+            0x0202_0101, // exp param0, v1, v1, v2, v2
+            0xF800_08CF,
+            0x0101_0101, // exp pos0, v1, v1, v1, v1 done
+            S_ENDPGM,
+        ];
+        let io = StageIo::Vs {
+            inputs: vec![],
+            outputs: vec![VsOutput {
+                usage: Usage::Generic,
+                row: 1,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+        };
+        let osg1 = [
+            element("SV_Position", 3, 0),
+            packed("TEXCOORD", 0, 9, 1, 0, 2),
+            SigElement {
+                index: 14,
+                ..packed("TEXCOORD", 0, 5, 1, 2, 2)
+            },
+        ];
+        let shader = translate_with(HwStage::Vs, &words, io, &[], &osg1);
+        assert_eq!(mode_at(&shader, 1, 0, 2, 3), 1, "the float2");
+        assert_eq!(mode_at(&shader, 1, 2, 2, 1), 1, "the uint2");
+        validate(&shader);
+    }
+
+    /// The pixel side of that register: the program reads the uint2 at its provoking vertex
+    /// (`v_interp_mov`, constant) and never the float2, whose default would be linear.
+    #[test]
+    fn an_unread_pixel_input_takes_the_mode_of_its_register() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC80A_0202, // v_interp_mov_f32 v2, p0, attr0.z
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let io = StageIo::Ps {
+            inputs: vec![PsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0b1100,
+                attr: 0,
+                flat: true,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            }],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        };
+        let isg1 = [
+            packed("TEXCOORD", 0, 9, 0, 0, 2),
+            SigElement {
+                index: 14,
+                ..packed("TEXCOORD", 0, 5, 0, 2, 2)
+            },
+        ];
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let shader = translate_with(HwStage::Ps, &words, io, &isg1, &[target]);
+        assert_eq!(mode_at(&shader, 0, 0, 2, 3), 1, "the float2");
+        assert_eq!(mode_at(&shader, 0, 2, 2, 1), 1, "the uint2");
+        validate(&shader);
+    }
+
+    /// PS_PropFoliageDeferred_Fire_ExportDepth's register 9: a float the program never reads
+    /// beside the front face (constant).
+    #[test]
+    fn an_unread_pixel_input_beside_the_front_face_is_constant() {
+        let words = [
+            0x7E04_02F2, // v_mov_b32 v2, 1.0
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ];
+        let io = StageIo::Ps {
+            inputs: vec![],
+            input_addr: 1 << 12,
+            db_shader_control: 0,
+            patches: vec![],
+        };
+        let isg1 = [
+            packed("TEXCOORD", 0, 9, 0, 0, 1),
+            packed("SV_IsFrontFace", 13, 5, 0, 1, 1),
+        ];
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let shader = translate_with(HwStage::Ps, &words, io, &isg1, &[target]);
+        assert_eq!(mode_at(&shader, 0, 0, 1, 3), 1, "the float");
+        validate(&shader);
+    }
+
     /// P10 of an attribute the program interpolates is P1 - P0.
     #[test]
     fn p10_of_an_interpolated_attribute() {
