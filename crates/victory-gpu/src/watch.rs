@@ -620,6 +620,15 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Runs `f` with the guards' lock held: no protection of the guards changes
+/// meanwhile. For `crate::coherence`, whose one-shot guards on single pages
+/// must not race a change of the blocks around them (its
+/// `protection_set` is told of every such change, under this lock).
+pub(crate) fn hold_guards<R>(f: impl FnOnce() -> R) -> R {
+    let _g = guards();
+    f()
+}
+
 /// `[first, last)` added to `ranges` (in order, joined). For ranges seen
 /// rarely (the views, once per new range): it sorts the whole list.
 fn add_range(ranges: &mut Vec<(usize, usize)>, first: usize, last: usize) {
@@ -1084,6 +1093,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+        crate::coherence::protection_set(block * BLOCK, (block + 1) * BLOCK, PAGE_READONLY);
         g.protected.insert(block);
         if view_known() {
             g.viewed.insert(block);
@@ -1114,14 +1124,18 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        let set = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
+        };
+        if set {
+            crate::coherence::protection_set(from * BLOCK, to * BLOCK, PAGE_READONLY);
         }
+        set
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
@@ -1217,7 +1231,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(&block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0 {
+            crate::coherence::protection_set(block * BLOCK, (block + 1) * BLOCK, PAGE_READWRITE);
+        }
         // A view block: not clean ([`Guards::unclean`]).
         if covered(&g.views, block, block + 1) {
             g.unclean.insert(block);
@@ -1233,6 +1249,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory. Upstream c75fdba's busy window, on these guards.
 pub fn writing(at: usize, len: usize) -> Writing {
+    // The one-shot guards of `crate::coherence` there come off first: the
+    // kernel's write would fail on one.
+    crate::coherence::written_over(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let end = at.saturating_add(len);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
@@ -1323,6 +1342,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         return;
     }
     crate::uheap::page_written(at, len);
+    crate::coherence::written_over(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1611,6 +1631,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     #[cfg(feature = "diagnostics")]
     remap_hook_part(3, &mut part);
+    crate::coherence::remapped(at, len);
     remapped_guards(at, len);
     #[cfg(feature = "diagnostics")]
     {
@@ -1746,6 +1767,7 @@ fn reopen_unknown(at: usize) -> bool {
     // SAFETY: a block of a title view; only its protection changes.
     let opened = unsafe { VirtualProtect(block as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
     if opened {
+        crate::coherence::protection_set(block, block + BLOCK, PAGE_READWRITE);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block no guard knew was opened"));
     }

@@ -47,7 +47,9 @@ pub fn title_memory_reserved(at: usize, len: usize, kind: u32, flags: u64, prote
     if at != 0 && len != 0 {
         crate::uheap::reserved(at, len, kind, flags, protect);
     }
-    if !(on() || skip_wc_back()) || at == 0 || len == 0 {
+    // (Also for the copy-back's watched pages, counted by write-combining:
+    // `crate::coherence`.)
+    if !(on() || skip_wc_back() || crate::coherence::observing()) || at == 0 || len == 0 {
         return;
     }
     RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, Reservation { len, kind, flags, protect });
@@ -86,8 +88,8 @@ pub(crate) fn skip_wc_compare() -> bool {
 }
 
 /// Whether the title buffer at `start` lies in memory the title reserved
-/// write-combining (needs the census or a skip switch on, which record the
-/// reservations).
+/// write-combining (needs the census, a skip switch or
+/// `VICTORY_COPYBACK_STATS` on, which record the reservations).
 pub(crate) fn is_wc(start: u64) -> bool {
     RESERVATIONS
         .lock()
