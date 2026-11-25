@@ -106,6 +106,10 @@ mod geometry_tests;
 mod intersect_tests;
 #[cfg(all(test, windows))]
 mod loop_tests;
+#[cfg(all(test, windows))]
+mod mask_join_tests;
+#[cfg(test)]
+mod title_tests;
 pub mod forms;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -113,6 +117,8 @@ mod idiom;
 mod lean;
 mod link;
 mod lower;
+#[cfg(all(test, windows))]
+mod mesh_bench_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod quad_tests;
