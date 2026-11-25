@@ -1,14 +1,18 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** With
-`VICTORY_BVH_BUILDER=1` the builder runs its whole first frame in the game
-(some 12,000 dispatches in the user-save scenario). In run rt-int1 the title
-died one frame later, its threads reading pointers of all ones out of pages
-that held what the builder wrote. The cause is found and fixed: the builder
-dispatches its box rehydration by thread counts, which the layer took for
-group counts, and those stages wrote empty nodes over gigabytes past their
-structures (see "Dispatches by thread counts" below). No run with the fix
-has been made yet. The builder stays off by default.
+Status, 2026-11-25: **the structure builder runs by default**
+(`VICTORY_BVH_BUILDER=0` turns it off). Its first frame in the game is some
+12,000 dispatches in the user-save scenario. In run rt-int1 the title died
+one frame later, its threads reading pointers of all ones out of pages that
+held what the builder wrote: the builder dispatches its box rehydration by
+thread counts, which the layer took for group counts, and those stages
+wrote empty nodes over gigabytes past their structures (see "Dispatches by
+thread counts" below). With the fix, run integ-general-2-rt2-builder had
+the builder on for 420 s of save gameplay: no fault, every stage run, some
+200 builder dispatches a frame once the world is up, and 88 ms more card
+time a frame in the same scene (160 ms against 72). The ray-traced passes
+now walk structures the builder made; whether they light as the console
+does is still to be compared picture by picture.
 
 ## What the title does
 
@@ -65,7 +69,8 @@ shaders and emulates the one instruction.
    64-lane waves running on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
    every builder pipeline the title has created has a host pipeline; otherwise
-   none run (`VICTORY_BVH_BUILDER=1` asks for it; `VICTORY_BVH_QUARANTINE=1`
+   none run (on by default, `VICTORY_BVH_BUILDER=0` turns the builder off;
+   `VICTORY_BVH_QUARANTINE=1`
    also keeps the builder's stores out of title memory, for a first test). A
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
@@ -171,20 +176,21 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- No run with the builder on has been made since the fix for dispatches by
-  thread counts (above). Until then (rt-int1 and before): the title died one
-  frame after the builder's first frame, 13 access violations on several
-  threads reading pointers of all ones or of infinities, each faulting
-  object 24 GiB below a tiled-heap range the box rehydration had overrun.
-- The trees are not known to be valid yet. The walk (`VICTORY_BVH_CHECK`,
-  which covers the structures InitHeaders starts: the dynamic ones and the
-  top-level ones) found 19,638 bad nodes in 283 structures in rt-int1, most
-  of them boxes of zeros or of the header stage's empty bounds, among them
-  the top-level structure at 0xd5f205e00 (787 instances), which lies in no
-  overrun: its instances' bounds come from the headers of the structures
-  they name, which the overruns and the leaves' zeros may have spoiled. The
-  walk reads title memory, which holds only what was put back: a node in a
-  window no dispatch named reads as it was.
+- Before the fix for dispatches by thread counts (rt-int1 and before) the
+  title died one frame after the builder's first frame, 13 access
+  violations on several threads reading pointers of all ones or of
+  infinities, each faulting object 24 GiB below a tiled-heap range the box
+  rehydration had overrun. Since the fix: none in 420 s (run
+  integ-general-2-rt2-builder).
+- The trees are not all known to be valid. In run integ-general-2-rt2-builder
+  the walk (`VICTORY_BVH_CHECK`) flagged some 10% of nodes, but it read most
+  of them before the builder's writes were put back (a structure rebuilt in
+  frame 3255 was walked at the start of 3256 still in its streamed form),
+  and held the rebuilt structures' roots to bounds in another space (the
+  leaf rehydration's scale); both are fixed in the walk since, and a run
+  with it has to say what is left. The walk reads title memory, which holds
+  only what was put back: a node in a window no dispatch named reads as it
+  was, and a structure the title rebuilds every frame may change under it.
 - What a stage reaches only through addresses in title memory (not in
   upload memory), such as the structures a top-level build's instances
   name, is not made ready unless something else named it; an access that
@@ -202,7 +208,10 @@ shaders and emulates the one instruction.
   threads, the last group cut short (the flags carry no `PARTIAL_TG_EN`, but
   the box stages place their payloads by the lanes in EXEC, which only a cut
   short wave makes right).
-- Cost on the GPU is unmeasured.
+- Cost: with the builder on, 88 ms more card time a frame in the window
+  scene of the save gameplay (160 ms against 72, run
+  integ-general-2-rt2-builder, its trace on). Its cost to the frame, which
+  the submitting thread bounds, is still to be measured without the trace.
 
 ## Where to look
 

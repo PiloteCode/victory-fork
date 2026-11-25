@@ -251,7 +251,7 @@ Rendering:
 - Gathers at a named mip level (with and without an offset) read level 0; fixed.
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- Ray tracing, in progress: the game's own structure builder runs by default (`VICTORY_BVH_BUILDER=0` turns it off; 420 s of save gameplay with it, no fault, some 88 ms more card time a frame), title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -303,15 +303,12 @@ they fill small constant buffers whose CPU-side copies then wait for the
 card), a table's constants read from the card copies (the scene vanished:
 refreshes leave ranges under shader writes alone), clamp windows of 1,024
 records or lasting to the title's next barrier (no fewer clamps that matter,
-no frame time gained), the ray-tracing structure builder
-(`VICTORY_BVH_BUILDER=1`: its first frame runs whole; the title died one
-frame later because the builder's dispatches by thread counts were taken
-for group counts, fixed since; see docs/fork-ray-tracing.md).
+no frame time gained).
 
-Still open: the ray-tracing structure builder (all 52 programs get
-pipelines and its first frame runs, with its upload memory, sizes, copies,
-streamed pages and dispatches by thread counts fixed; off by default until
-a run with it on walks clean, so shadows stay dark); ~95 ms of card time a frame, 19 ms of it
+Still open: the ray-tracing structure builder's cost and pictures (on by
+default since a run of 420 s with it on had no fault; some 88 ms more card
+time a frame, and its pictures still to be compared with the console's);
+~95 ms of card time a frame, 19 ms of it
 our clamps of indirect records (the card still turns from drawing to
 compute and back for each of 2,500 a frame: the title's ~710 barriers a
 frame cut its runs of records short); ~60 ms a frame that the submitting
