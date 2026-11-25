@@ -3342,9 +3342,14 @@ impl State {
                 // records: if none may, the card holds them as they are when
                 // the list begins, and they are clamped in its prelude
                 // (`crate::indirect::early`): nothing of ours goes into the
-                // list.
+                // list. Taken as written where shaders write undeclared:
+                // title memory in place (`VICTORY_INPLACE`), and any memory
+                // once a shader of the list stores through addresses (into
+                // copies no dispatch names: `crate::memory`).
                 let span = len.max(u64::from(step) * u64::from(records));
-                let written = list.writes_declared((arguments as usize, (arguments + span) as usize));
+                let written = args.in_place()
+                    || list.asked(crate::memory::STORES)
+                    || list.writes_declared((arguments as usize, (arguments + span) as usize));
                 let early = crate::indirect::early() && counter.is_none() && !written;
                 #[cfg(feature = "diagnostics")]
                 {
