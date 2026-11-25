@@ -10645,6 +10645,147 @@ void main() {
         drop(lists);
     }
 
+    /// `VICTORY_COPYBACK=lazy` end to end on the software adapter: a
+    /// shader writes three pieces of a title buffer's copy in the card's
+    /// memory; at the landing they stay on the card, their title memory
+    /// closed; a kernel read, a read in place and a write of the title each
+    /// bring one back with the shader's bytes, and the title's write wins:
+    /// the next submission's shader reads it.
+    ///
+    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_RELAY=2
+    ///  VICTORY_COPYBACK=lazy cargo test -p victory-gpu --features
+    ///  diagnostics warp_lazy -- --nocapture`
+    #[test]
+    fn warp_lazy_copy_back_brings_shader_writes_back_at_first_touch() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        if !crate::coherence::lazy() || !relay() {
+            eprintln!("queue2_tests: lazy skipped, VICTORY_COPYBACK=lazy and VICTORY_RELAY=2 are not both set");
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        // Never on a real card.
+        // SAFETY: a plain query.
+        let software = host
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if !software {
+            eprintln!("queue2_tests: lazy skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
+            return;
+        }
+        const PIECE: usize = 64 << 10;
+        const LEN: usize = 4 << 20;
+        // "Title memory": write-watched, reserved as the runtime reserves
+        // the title's (the lazy copy-back closes only such memory).
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        assert!(!title.is_null());
+        crate::census::title_memory_reserved(title as usize, LEN, 0, 0, 0);
+        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
+        let old = |at: usize| 0x5A00_0000 | (at / 4) as u32;
+        for i in 0..LEN / 4 {
+            // SAFETY: inside the allocation.
+            unsafe { dword(i * 4).write_volatile(old(i * 4)) };
+        }
+        crate::shadow::register(0x53_5353, title as u64, LEN as u64);
+        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        if !shadow.carded() {
+            eprintln!("queue2_tests: lazy skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            return;
+        }
+        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        // A submission whose shader stores `memory[from] + add` at each
+        // `to` of `writes`, the pieces of those declared as shader-written.
+        let submit = |writes: &[(usize, usize, u32)]| {
+            let list = host.new_list().expect("a host list");
+            shadow.refresh(&list, title as u64, LEN as u64);
+            for &(to, _, _) in writes {
+                shadow.gpu_writes(&list, (title as usize + to / PIECE * PIECE) as u64, PIECE as u64);
+            }
+            // SAFETY: an open list; the copy's buffer, with unordered
+            // access; the shader's own root signature.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                for &(to, from, add) in writes {
+                    let constants = [to as u32, from as u32, add, 0];
+                    list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                    list.list.Dispatch(1, 1, 1);
+                }
+            }
+            list.close();
+            host.execute_own(&list);
+            settle_now(WHY_SYNC);
+            list
+        };
+        // Three pieces, each in a 512 KiB window of its own.
+        let to = [30 * PIECE + 128, 33 * PIECE + 136, 41 * PIECE + 144];
+        let from = |k: usize| (1 + k) * PIECE + 4 * k + 64;
+        let titles = |k: usize| 0x0100_0000 + 0x1000 * k as u32 + 7;
+        for k in 0..3 {
+            // SAFETY: inside the allocation.
+            unsafe { dword(from(k)).write_volatile(titles(k)) };
+        }
+        let first = submit(&[(to[0], from(0), 0), (to[1], from(1), 1), (to[2], from(2), 2)]);
+        let at = |k: usize| title as usize + to[k];
+        for k in 0..3 {
+            assert!(crate::coherence::owns(at(k), 4), "piece {k} was not left on the card (see the per-second lazy line's reasons)");
+        }
+        // A kernel read (under the least a copy in place takes) fails on
+        // the closed page, brings the piece back, and reads.
+        let mut out = [0u8; 16];
+        assert!(read_into(at(0) as *const u8, &mut out), "a kernel read of a piece left on the card");
+        assert_eq!(u32::from_le_bytes([out[0], out[1], out[2], out[3]]), titles(0));
+        assert_eq!(u32::from_le_bytes([out[4], out[5], out[6], out[7]]), old(to[0] + 4));
+        assert!(!crate::coherence::owns(at(0), 4));
+        assert!(crate::coherence::owns(at(1), 4) && crate::coherence::owns(at(2), 4), "the other windows stay on the card");
+        // A read in place faults and brings the piece back.
+        // SAFETY: inside the allocation.
+        assert_eq!(unsafe { dword(to[1]).read_volatile() }, titles(1) + 1);
+        assert!(!crate::coherence::owns(at(1), 4));
+        // A write of the title brings the piece back first and wins.
+        // SAFETY: inside the allocation.
+        unsafe { dword(to[2]).write_volatile(0x00C0_FFEE) };
+        assert!(!crate::coherence::owns(at(2), 4));
+        // SAFETY: inside the allocation.
+        assert_eq!(unsafe { dword(to[2]).read_volatile() }, 0x00C0_FFEE);
+        // Nothing else moved.
+        let touched: std::collections::HashSet<usize> = (0..3).flat_map(|k| [from(k), to[k]]).collect();
+        for i in (0..LEN / 4).filter(|i| !touched.contains(&(i * 4))) {
+            // SAFETY: inside the allocation.
+            let got = unsafe { dword(i * 4).read_volatile() };
+            assert_eq!(got, old(i * 4), "dword {i} of title memory changed");
+        }
+        // The title's write went up with the next refresh: a shader reads
+        // it, and its sum comes back at the first touch.
+        let sum = 50 * PIECE + 152;
+        let second = submit(&[(sum, to[2], 1)]);
+        // SAFETY: inside the allocation.
+        assert_eq!(unsafe { dword(sum).read_volatile() }, 0x00C0_FFEF, "the shader read the title's write");
+        drop((first, second));
+    }
+
     /// `memory[to] = first` at once; then `spin` steps, each a store to
     /// `memory[to + 4]`; then `memory[to + 4] = 0` and `memory[to] = last`.
     /// Whatever `spin` is, the bytes it leaves are the same.
