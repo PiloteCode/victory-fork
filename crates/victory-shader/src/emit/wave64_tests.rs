@@ -223,6 +223,193 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     eprintln!("ran on the hardware device: the sum {tree:#x} of the console's tree");
 }
 
+/// One console wave of 64 threads in two host waves of 32 that exchange (the exchange form):
+/// two wave sums in a row, of the thread index and of the thread index's low five bits, each
+/// stored by every thread (dwords 0 and 1). With `VICTORY_WAVE_EXCHANGE2` the exchanges take
+/// the two pairs of exchange dwords in turn and the first one's second meeting goes; with
+/// `VICTORY_WAVE_BASE_DIRECT` (a group of one dimension) each host wave takes its first
+/// thread index as its base instead of an LDS counter. Every combination validates, each
+/// switch changes the program, and on a host of 32-lane waves each stores the console's sums
+/// (2016 and 992).
+#[test]
+fn exchanges_in_a_row_take_two_pairs_in_turn_and_meet_once_each() {
+    // (the wave OR's words with v_add_nc_u32 for v_or_b32: a sum over the wave into s7)
+    let sum = super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 0x25 << 25 } else { w });
+    let mut words = vec![
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x3610_009F, // v_and_b32 v8, 31, v0
+        0x7E0E_0300, // v_mov_b32 v7, v0
+    ];
+    words.extend(sum.clone());
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0x7E0E_0308,          // v_mov_b32 v7, v8
+    ]);
+    words.extend(sum);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18 | 4,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0 offset:4
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered_with = |two: bool, direct: bool| {
+        let was = (
+            lower::TEST_HOST_WAVE.replace(Some(32)),
+            lower::TEST_EXCHANGE2.replace(Some(two)),
+            lower::TEST_BASE_DIRECT.replace(Some(direct)),
+        );
+        lower::TEST_MEETINGS_DROPPED.set(0);
+        lower::TEST_BASES_DIRECT.set(0);
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(was.0);
+        lower::TEST_EXCHANGE2.set(was.1);
+        lower::TEST_BASE_DIRECT.set(was.2);
+        let lowered = lowered.expect("lower");
+        assert_eq!((lowered.form, lowered.wave_size), (super::forms::EXCHANGE, Some(32)), "exchange2 {two}, direct {direct}");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views.clone(),
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        (shader, lower::TEST_MEETINGS_DROPPED.get(), lower::TEST_BASES_DIRECT.get())
+    };
+    let (once, dropped_off, direct_off) = lowered_with(false, false);
+    let (twice, dropped_on, _) = lowered_with(true, false);
+    let (direct, _, direct_on) = lowered_with(false, true);
+    let (both, dropped_both, direct_both) = lowered_with(true, true);
+    assert_eq!((dropped_off, direct_off), (0, 0), "without the switches every exchange meets twice");
+    assert!(dropped_on > 0, "with the first, an exchange followed by another in its block meets once");
+    assert!(direct_on > 0 && direct_both > 0 && dropped_both > 0, "with the second, the wave base needs no LDS");
+    for (other, name) in [(&twice, "pairs in turn"), (&direct, "direct bases"), (&both, "both")] {
+        assert_ne!(once.dxil, other.dxil, "{name}");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (shader, name) in [(&once, "two meetings"), (&twice, "pairs in turn"), (&direct, "direct bases"), (&both, "both")] {
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(shader) else {
+            eprintln!("the hardware device does not take this program (waves of 32?); not run");
+            return;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(&out[0][..2], &[2016, 992], "{name}");
+    }
+    eprintln!("ran on the hardware device: both wave sums, with and without each switch");
+}
+
+/// One console wave of 64 threads sharing LDS without barriers, run as two host waves of 32
+/// (the halves form, which meets before each LDS access): each thread writes 7 t to its
+/// dword, then reads its mirror thread's (63 - t) and its neighbour's (t ^ 1). With
+/// `VICTORY_WAVE_LDS_READS` the second read, right after the first, goes without its meeting;
+/// both forms validate, and on a host of 32-lane waves both read what the console's lanes
+/// wrote.
+#[test]
+fn an_lds_read_after_a_read_needs_no_meeting_of_its_own() {
+    let mut w = vec![vop2(0x1A, 1, k(2), 0)]; // v_lshlrev_b32 v1, 2, v0: this thread's dword
+    w.extend(vop3(0x169, 2, v(0), k(7))); // v_mul_lo_u32 v2, v0, 7
+    w.extend(ds(0x0D, 0, 1, 2, 0)); // ds_write_b32 v1, v2
+    w.extend([
+        vop2(0x26, 5, k(63), 0), // v_sub_nc_u32 v5, 63, v0: the mirror thread
+        vop2(0x1A, 5, k(2), 5),  // v_lshlrev_b32 v5, 2, v5: its dword
+        vop2(0x1D, 8, k(1), 0),  // v_xor_b32 v8, 1, v0: the neighbour
+        vop2(0x1A, 8, k(2), 8),  // v_lshlrev_b32 v8, 2, v8: its dword
+    ]);
+    w.extend(ds(0x36, 6, 5, 0, 0)); // ds_read_b32 v6, v5
+    w.extend(ds(0x36, 7, 8, 0, 0)); // ds_read_b32 v7, v8
+    w.extend(stores([6, 7, 6, 7]));
+    let native = native_with(&w, true, 64, 256);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered_with = |reads: bool| {
+        let was = (lower::TEST_HOST_WAVE.replace(Some(32)), lower::TEST_LDS_READS.replace(Some(reads)));
+        lower::TEST_MEETINGS_DROPPED.set(0);
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(was.0);
+        lower::TEST_LDS_READS.set(was.1);
+        let lowered = lowered.expect("lower");
+        assert_eq!((lowered.form, lowered.wave_size), (super::forms::HALVES, Some(32)), "lds reads {reads}");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views.clone(),
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        (shader, lower::TEST_MEETINGS_DROPPED.get())
+    };
+    let (each, dropped_off) = lowered_with(false);
+    let (shared, dropped_on) = lowered_with(true);
+    assert_eq!((dropped_off, dropped_on), (0, 1), "the second read's meeting only");
+    assert_ne!(each.dxil, shared.dxil);
+    let want: Vec<u32> = (0..64u32).flat_map(|t| [7 * (63 - t), 7 * (t ^ 1), 7 * (63 - t), 7 * (t ^ 1)]).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (shader, name) in [(&each, "a meeting each"), (&shared, "reads together")] {
+        let Some(got) = run_paired(shader, [0; 4], 256) else { return };
+        assert_eq!(got, want, "{name}");
+    }
+    eprintln!("ran on the hardware device: the LDS reads as the console's lanes made them");
+}
+
 /// The console's 16-bit wave sum where the lanes at or past s0 have left the program (a
 /// thread past the end of the data): on the console they add +0, and after each step of the
 /// tree they hold their run's partial sum all the same. On a host of 64-lane waves (AMD) the
