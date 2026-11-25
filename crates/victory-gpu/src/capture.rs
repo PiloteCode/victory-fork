@@ -420,6 +420,40 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_DUMP_TARGETS` as a comma-separated list of `<w>x<h>` or
+/// `<w>x<h>f<format>` (the host texture's format, as the file name has it):
+/// only the targets of those sizes (and formats) are saved. Any other value
+/// saves them all. A frame of the opening writes hundreds of targets; saving
+/// them all took 15 to 20 s a frame, and the cutscene, which keeps time
+/// with its sound, went on without the frames in between.
+fn dump_sizes() -> &'static [(u64, u32, Option<i32>)] {
+    static LIST: std::sync::OnceLock<Vec<(u64, u32, Option<i32>)>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| parse_dump_sizes(&std::env::var("VICTORY_DUMP_TARGETS").unwrap_or_default()))
+}
+
+/// The sizes (and formats) of a `VICTORY_DUMP_TARGETS` list; what is not
+/// one is left out.
+fn parse_dump_sizes(list: &str) -> Vec<(u64, u32, Option<i32>)> {
+    list.split(',')
+        .filter_map(|item| {
+            let (w, rest) = item.trim().split_once('x')?;
+            let (h, format) = match rest.split_once('f') {
+                Some((h, f)) => (h, Some(f.parse().ok()?)),
+                None => (rest, None),
+            };
+            Some((w.parse().ok()?, h.parse().ok()?, format))
+        })
+        .collect()
+}
+
+/// Whether a target of `width` x `height` in `format` is saved.
+fn dump_wanted(sizes: &[(u64, u32, Option<i32>)], width: u64, height: u32, format: i32) -> bool {
+    sizes.is_empty()
+        || sizes
+            .iter()
+            .any(|&(w, h, f)| w == width && h == height && f.is_none_or(|f| f == format))
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
@@ -442,7 +476,10 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1
+            || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || !dump_wanted(dump_sizes(), d.Width, d.Height, d.Format.0)
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -1057,6 +1094,21 @@ mod tests {
         assert_eq!(listed, [100, 101, 102]);
         assert!(!(0..5).any(|n| super::in_timed_run(u64::MAX, n)));
         assert!(!super::in_timed_run(u64::MAX, u64::MAX));
+    }
+
+    /// A list of sizes keeps those targets (a format, when given, too); a
+    /// value that is no list keeps them all.
+    #[test]
+    fn dump_sizes_pick_targets() {
+        let sizes = super::parse_dump_sizes("1280x720, 2560x1440f10,junk,64xq");
+        assert_eq!(sizes, [(1280, 720, None), (2560, 1440, Some(10))]);
+        assert!(super::dump_wanted(&sizes, 1280, 720, 26));
+        assert!(super::dump_wanted(&sizes, 2560, 1440, 10));
+        assert!(!super::dump_wanted(&sizes, 2560, 1440, 19));
+        assert!(!super::dump_wanted(&sizes, 640, 360, 10));
+        let all = super::parse_dump_sizes("1");
+        assert!(all.is_empty());
+        assert!(super::dump_wanted(&all, 640, 360, 10));
     }
 
     #[test]
