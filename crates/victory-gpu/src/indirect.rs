@@ -264,6 +264,10 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// of its two layers, 2560x1440 in 8x8 tiles), cut to 65,535 before, so
 /// the farther layer was left unblurred below a row of the picture.
 pub(crate) const SPLIT_DISPATCH: u32 = 3;
+/// A list's indirect work budget, as the clamp's source has it (`BUDGET`):
+/// vertex instances and threads (groups as 64, mesh groups as 128).
+pub(crate) const BUDGET: u32 = 1 << 27;
+
 /// Records a split dispatch record becomes: up to 4 x 65,535 groups in x.
 pub(crate) const SPLIT: u32 = 4;
 /// Bytes of a record of a split dispatch: base, x, y, z.
@@ -1087,6 +1091,14 @@ void main() {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// The budget the host reads back is the one the clamp charges.
+    #[test]
+    fn budget_matches_the_clamps() {
+        let line = format!("static const uint BUDGET = 1u << {};", BUDGET.trailing_zeros());
+        assert!(SOURCE.contains(&line), "{line}");
+        assert!(BUDGET.is_power_of_two());
     }
 
     #[test]
