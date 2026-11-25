@@ -89,7 +89,11 @@ impl Host {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         let mut kept = DEVICES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(KeptDevice(device)) = &kept[usize::from(warp)] {
-            return Ok(Host { device: device.clone() });
+            return Ok(Host {
+                device: device.clone(),
+                #[cfg(test)]
+                queue: std::cell::OnceCell::new(),
+            });
         }
         let made = Self::make(warp)?;
         kept[usize::from(warp)] = Some(KeptDevice(made.device.clone()));
