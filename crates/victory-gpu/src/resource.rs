@@ -1161,6 +1161,10 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// Diagnostics: the frame (plus one; 0: never) in which a list last put
+    /// its host copy in a state it is written in ([`note_written`]).
+    #[cfg(feature = "diagnostics")]
+    written: std::sync::atomic::AtomicU64,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1298,6 +1302,26 @@ pub(crate) fn note_unaliased(this: This) {
             d.width, d.height, d.depth_or_array_size, d.mip_levels, d.format, d.flags, d.dimension
         )
     };
+    // When the host last wrote the other texture: this view is uploaded
+    // now because the title has just written its memory, so what the title
+    // wrote there is the newest unless the other texture was written since.
+    let now = crate::frame::current();
+    let last = o.host.written.load(std::sync::atomic::Ordering::Relaxed);
+    let ago = last.checked_sub(1).map(|f| now.saturating_sub(f));
+    UNALIASED[match ago {
+        Some(0..=1) => 1,
+        Some(_) => 2,
+        None => 3,
+    }]
+    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    UNALIASED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let relation = if start == at {
+        "at the same address".to_owned()
+    } else if start < at {
+        format!("from {} KiB before its start, over its first {} KiB", (at - start) >> 10, (end.min(at + len) - at) >> 10)
+    } else {
+        format!("from {} KiB into it", (start - at) >> 10)
+    };
     tracing::warn!(
         texture = ?this,
         at = format_args!("{start:#x}+{size:#x}"),
@@ -1305,8 +1329,31 @@ pub(crate) fn note_unaliased(this: This) {
         written = ?other,
         written_at = format_args!("{at:#x}+{len:#x}"),
         written_shape = %shape(&o.desc),
-        "a view read from title memory meets a texture the host writes, of another shape: what the host wrote is not what it shows"
+        frames_since_the_host_wrote_it = ?ago,
+        counts = ?UNALIASED.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)),
+        "a view read from title memory overlaps a texture the host writes, in another shape, {relation}: the title has just written the view's memory, and the view shows that"
     );
+}
+
+/// Diagnostics, of the views [`note_unaliased`] logged: all, those whose
+/// overlapped texture the host wrote in this frame or the one before (the
+/// two in use at once), longer ago, and never.
+#[cfg(all(windows, feature = "diagnostics"))]
+static UNALIASED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Diagnostics: a list moves title texture `this` to host state `state`;
+/// a state it is written in (render target, unordered access, depth write,
+/// copy or resolve destination) notes the frame ([`Hosted::written`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_written(this: This, state: u32) {
+    const WRITES: u32 = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
+    if this.is_null() || state & WRITES == 0 {
+        return;
+    }
+    resource(this)
+        .host
+        .written
+        .store(crate::frame::current() + 1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -2349,6 +2396,8 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            written: std::sync::atomic::AtomicU64::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
