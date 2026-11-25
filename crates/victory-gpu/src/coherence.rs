@@ -70,12 +70,15 @@
 //! card's results; expect wrong pictures
 //! where the title's CPU writes a 64 KiB piece the card also wrote (the next
 //! upload sends the title's stale bytes over the card's).
-//! `VICTORY_COPYBACK=lazy` and `=predict` are not in this build yet: they
-//! copy back as before, and say so.
+//!
+//! `VICTORY_COPYBACK=lazy` ([`lazy`], stage 3; off by default) keeps what
+//! shaders wrote on the card until the CPU touches it: see the section
+//! "Stage 3" below. `=predict` (stage 4) is not in this build: it copies
+//! back as before, and says so.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The kernel's page: the unit a guard covers.
 const KERNEL_PAGE: usize = 4096;
@@ -86,16 +89,18 @@ const BLOCK: usize = 64 << 10;
 /// The most pages watched at once.
 pub(crate) const MOST_ARMED: usize = 256;
 
-/// What shaders write is copied back as before ([`Mode::Eager`]), or not
-/// ([`Mode::Off`], a measurement mode).
+/// What shaders write is copied back as before ([`Mode::Eager`]), not
+/// ([`Mode::Off`], a measurement mode), or at the CPU's first touch
+/// ([`Mode::Lazy`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Mode {
     Eager,
     Off,
+    Lazy,
 }
 
 /// `VICTORY_COPYBACK`: unset (or `eager`) copies back as before; `off`, a
-/// measurement mode ([`off`]). Read once.
+/// measurement mode ([`off`]); `lazy`, stage 3 ([`lazy`]). Read once.
 pub(crate) fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| {
@@ -110,9 +115,21 @@ pub(crate) fn mode() -> Mode {
                 );
                 Mode::Off
             }
+            "lazy" => {
+                tracing::info!(
+                    window_kb = WINDOW >> 10,
+                    keep = off_keep(),
+                    write_combining = lazy_wc(),
+                    demote_after = demote_after(),
+                    "VICTORY_COPYBACK=lazy: the 64 KiB pieces shaders wrote to a title buffer's copy in the card's memory stay \
+                     there, their title memory closed, until the CPU first touches them (write-watched memory held by one \
+                     copy; the rest is copied back as before)"
+                );
+                Mode::Lazy
+            }
             "" | "eager" => Mode::Eager,
             other => {
-                tracing::warn!("VICTORY_COPYBACK={other} is not in this build (lazy and predict are planned): copied back as before");
+                tracing::warn!("VICTORY_COPYBACK={other} is not in this build (predict is planned): copied back as before");
                 Mode::Eager
             }
         }
@@ -134,7 +151,7 @@ pub(crate) fn off() -> bool {
 /// fetches and merges only.
 pub(crate) fn reads_wait() -> bool {
     static WAIT: OnceLock<bool> = OnceLock::new();
-    *WAIT.get_or_init(|| !off() || crate::switch::on("VICTORY_TEXTURE_BACK"))
+    *WAIT.get_or_init(|| !off() || crate::texback::on())
 }
 
 /// With [`off`], the most bytes of a declared range that is still copied
@@ -542,6 +559,12 @@ pub(crate) fn written_over(at: usize, len: usize) {
     if observing() {
         let_go(at, len, WRITTEN_OVER);
     }
+    // What the card keeps there comes back first: the kernel's write would
+    // fail on a closed page, and a write of part of a piece must land on
+    // the card's bytes, not on the stale ones.
+    if lazy() {
+        release(at, len, BY_WRITING);
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: the
@@ -549,6 +572,10 @@ pub(crate) fn written_over(at: usize, len: usize) {
 pub(crate) fn remapped(at: usize, len: usize) {
     if observing() {
         let_go(at, len, REMAPPED);
+    }
+    // Pieces kept on the card there no longer name what the addresses show.
+    if lazy() {
+        forget(at, len);
     }
 }
 
@@ -558,7 +585,12 @@ pub(crate) fn remapped(at: usize, len: usize) {
 /// guards (our handler lets that through), counted as read by our own code
 /// through the kernel and watched on (the guards come back at the next
 /// [`rearm`]); then the read is tried again with `again`. Whether it read.
-pub(crate) fn read_again(src: usize, len: usize, again: impl FnMut() -> bool) -> bool {
+pub(crate) fn read_again(src: usize, len: usize, mut again: impl FnMut() -> bool) -> bool {
+    // A page the lazy copy-back keeps closed fails it too: what the card
+    // keeps there comes back, and the read is tried again.
+    if lazy() && release(src, len, BY_KERNEL) && again() {
+        return true;
+    }
     observing() && read_through(src, len, again)
 }
 
@@ -858,6 +890,9 @@ pub(crate) fn line(frames: f64) {
             off_keep()
         );
     }
+    if lazy() {
+        lazy_line(frames);
+    }
     if !observing() {
         return;
     }
@@ -935,9 +970,1055 @@ pub(crate) fn line(frames: f64) {
     );
 }
 
+// Stage 3: `VICTORY_COPYBACK=lazy`.
+//
+// At a flight's landing the card's compare still flags the 64 KiB pieces
+// its shaders changed (`crate::host`'s `relay_card_back`). A flagged piece
+// that may be left on the card ([`take`]) is not fetched: it is "owned by
+// the card", noted here with the copy that holds it and the flight that
+// wrote it last, and the 4 KiB pages of title memory under it are closed
+// (no access). The title's first touch of a closed page faults into our
+// handler ([`install`], first in the line, ahead of the copies in place and
+// the guards), which fetches the owned pieces of the 512 KiB window around
+// it through the relay's copy queue (no title list), puts what shaders
+// wrote into title memory and the copy's CPU side, opens the pages and lets
+// the instruction run again ([`resolve_range`]). Our own reads and writes
+// of title memory bring the pieces back the same way first: in place they
+// fault like the title's; through the kernel they fail, and are tried again
+// after ([`read_again`]); the runtime's writes ([`written_over`], through
+// `crate::watch::writing`) and system calls that read title buffers
+// ([`kernel_will_read`]) bring them back before the kernel is asked.
+//
+// Which pieces may be left on the card (the rest is copied back as before,
+// counted by reason in the per-second line):
+// - a title buffer's copy in the card's memory, not a window outside
+//   buffers, and no other host copy, staged texture or fill read ahead of a
+//   flight holds any of the piece: their bytes would be older than the
+//   card's with nothing to say so (the write watch sees no write);
+// - a declared range longer than `VICTORY_COPYBACK_OFF_KEEP` (256 bytes),
+//   not a texture read back (`VICTORY_TEXTURE_BACK`): small values the
+//   title may poll;
+// - memory the runtime reserved write-watched (`XMemVirtualAlloc`, never a
+//   view of physical pages: no other address shows those pages, so one
+//   change of protection closes every way in), committed read-write; with
+//   `VICTORY_COPYBACK_LAZY_WC=0` not write-combining memory;
+// - no title bytes still on their way to the card there (the copy's CPU
+//   side holds bytes not sent, or sent after the flight), and no write of
+//   the title since the last asking of the write watch (looked at once the
+//   pages are closed);
+// - not a piece the title touched first after
+//   `VICTORY_COPYBACK_LAZY_DEMOTE` (4) ownerships in a row: the title reads
+//   it, and fetching it at each touch costs more than fetching it at once.
+//
+// The invariants, and where each is kept:
+// 1. protect before copy: a piece is noted, then closed, then the write
+//    watch asked ([`own`]); a write that came first leaves it eager.
+// 2. ownership only after pending CPU bytes are sent: `Shadow::cpu_pending`.
+// 3. no upload covers an owned range: a refresh reads title memory before
+//    it sends anything up, and that read brings the piece back first (in
+//    place: the handler; through the kernel: [`read_again`]; `read_sparse`
+//    never takes a closed page for a hole); only one copy holds an owned
+//    piece, so no other copy's refresh can skip it as unwritten.
+// 4. a CPU write wins: the merge puts only the bytes the card changed
+//    (against the copy's CPU side) into title memory; a title write after
+//    the fault lands on top, and goes up at the next refresh.
+// 5. our code and the runtime see current bytes: the same three ways in.
+// 6. remove write, then read, under one lock: a piece is closed with one
+//    change (no access) and opened with one, both under [`LAZY`]'s lock,
+//    held by the handler's look too.
+// 7. no stack or code shares a closed page: only write-watched GPU
+//    reservations of the title are closed.
+//
+// Known limits: a thread that touches an owned page between the moment
+// another thread's fault opens it and the end of that fault's write sees
+// the bytes from before (there is no second view of private memory to
+// write through while it stays closed); the merge of the copy's CPU side
+// takes the card's bytes where they differ from it, as the eager merge
+// does. With the switch on, the in-flight fetch (`VICTORY_CARD_FETCH_INFLIGHT`)
+// is off: lazy needs the relay's own fetch.
+
+/// A 64 KiB piece of title memory, as the card's compare cuts the copies
+/// (at multiples of 64 KiB of title memory).
+const PIECE: usize = 64 << 10;
+/// What a first touch brings back: the owned pieces of the aligned window
+/// around it.
+const WINDOW: usize = 512 << 10;
+
+/// [`Mode::Lazy`].
+pub(crate) fn lazy() -> bool {
+    mode() == Mode::Lazy
+}
+
+/// Whether memory the title reserved write-combining may be left on the
+/// card (`VICTORY_COPYBACK_LAZY_WC=0`: no).
+fn lazy_wc() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPYBACK_LAZY_WC").is_none_or(|v| v != "0"))
+}
+
+/// After how many ownerships in a row that the title touched first a piece
+/// stays eager (`VICTORY_COPYBACK_LAZY_DEMOTE`, 4; 0: never).
+fn demote_after() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_COPYBACK_LAZY_DEMOTE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+}
+
+/// The title's reservations the runtime made (`XMemVirtualAlloc` at an
+/// address of its choice), by start: end, whether they are write-watched
+/// private memory (not a placeholder for views of physical pages), whether
+/// the title asked for write-combining.
+static RESERVED: Mutex<BTreeMap<usize, (usize, bool, bool)>> = Mutex::new(BTreeMap::new());
+
+/// `crate::census::title_memory_reserved`: the runtime reserved `[at, at +
+/// len)` with the title's `kind` and console `protect`.
+pub(crate) fn reserved(at: usize, len: usize, kind: u32, protect: u32) {
+    if !lazy() || at == 0 || len == 0 {
+        return;
+    }
+    // As `victory-hle`'s xmem: 64 KiB pages reserved without a commit are
+    // a placeholder (physical pages mapped later, views); the rest is
+    // reserved with write watching.
+    const PAGES_64K: u32 = 0x2040_0000;
+    const MEM_COMMIT: u32 = 0x1000;
+    const WRITE_COMBINE: u32 = 0x400;
+    let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
+    RESERVED.lock().unwrap_or_else(|e| e.into_inner()).insert(at, (at + len, !placeholder, protect & WRITE_COMBINE != 0));
+}
+
+/// Of title memory `[from, to)`: whether one write-watched reservation
+/// holds it, and whether it is write-combining.
+fn reservation(from: usize, to: usize) -> Option<bool> {
+    let reserved = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, &(end, watched, wc)) = reserved.range(..=from).next_back()?;
+    (watched && to <= end).then_some(wc)
+}
+
+/// With [`lazy`]: how many host copies hold each 64 KiB piece of title
+/// memory, by piece number.
+static COVER: Mutex<BTreeMap<usize, u32>> = Mutex::new(BTreeMap::new());
+
+/// A host copy of title memory `[start, start + len)` was made
+/// (`crate::shadow`).
+pub(crate) fn copy_made(start: usize, len: usize) {
+    if !lazy() || len == 0 {
+        return;
+    }
+    let mut cover = COVER.lock().unwrap_or_else(|e| e.into_inner());
+    for piece in start / PIECE..=(start + len - 1) / PIECE {
+        *cover.entry(piece).or_insert(0) += 1;
+    }
+}
+
+/// A host copy of `[start, start + len)` is gone (or was title memory in
+/// place, not a copy).
+pub(crate) fn copy_gone(start: usize, len: usize) {
+    if !lazy() || len == 0 {
+        return;
+    }
+    let mut cover = COVER.lock().unwrap_or_else(|e| e.into_inner());
+    for piece in start / PIECE..=(start + len - 1) / PIECE {
+        if let Some(n) = cover.get_mut(&piece) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                cover.remove(&piece);
+            }
+        }
+    }
+}
+
+/// Whether exactly one host copy holds the piece at `key`.
+fn alone(key: usize) -> bool {
+    COVER.lock().unwrap_or_else(|e| e.into_inner()).get(&(key / PIECE)).copied() == Some(1)
+}
+
+/// A piece left on the card.
+struct Owned {
+    /// The copy whose card side holds what shaders wrote; kept alive while
+    /// it owns. `None` only in the tests.
+    copy: Option<Arc<crate::shadow::Shadow>>,
+    /// The offsets of the copy the card may have written there (the
+    /// flagged parts of declared ranges, joined over landings).
+    lo: usize,
+    hi: usize,
+    /// Its number among the copy's pieces (`crate::host`'s `BESIDE`).
+    number: u32,
+    /// The 4 KiB pages of title memory kept closed, `[start, end)`.
+    pages: (usize, usize),
+    /// The last flight that flagged it, and the host fence value behind it
+    /// (reached: it has landed).
+    flight: u64,
+    fence: u64,
+    /// The tests' "card": the bytes the fetch brings for `[lo, hi)`.
+    #[cfg(test)]
+    fake: Option<Arc<Vec<u8>>>,
+}
+
+struct Lazy {
+    /// By the title address of the piece (a multiple of [`PIECE`]).
+    owned: BTreeMap<usize, Owned>,
+    /// Pieces ever closed: a fault there once they are open again is
+    /// retried, not passed on.
+    ever: BTreeSet<usize>,
+    /// Per piece: ownerships in a row that the title touched first; and
+    /// the pieces that stay eager.
+    streak: BTreeMap<usize, u32>,
+    demoted: BTreeSet<usize>,
+}
+
+static LAZY: Mutex<Lazy> = Mutex::new(Lazy {
+    owned: BTreeMap::new(),
+    ever: BTreeSet::new(),
+    streak: BTreeMap::new(),
+    demoted: BTreeSet::new(),
+});
+/// Pieces owned now, and whether any ever was: looked at without the lock.
+static OWNED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static EVER: AtomicBool = AtomicBool::new(false);
+
+fn lazy_state() -> std::sync::MutexGuard<'static, Lazy> {
+    LAZY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Who brought owned pieces back (the [`LAZY_COUNT`] places from
+/// [`BY_FIRST`]): the title reading, the title writing, a copy of ours in
+/// place, other code of ours in place, a read through the kernel, a write
+/// into title memory (ours or the runtime's), a system call of the title,
+/// a merge or landing of ours, a copy let go.
+pub(crate) const BY_READ: usize = 0;
+pub(crate) const BY_WRITE: usize = 1;
+pub(crate) const BY_OWN_COPY: usize = 2;
+pub(crate) const BY_OWN: usize = 3;
+pub(crate) const BY_KERNEL: usize = 4;
+pub(crate) const BY_WRITING: usize = 5;
+pub(crate) const BY_SYSTEM: usize = 6;
+pub(crate) const BY_MERGE: usize = 7;
+pub(crate) const BY_RELEASED: usize = 8;
+const BY_KINDS: usize = 9;
+
+/// Why a flagged piece was copied back as before (the [`LAZY_COUNT`]
+/// places from [`EAGER_FIRST`]).
+const EAGER_READY: usize = 0;
+const EAGER_CLASS: usize = 1;
+const EAGER_SMALL: usize = 2;
+const EAGER_BACK: usize = 3;
+const EAGER_RESERVATION: usize = 4;
+const EAGER_WC: usize = 5;
+const EAGER_SHARED: usize = 6;
+const EAGER_FILL: usize = 7;
+const EAGER_DEMOTED: usize = 8;
+const EAGER_PENDING: usize = 9;
+const EAGER_PROTECT: usize = 10;
+const EAGER_WRITTEN: usize = 11;
+const EAGER_KINDS: usize = 12;
+
+/// Since the last line: pieces owned and their bytes (left on the card,
+/// not fetched), pieces flagged again while owned and their bytes; then
+/// first touches (fault or ask that found an owned piece) by who, the
+/// pieces they brought back and their bytes, the fetches, their
+/// microseconds (fetch and merge) and the longest, the bytes written into
+/// title memory, pieces given up without a fetch; then eager pieces by
+/// reason.
+const OWNED_PIECES: usize = 0;
+const OWNED_BYTES: usize = 1;
+const AGAIN_PIECES: usize = 2;
+const AGAIN_BYTES: usize = 3;
+const BY_FIRST: usize = 4;
+const BACK_PIECES: usize = BY_FIRST + BY_KINDS;
+const BACK_BYTES: usize = BACK_PIECES + 1;
+const FETCHES: usize = BACK_BYTES + 1;
+const FETCH_US: usize = FETCHES + 1;
+const FETCH_MOST_US: usize = FETCH_US + 1;
+const MERGED_BYTES: usize = FETCH_MOST_US + 1;
+const FORGOTTEN: usize = MERGED_BYTES + 1;
+const EAGER_FIRST: usize = FORGOTTEN + 1;
+const LAZY_COUNTS: usize = EAGER_FIRST + EAGER_KINDS;
+static LAZY_COUNT: [AtomicU64; LAZY_COUNTS] = [const { AtomicU64::new(0) }; LAZY_COUNTS];
+
+fn add(at: usize, n: u64) {
+    LAZY_COUNT[at].fetch_add(n, Relaxed);
+}
+
+/// The landing a [`take`] is part of.
+pub(crate) struct Landing<'a> {
+    /// The number of the flight whose compare flagged the piece, and the
+    /// host fence value behind the landing's last flight.
+    pub(crate) flight: u64,
+    pub(crate) fence: u64,
+    /// The flight's send of title bytes to the card's copies (its plan's
+    /// `sent_as`): bytes sent after it had not reached the card when it ran.
+    pub(crate) sent_as: u64,
+    /// The title memory texture read-backs of the landing write (in order,
+    /// joined): left eager.
+    pub(crate) backs: &'a [(usize, usize)],
+}
+
+/// At a landing (`crate::host`'s `relay_card_back`), for a piece the card's
+/// compare flagged: offsets `[lo, hi)` of `copy` (inside piece `number`),
+/// in the declared range `declared` (title addresses). Whether it stays on
+/// the card (owned: the caller neither fetches nor merges it); otherwise it
+/// is copied back as before.
+pub(crate) fn take(
+    copy: &Arc<crate::shadow::Shadow>,
+    lo: usize,
+    hi: usize,
+    number: u32,
+    declared: (usize, usize),
+    landing: &Landing,
+) -> bool {
+    if !lazy() || lo >= hi {
+        return false;
+    }
+    let start = copy.title_start() as usize;
+    let (t0, t1) = (start + lo, start + hi);
+    let key = t0 / PIECE * PIECE;
+    let facts = Facts {
+        ready: crate::host::lazy_ready(),
+        card_buffer: copy.carded() && !copy.windowed(),
+        // A piece is cut at 64 KiB of title memory: one key.
+        one_piece: (t1 - 1) / PIECE * PIECE == key,
+        declared: declared.1.saturating_sub(declared.0),
+        back: touches(landing.backs, t0, t1),
+        reservation: reservation(t0, t1),
+        alone: alone(key),
+        texture: crate::texture::staged_over(t0, t1 - t0),
+        fill: crate::host::fills_read_ahead(t0, t1 - t0),
+        demoted: lazy_state().demoted.contains(&key),
+    };
+    if let Some(why) = refusal(&facts, off_keep(), lazy_wc()) {
+        add(EAGER_FIRST + why, 1);
+        return false;
+    }
+    install_lazy();
+    copy.with_side(|| own(copy, lo, hi, number, (t0, t1), landing))
+}
+
+/// What [`take`] decides on, looked up beforehand.
+#[derive(Clone, Copy, Debug)]
+struct Facts {
+    /// The relay lands flights and fetches on its copy queue.
+    ready: bool,
+    /// A title buffer's copy in the card's memory, not a window.
+    card_buffer: bool,
+    one_piece: bool,
+    /// The declared range's bytes.
+    declared: usize,
+    /// A texture read-back of the landing writes there.
+    back: bool,
+    /// One write-watched reservation holds it: whether write-combining.
+    reservation: Option<bool>,
+    /// No other host copy holds the piece.
+    alone: bool,
+    /// A staged texture's memory meets it.
+    texture: bool,
+    /// A fill read it ahead of flights lately.
+    fill: bool,
+    demoted: bool,
+}
+
+/// Why a piece with `facts` is copied back as before, if it is; `keep` is
+/// [`off_keep`], `wc` [`lazy_wc`].
+fn refusal(facts: &Facts, keep: usize, wc: bool) -> Option<usize> {
+    if !facts.ready {
+        return Some(EAGER_READY);
+    }
+    if !facts.card_buffer || !facts.one_piece {
+        return Some(EAGER_CLASS);
+    }
+    if facts.declared <= keep {
+        return Some(EAGER_SMALL);
+    }
+    if facts.back {
+        return Some(EAGER_BACK);
+    }
+    let Some(write_combining) = facts.reservation else {
+        return Some(EAGER_RESERVATION);
+    };
+    if write_combining && !wc {
+        return Some(EAGER_WC);
+    }
+    if !facts.alone || facts.texture {
+        return Some(EAGER_SHARED);
+    }
+    if facts.fill {
+        return Some(EAGER_FILL);
+    }
+    if facts.demoted {
+        return Some(EAGER_DEMOTED);
+    }
+    None
+}
+
+/// Whether `[from, to)` meets one of `ranges` (in order, joined).
+fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+    let at = ranges.partition_point(|r| r.1 <= from);
+    ranges.get(at).is_some_and(|r| r.0 < to)
+}
+
+/// The 4 KiB pages that hold title memory `[t0, t1)`.
+fn pages_over(t0: usize, t1: usize) -> (usize, usize) {
+    (t0 - t0 % KERNEL_PAGE, t1.div_ceil(KERNEL_PAGE) * KERNEL_PAGE)
+}
+
+/// [`take`], under the copy's CPU side lock (`Shadow::with_side`), which
+/// every merge into the copy holds too.
+fn own(copy: &Arc<crate::shadow::Shadow>, lo: usize, hi: usize, number: u32, (t0, t1): (usize, usize), landing: &Landing) -> bool {
+    // Invariant 2: title bytes still on their way to the card there.
+    if copy.cpu_pending(lo, hi, landing.sent_as) {
+        add(EAGER_FIRST + EAGER_PENDING, 1);
+        return false;
+    }
+    let key = t0 / PIECE * PIECE;
+    let pages = pages_over(t0, t1);
+    let mut l = lazy_state();
+    if let Some(o) = l.owned.get_mut(&key) {
+        if !o.copy.as_ref().is_some_and(|c| Arc::ptr_eq(c, copy)) {
+            add(EAGER_FIRST + EAGER_SHARED, 1);
+            return false;
+        }
+        // Flagged again while owned: the card holds newer bytes, title
+        // memory stays closed. Pages of the piece not closed yet are.
+        let wider = (o.pages.0.min(pages.0), o.pages.1.max(pages.1));
+        if wider != o.pages && !close(wider) {
+            add(EAGER_FIRST + EAGER_PROTECT, 1);
+            return false;
+        }
+        o.pages = wider;
+        o.lo = o.lo.min(lo);
+        o.hi = o.hi.max(hi);
+        o.flight = landing.flight;
+        o.fence = landing.fence;
+        // Owned through a landing untouched: the title did not read it.
+        l.streak.remove(&key);
+        add(AGAIN_PIECES, 1);
+        add(AGAIN_BYTES, (hi - lo) as u64);
+        return true;
+    }
+    // Noted first: a fault from the moment the pages are closed is ours.
+    l.ever.insert(key);
+    EVER.store(true, Relaxed);
+    l.owned.insert(
+        key,
+        Owned {
+            copy: Some(copy.clone()),
+            lo,
+            hi,
+            number,
+            pages,
+            flight: landing.flight,
+            fence: landing.fence,
+            #[cfg(test)]
+            fake: None,
+        },
+    );
+    if !close(pages) {
+        l.owned.remove(&key);
+        add(EAGER_FIRST + EAGER_PROTECT, 1);
+        return false;
+    }
+    // Closed: a write of the title from here on faults. One before it may
+    // not have reached the copy yet: then the piece stays eager.
+    if written_since(pages) {
+        open(pages);
+        l.owned.remove(&key);
+        add(EAGER_FIRST + EAGER_WRITTEN, 1);
+        return false;
+    }
+    OWNED_N.store(l.owned.len(), Relaxed);
+    add(OWNED_PIECES, 1);
+    add(OWNED_BYTES, (hi - lo) as u64);
+    true
+}
+
+/// Closes title pages `[pages.0, pages.1)` (no access), if they are
+/// committed read-write; whether they are closed now.
+fn close(pages: (usize, usize)) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: committed title memory (the call fails otherwise); only its
+    // protection changes, and every way in is ours to open again.
+    if unsafe { VirtualProtect(pages.0 as *const _, pages.1 - pages.0, PAGE_NOACCESS, &mut old) } == 0 {
+        return false;
+    }
+    if old != PAGE_READWRITE {
+        // Not plain read-write memory (the title's own protection): put
+        // back.
+        // SAFETY: as above.
+        unsafe { VirtualProtect(pages.0 as *const _, pages.1 - pages.0, old, &mut old) };
+        return false;
+    }
+    true
+}
+
+/// Opens title pages `[pages.0, pages.1)` again (read-write).
+fn open(pages: (usize, usize)) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: pages [`close`] closed; only their protection changes.
+    unsafe { VirtualProtect(pages.0 as *const _, pages.1 - pages.0, PAGE_READWRITE, &mut old) };
+}
+
+/// Whether the title wrote a page of `[pages.0, pages.1)` since the write
+/// watch was last asked (asked without resetting it: the journal's askings
+/// still find it). True where the memory is not write-watched.
+fn written_since(pages: (usize, usize)) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let mut found = [std::ptr::null_mut::<std::ffi::c_void>(); PIECE / KERNEL_PAGE];
+    let mut count = found.len().min((pages.1 - pages.0) / KERNEL_PAGE);
+    let mut granularity = 0;
+    // SAFETY: room for `count` answers; nothing is reset.
+    let failed = unsafe { GetWriteWatch(0, pages.0 as *const _, pages.1 - pages.0, found.as_mut_ptr(), &mut count, &mut granularity) } != 0;
+    failed || count > 0
+}
+
+/// Whether a piece of title memory `[at, at + len)` is owned now.
+pub(crate) fn owns(at: usize, len: usize) -> bool {
+    if OWNED_N.load(Relaxed) == 0 || len == 0 {
+        return false;
+    }
+    let first = at / PIECE * PIECE;
+    lazy_state().owned.range(first..at.saturating_add(len)).next().is_some()
+}
+
+/// Brings back what the card keeps in title memory `[at, at + len)`
+/// before it is read or written, for `why` (a `BY_` place). Whether
+/// anything was.
+pub(crate) fn release(at: usize, len: usize, why: usize) -> bool {
+    if !owns(at, len) {
+        return false;
+    }
+    let first = at / PIECE * PIECE;
+    resolve_range(first, at.saturating_add(len), why) > 0
+}
+
+/// `crate::kernel_will_read`: a system call is about to read title memory
+/// `[at, at + len)` (a file write, a send).
+pub(crate) fn kernel_will_read(at: usize, len: usize) {
+    if lazy() {
+        release(at, len, BY_SYSTEM);
+    }
+}
+
+/// The title let go of the buffer `copy` is of (`crate::shadow::unregister`):
+/// what the card keeps of it comes back now, while its card side is there
+/// (the memory may be read as something else).
+pub(crate) fn copy_released(copy: &Arc<crate::shadow::Shadow>) {
+    if OWNED_N.load(Relaxed) == 0 {
+        return;
+    }
+    let keys: Vec<usize> = lazy_state()
+        .owned
+        .iter()
+        .filter(|(_, o)| o.copy.as_ref().is_some_and(|c| Arc::ptr_eq(c, copy)))
+        .map(|(&k, _)| k)
+        .collect();
+    for key in keys {
+        resolve_range(key, key + PIECE, BY_RELEASED);
+    }
+}
+
+/// Pieces owned in `[at, at + len)` are given up without a fetch (the
+/// memory shows something else now: a mapping changed).
+fn forget(at: usize, len: usize) {
+    if OWNED_N.load(Relaxed) == 0 || len == 0 {
+        return;
+    }
+    let first = at / PIECE * PIECE;
+    let mut l = lazy_state();
+    let keys: Vec<usize> = l.owned.range(first..at.saturating_add(len)).map(|(&k, _)| k).collect();
+    for key in keys {
+        // (What the addresses show now is read-write, the runtime says.)
+        if let Some(o) = l.owned.remove(&key) {
+            open(o.pages);
+        }
+        add(FORGOTTEN, 1);
+    }
+    OWNED_N.store(l.owned.len(), Relaxed);
+}
+
+/// The tests' landing: title memory `[t0, t1)` (inside one piece) is left
+/// on a "card" that holds `card` there, as [`own`] leaves a piece.
+#[cfg(test)]
+fn own_fake(t0: usize, t1: usize, card: Vec<u8>, flight: u64) -> bool {
+    assert_eq!(card.len(), t1 - t0);
+    install_lazy();
+    let key = t0 / PIECE * PIECE;
+    let pages = pages_over(t0, t1);
+    let mut l = lazy_state();
+    l.ever.insert(key);
+    EVER.store(true, Relaxed);
+    l.owned.insert(key, Owned { copy: None, lo: t0, hi: t1, number: 0, pages, flight, fence: 0, fake: Some(Arc::new(card)) });
+    if !close(pages) {
+        l.owned.remove(&key);
+        return false;
+    }
+    OWNED_N.store(l.owned.len(), Relaxed);
+    true
+}
+
+thread_local! {
+    /// This thread is bringing pieces back: a fault inside that is not one
+    /// to take again (it would wait for itself).
+    static RESOLVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The last address this thread faulted at on an open piece that was
+    /// once owned, and how many times in a row.
+    static RETRIED: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// One bring-back at a time: the fetch buffer is one.
+static RESOLVER: Mutex<()> = Mutex::new(());
+
+/// A piece being brought back: its key, copy, offsets, number, flight and
+/// fence.
+type Back = (usize, Option<Arc<crate::shadow::Shadow>>, usize, usize, u32, u64, u64);
+
+/// Brings back every owned piece whose key lies in `[from, to)`: their
+/// bytes are fetched from the card's sides through the relay's copy queue
+/// (behind their producers' fences, reached already, and nothing else),
+/// what shaders wrote goes into the copies' CPU sides and title memory,
+/// and the pages are opened, each piece under its copy's side lock and
+/// [`LAZY`]'s. A piece flagged again by a landing meanwhile is fetched
+/// again. Returns the pieces brought back.
+fn resolve_range(from: usize, to: usize, why: usize) -> usize {
+    if RESOLVING.with(std::cell::Cell::get) {
+        return 0;
+    }
+    RESOLVING.with(|r| r.set(true));
+    let started = std::time::Instant::now();
+    let one = RESOLVER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut done = 0;
+    for _ in 0..4 {
+        let backs: Vec<Back> = {
+            let l = lazy_state();
+            l.owned.range(from / PIECE * PIECE..to).map(|(&k, o)| (k, o.copy.clone(), o.lo, o.hi, o.number, o.flight, o.fence)).collect()
+        };
+        if backs.is_empty() {
+            break;
+        }
+        let Some((bytes, after)) = fetch(&backs) else {
+            // The card cannot be read (removed): the pages open on what
+            // title memory holds, said once.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::error!("VICTORY_COPYBACK=lazy: the card's bytes could not be fetched; title memory keeps older bytes"));
+            let mut l = lazy_state();
+            for b in &backs {
+                if let Some(o) = l.owned.remove(&b.0) {
+                    open(o.pages);
+                }
+            }
+            OWNED_N.store(l.owned.len(), Relaxed);
+            break;
+        };
+        add(FETCHES, 1);
+        let mut at = 0;
+        let mut again = false;
+        for (key, copy, lo, hi, _, flight, _) in &backs {
+            let gpu = &bytes[at..at + (hi - lo)];
+            at += hi - lo;
+            let merged = match copy {
+                Some(copy) => copy.with_side(|| merge(*key, Some(copy), *lo, gpu, after, *flight)),
+                None => merge(*key, None, *lo, gpu, after, *flight),
+            };
+            match merged {
+                Some(written) => {
+                    done += 1;
+                    add(BACK_PIECES, 1);
+                    add(BACK_BYTES, (hi - lo) as u64);
+                    add(MERGED_BYTES, written as u64);
+                }
+                None => again = true,
+            }
+        }
+        if !again {
+            break;
+        }
+    }
+    drop(one);
+    RESOLVING.with(|r| r.set(false));
+    if done > 0 {
+        add(BY_FIRST + why, 1);
+        let us = started.elapsed().as_micros() as u64;
+        add(FETCH_US, us);
+        LAZY_COUNT[FETCH_MOST_US].fetch_max(us, Relaxed);
+    }
+    done
+}
+
+/// The fetch of [`resolve_range`]: the pieces' bytes one after the other,
+/// and the last send of title bytes the card had finished before.
+fn fetch(backs: &[Back]) -> Option<(Vec<u8>, u64)> {
+    #[cfg(test)]
+    if backs.iter().all(|b| b.1.is_none()) {
+        let l = lazy_state();
+        let bytes = backs.iter().flat_map(|b| l.owned.get(&b.0).and_then(|o| o.fake.clone()).map_or_else(|| vec![0; b.3 - b.2], |f| f.to_vec())).collect();
+        return Some((bytes, 0));
+    }
+    let pieces: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u32)> =
+        backs.iter().filter_map(|b| b.1.clone().map(|c| (c, b.2, b.3, b.4))).collect();
+    if pieces.len() != backs.len() {
+        return None;
+    }
+    let behind = backs.iter().map(|b| b.6).max().unwrap_or(0);
+    crate::host::lazy_fetch(&pieces, behind)
+}
+
+/// The merge of one piece brought back (`gpu`: the card side's bytes at
+/// offset `lo` of `copy`, fetched after send `after`), under the copy's
+/// side lock: unless a landing flagged it again since `flight` (then
+/// `None`: fetched again), what shaders wrote goes into the CPU side and
+/// title memory, and the pages open. The bytes written into title memory.
+fn merge(key: usize, copy: Option<&Arc<crate::shadow::Shadow>>, lo: usize, gpu: &[u8], after: u64, flight: u64) -> Option<usize> {
+    let mut l = lazy_state();
+    let Some(o) = l.owned.get(&key) else {
+        // Brought back by another way meanwhile.
+        return Some(0);
+    };
+    if o.flight != flight || o.lo != lo || o.hi != lo + gpu.len() {
+        return None;
+    }
+    let pages = o.pages;
+    // (The tests' pieces have no copy: their offsets are title addresses.)
+    let start = copy.map_or(0, |c| c.title_start() as usize);
+    // The bytes shaders wrote: those the card changed against the CPU side
+    // (which takes them), outside title bytes the card had not received.
+    let runs = match copy {
+        Some(copy) => copy.lazy_runs(lo, gpu, after),
+        None => vec![(0, gpu.len())],
+    };
+    // Invariant 6: one change opens the pages, under the lock the handler's
+    // look takes.
+    open(pages);
+    let mut written = 0;
+    for (off, n) in runs {
+        crate::host::write_mapped((start + lo + off) as *mut u8, gpu[off..].as_ptr(), n);
+        written += n;
+    }
+    if written > 0 {
+        // A placed texture there changed with no descriptor written.
+        crate::descriptor::host::remapped(start + lo, gpu.len());
+    }
+    l.owned.remove(&key);
+    OWNED_N.store(l.owned.len(), Relaxed);
+    Some(written)
+}
+
+/// The title touched an owned piece first: its streak grows, and past
+/// [`demote_after`] it stays eager.
+fn touched_by_title(key: usize) {
+    let n = demote_after();
+    if n == 0 {
+        return;
+    }
+    let mut l = lazy_state();
+    let streak = l.streak.entry(key).or_insert(0);
+    *streak += 1;
+    if *streak >= n {
+        l.streak.remove(&key);
+        l.demoted.insert(key);
+    }
+}
+
+/// Registers the handler of the closed pages, first in the line (ahead of
+/// the copies in place, whose handler would end their copy at a closed
+/// page, and the guards'), once.
+fn install_lazy() {
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Looked up here, not in the handler.
+        let _ = images();
+        // The copies in place register at their first copy: made now, so
+        // that this handler, registered after, runs first.
+        static PROBE: u8 = 0;
+        crate::plaincopy::touch(&raw const PROBE as usize);
+        // SAFETY: the handler reads the record and context it is given and
+        // touches only the owned pieces' state and protections.
+        unsafe { AddVectoredExceptionHandler(1, Some(on_access)) };
+    });
+}
+
+/// The handler of the closed pages: an access violation in an owned piece
+/// brings back the owned pieces of the window around it, then lets the
+/// instruction run again.
+unsafe extern "system" fn on_access(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH};
+    // SAFETY: the system passes the exception being dispatched and the
+    // context it will continue with.
+    let (r, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
+    if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 || !EVER.load(Relaxed) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const WRITE: usize = 1;
+    const EXECUTE: usize = 8;
+    let kind = r.ExceptionInformation[0];
+    let at = r.ExceptionInformation[1];
+    if kind == EXECUTE || RESOLVING.with(std::cell::Cell::get) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let key = at / PIECE * PIECE;
+    let (owned, ever) = {
+        let l = lazy_state();
+        (l.owned.contains_key(&key), l.ever.contains(&key))
+    };
+    if !owned {
+        // Opened since the fault (another thread brought it back): run the
+        // instruction again, once or twice; a page closed for another
+        // reason is not ours.
+        if !ever {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let (last, n) = RETRIED.with(std::cell::Cell::get);
+        let n = if last == at { n + 1 } else { 1 };
+        RETRIED.with(|c| c.set((at, n)));
+        return if n <= 2 { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH };
+    }
+    let (own, foreign) = images();
+    // SAFETY: the faulting thread's context, on that thread.
+    let who = who(context.Rip as usize, *own, foreign, crate::plaincopy::copy_instruction(), || unsafe { caller(context, foreign) });
+    let why = match who {
+        Who::OwnCopy => BY_OWN_COPY,
+        Who::Own => BY_OWN,
+        Who::Title if kind == WRITE => BY_WRITE,
+        Who::Title => BY_READ,
+    };
+    let w0 = at / WINDOW * WINDOW;
+    resolve_range(w0, w0 + WINDOW, why);
+    if who == Who::Title {
+        touched_by_title(key);
+    }
+    RETRIED.with(|c| c.set((0, 0)));
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+/// The per-second line of [`lazy`], over `frames`.
+fn lazy_line(frames: f64) {
+    let c: Vec<u64> = LAZY_COUNT.iter().map(|c| c.swap(0, Relaxed)).collect();
+    let f = |i: usize| c[i] as f64 / frames;
+    let mb = |i: usize| c[i] as f64 / 1e6 / frames;
+    let (owned_now, owned_bytes, demoted) = {
+        let l = lazy_state();
+        (l.owned.len(), l.owned.values().map(|o| (o.hi - o.lo) as u64).sum::<u64>(), l.demoted.len())
+    };
+    let touches: u64 = c[BY_FIRST..BY_FIRST + BY_KINDS].iter().sum();
+    tracing::info!(
+        "copy-back lazy (VICTORY_COPYBACK=lazy) per frame: {:.1} pieces left on the card ({:.2} MB not fetched), {:.1} flagged \
+         again while owned ({:.2} MB); first touches {:.2} (title reads {:.2}, title writes {:.2}, our copies in place {:.2}, \
+         our code in place {:.2}, kernel reads {:.2}, writes into title memory {:.2}, system calls {:.2}, our merges {:.2}, \
+         copies let go {:.2}) bringing back {:.1} pieces ({:.2} MB fetched, {:.2} MB written) in {:.2} fetches, {:.3} ms \
+         (longest {:.3} ms since the last line); {:.1} given up unfetched; eager instead: not ready {:.1}, not a card buffer \
+         {:.1}, small {:.1}, texture back {:.1}, not write-watched {:.1}, write-combining {:.1}, other copies or textures \
+         {:.1}, fills ahead {:.1}, read by the title {:.1}, title bytes on their way {:.1}, protection refused {:.1}, \
+         written since asked {:.1}; {owned_now} pieces owned now ({:.1} MB), {demoted} pieces demoted; {:.0} first touches a \
+         second",
+        f(OWNED_PIECES),
+        mb(OWNED_BYTES),
+        f(AGAIN_PIECES),
+        mb(AGAIN_BYTES),
+        touches as f64 / frames,
+        f(BY_FIRST + BY_READ),
+        f(BY_FIRST + BY_WRITE),
+        f(BY_FIRST + BY_OWN_COPY),
+        f(BY_FIRST + BY_OWN),
+        f(BY_FIRST + BY_KERNEL),
+        f(BY_FIRST + BY_WRITING),
+        f(BY_FIRST + BY_SYSTEM),
+        f(BY_FIRST + BY_MERGE),
+        f(BY_FIRST + BY_RELEASED),
+        f(BACK_PIECES),
+        mb(BACK_BYTES),
+        mb(MERGED_BYTES),
+        f(FETCHES),
+        c[FETCH_US] as f64 / 1e3 / frames,
+        c[FETCH_MOST_US] as f64 / 1e3,
+        f(FORGOTTEN),
+        f(EAGER_FIRST + EAGER_READY),
+        f(EAGER_FIRST + EAGER_CLASS),
+        f(EAGER_FIRST + EAGER_SMALL),
+        f(EAGER_FIRST + EAGER_BACK),
+        f(EAGER_FIRST + EAGER_RESERVATION),
+        f(EAGER_FIRST + EAGER_WC),
+        f(EAGER_FIRST + EAGER_SHARED),
+        f(EAGER_FIRST + EAGER_FILL),
+        f(EAGER_FIRST + EAGER_DEMOTED),
+        f(EAGER_FIRST + EAGER_PENDING),
+        f(EAGER_FIRST + EAGER_PROTECT),
+        f(EAGER_FIRST + EAGER_WRITTEN),
+        owned_bytes as f64 / 1e6,
+        touches as f64,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The facts a landing looks up, and which of them leaves a piece
+    /// eager: the first that applies, in the order the line names them.
+    #[test]
+    fn a_piece_stays_eager_for_the_first_reason_that_applies() {
+        let ok = Facts {
+            ready: true,
+            card_buffer: true,
+            one_piece: true,
+            declared: 64 << 10,
+            back: false,
+            reservation: Some(false),
+            alone: true,
+            texture: false,
+            fill: false,
+            demoted: false,
+        };
+        assert_eq!(refusal(&ok, 256, true), None);
+        let with = |f: fn(&mut Facts)| {
+            let mut facts = ok;
+            f(&mut facts);
+            refusal(&facts, 256, true)
+        };
+        assert_eq!(with(|f| f.ready = false), Some(EAGER_READY));
+        assert_eq!(with(|f| f.card_buffer = false), Some(EAGER_CLASS));
+        assert_eq!(with(|f| f.one_piece = false), Some(EAGER_CLASS));
+        assert_eq!(with(|f| f.declared = 256), Some(EAGER_SMALL));
+        assert_eq!(with(|f| f.declared = 257), None);
+        assert_eq!(with(|f| f.back = true), Some(EAGER_BACK));
+        assert_eq!(with(|f| f.reservation = None), Some(EAGER_RESERVATION));
+        assert_eq!(with(|f| f.alone = false), Some(EAGER_SHARED));
+        assert_eq!(with(|f| f.texture = true), Some(EAGER_SHARED));
+        assert_eq!(with(|f| f.fill = true), Some(EAGER_FILL));
+        assert_eq!(with(|f| f.demoted = true), Some(EAGER_DEMOTED));
+        // Write-combining memory: lazy unless VICTORY_COPYBACK_LAZY_WC=0.
+        let wc = Facts { reservation: Some(true), ..ok };
+        assert_eq!(refusal(&wc, 256, true), None);
+        assert_eq!(refusal(&wc, 256, false), Some(EAGER_WC));
+        // Not ready comes first, whatever else holds.
+        let none = Facts { ready: false, card_buffer: false, declared: 0, ..ok };
+        assert_eq!(refusal(&none, 256, true), Some(EAGER_READY));
+    }
+
+    /// The pages closed for a piece's bytes, and ranges that meet.
+    #[test]
+    fn closed_pages_cover_the_bytes_and_ranges_meet() {
+        assert_eq!(pages_over(0x1_0010, 0x1_0020), (0x1_0000, 0x1_1000));
+        assert_eq!(pages_over(0x1_0000, 0x1_1000), (0x1_0000, 0x1_1000));
+        assert_eq!(pages_over(0x1_0fff, 0x1_1001), (0x1_0000, 0x1_2000));
+        let ranges = [(0x100, 0x200), (0x400, 0x500)];
+        assert!(touches(&ranges, 0x1ff, 0x300));
+        assert!(!touches(&ranges, 0x200, 0x400));
+        assert!(touches(&ranges, 0x0, 0x1000));
+        assert!(!touches(&[], 0, 10));
+    }
+
+    /// Reservations: write-watched private memory may be closed, a
+    /// placeholder for views may not; write-combining is told apart.
+    #[test]
+    fn only_write_watched_reservations_hold_pieces() {
+        {
+            let mut r = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+            r.insert(0x7_0000_0000, (0x7_1000_0000, true, false));
+            r.insert(0x7_2000_0000, (0x7_3000_0000, true, true));
+            r.insert(0x7_4000_0000, (0x7_5000_0000, false, false));
+        }
+        assert_eq!(reservation(0x7_0000_1000, 0x7_0001_0000), Some(false));
+        assert_eq!(reservation(0x7_2000_1000, 0x7_2001_0000), Some(true));
+        assert_eq!(reservation(0x7_4000_1000, 0x7_4001_0000), None);
+        // Past a reservation's end, or below the first.
+        assert_eq!(reservation(0x7_0fff_ff00, 0x7_1000_0100), None);
+        assert_eq!(reservation(0x6_ffff_0000, 0x6_ffff_1000), None);
+    }
+
+    /// One test for the closed pages (they share the owned pieces): a piece
+    /// left on the "card" is brought back by the first read in place (the
+    /// whole window), a write of the title lands on the card's bytes and
+    /// wins, a kernel read fails until the piece is brought back, a write
+    /// told before it lands brings it back first, a mapping change gives it
+    /// up, and a piece the title keeps touching first stays eager.
+    #[test]
+    fn owned_pieces_through_their_lives() {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // Two windows of our own write-watched memory (one more to align
+        // them), a pattern in it.
+        let len = 2 * WINDOW;
+        // SAFETY: memory of the test's own.
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), len + WINDOW, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(reserved, 0);
+        let base = reserved.next_multiple_of(WINDOW);
+        let title = |at: usize| (at as u32).wrapping_mul(0x9E37_79B1);
+        for at in (0..len).step_by(4) {
+            // SAFETY: inside the allocation.
+            unsafe { ((base + at) as *mut u32).write_volatile(title(at)) };
+        }
+        let gpu = |at: usize| title(at) ^ 0xFFFF_0000;
+        let card = |t0: usize, t1: usize| -> Vec<u8> { (t0..t1).step_by(4).flat_map(|at| gpu(at - base).to_le_bytes()).collect() };
+        // SAFETY: inside the allocation.
+        let read = |at: usize| unsafe { ((base + at) as *const u32).read_volatile() };
+        // Two pieces of the first window and one of the second.
+        let (a, b, c) = (base + PIECE + 0x100, base + 3 * PIECE, base + WINDOW + 2 * PIECE);
+        assert!(own_fake(a, a + 0x2000, card(a, a + 0x2000), 1));
+        assert!(own_fake(b, b + PIECE, card(b, b + PIECE), 1));
+        assert!(own_fake(c, c + 0x1000, card(c, c + 0x1000), 1));
+        assert!(owns(a, 1) && owns(b + 100, 4) && owns(c, 0x1000));
+        assert!(!owns(base, PIECE));
+        // A read in place on another thread faults: the window comes back,
+        // the card's bytes in it, the title's around them.
+        let got = std::thread::spawn(move || {
+            // SAFETY: inside the allocation.
+            unsafe { ((base + PIECE + 0x200) as *const u32).read_volatile() }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got, gpu(PIECE + 0x200));
+        assert!(!owns(a, 1) && !owns(b, PIECE), "the whole window came back");
+        assert!(owns(c, 1), "not the next window");
+        assert_eq!(read(PIECE + 0x100), gpu(PIECE + 0x100));
+        assert_eq!(read(PIECE + 0x2100 - 4), gpu(PIECE + 0x2100 - 4));
+        assert_eq!(read(PIECE + 0x2100), title(PIECE + 0x2100), "past the piece's bytes: the title's");
+        assert_eq!(read(PIECE), title(PIECE));
+        assert_eq!(read(3 * PIECE + 0x8000), gpu(3 * PIECE + 0x8000));
+        // A write of the title: the piece comes back first, the write
+        // lands on top and wins.
+        // SAFETY: inside the allocation.
+        unsafe { ((c + 8) as *mut u32).write_volatile(0x1234_5678) };
+        assert!(!owns(c, 1));
+        assert_eq!(read(c + 8 - base), 0x1234_5678);
+        assert_eq!(read(c + 4 - base), gpu(c + 4 - base));
+        // A kernel read of a closed page fails, and reads once the piece
+        // is brought back (as `read_again` does).
+        assert!(own_fake(c, c + 0x1000, card(c, c + 0x1000), 2));
+        let mut out = [0u8; 16];
+        let mut done = 0;
+        // SAFETY: our own memory, read into a buffer of ours of that size.
+        let mut kernel = || unsafe { ReadProcessMemory(GetCurrentProcess(), (c + 16) as *const _, out.as_mut_ptr().cast(), 16, &mut done) != 0 };
+        assert!(!kernel(), "a kernel read of a closed page");
+        assert!(release(c + 16, 16, BY_KERNEL) && kernel());
+        assert_eq!(u32::from_le_bytes([out[0], out[1], out[2], out[3]]), gpu(c + 16 - base));
+        // A write told before it lands (`crate::watch::writing`) brings it
+        // back first; a second release finds nothing.
+        assert!(own_fake(b, b + PIECE, card(b, b + PIECE), 3));
+        assert!(release(b + 0x10, 0x20, BY_WRITING));
+        assert!(!release(b, PIECE, BY_WRITING));
+        assert_eq!(read(3 * PIECE), gpu(3 * PIECE));
+        // A mapping change gives the piece up, opened, unfetched.
+        for at in (0..PIECE).step_by(4) {
+            // SAFETY: inside the allocation.
+            unsafe { ((b + at) as *mut u32).write_volatile(title(3 * PIECE + at)) };
+        }
+        assert!(own_fake(b, b + PIECE, card(b, b + PIECE), 4));
+        forget(b, PIECE);
+        assert!(!owns(b, PIECE));
+        assert_eq!(read(3 * PIECE + 4), title(3 * PIECE + 4), "given up: nothing fetched");
+        // A piece the title touches first after each ownership stays eager.
+        let key = 0x7_7700_0000;
+        for _ in 1..demote_after() {
+            touched_by_title(key);
+        }
+        assert!(demote_after() == 0 || !lazy_state().demoted.contains(&key));
+        touched_by_title(key);
+        assert!(demote_after() == 0 || lazy_state().demoted.contains(&key));
+        // SAFETY: the test's own reservation.
+        unsafe { VirtualFree(reserved as *mut _, 0, MEM_RELEASE) };
+    }
 
     /// Off keeps only small ranges; otherwise everything is copied back.
     #[test]

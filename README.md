@@ -163,6 +163,12 @@ What did it, on top of the list below:
     sync looks at a changed page's records under one lock, fingerprint
     first; guarded view memory is left out of a submission's write-watch
     askings ahead (after triippywhale).
+  - `VICTORY_TEXTURE_BACK` (on by default here; `=0` turns it off, a
+    list `<w>x<h>f<format>,...` picks other kinds; fxceless #999): the
+    textures shaders write and the title reads (the ocean's height and
+    displacement maps) are copied back into title memory in the
+    console's layout. Without it boats sink and the first boat mission
+    fails. No cost measured in the save's gameplay.
   - `VICTORY_COPY_PLAIN` (on by default here; `=0` turns it off): copies of title memory made in place by this
     process, with a handler that falls back to the kernel's copy on a
     missing page. Its first form also took the layer's one-byte "is this

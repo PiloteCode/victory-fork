@@ -174,6 +174,27 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
 }
 
+/// Whether a staged texture's memory meets title memory `[at, at + len)`
+/// (`crate::coherence`: what shaders wrote under a texture is copied back
+/// at once, since the texture's upload asks the write watch, which would
+/// see nothing).
+pub(crate) fn staged_over(at: usize, len: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    let earliest_start = at.saturating_sub(LARGEST_STAGED_BYTES.load(Relaxed));
+    let index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    index
+        .range(earliest_start..end)
+        .flat_map(|(_, entries)| entries.iter().filter_map(Weak::upgrade))
+        .any(|staging| {
+            let (start, bytes) = staging.memory();
+            start < end && start.saturating_add(bytes) > at
+        })
+}
+
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
 /// ([`alias`]): every level of every layer as each of the two formats lays
