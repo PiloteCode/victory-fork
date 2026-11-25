@@ -6729,7 +6729,7 @@ impl Meter {
         let compute_widest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
         let compute_cut = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
+            "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535, or 4 x 65535 for a program that counts its groups from a base), {compute_cut:.1} records per frame asked for more and were cut to that"
         );
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
