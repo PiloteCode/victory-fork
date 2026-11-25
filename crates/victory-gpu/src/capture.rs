@@ -789,14 +789,12 @@ pub(crate) fn probe(
     }
 }
 
-/// Whether every pixel [`probe`] read is (near) black.
-pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
+/// The brightest channel of the pixels [`probe`] read (the copies have run).
+fn level(buffer: &ID3D12Resource) -> Option<u8> {
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (every submission is waited for).
+    // SAFETY: the copies have run; the mapping spans the grid's slots.
     unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return false;
-        }
+        buffer.Map(0, None, Some(&mut data)).ok()?;
         let bytes =
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
         let level = bytes
@@ -805,27 +803,167 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             .max()
             .unwrap_or(0);
         buffer.Unmap(0, None);
-        let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-        if levels.len() == 12 {
-            levels.pop_front();
-        }
-        levels.push_back(level);
-        level < 8
+        Some(level)
     }
 }
 
-/// The brightest probed channel of the last frames, oldest first: a fade
-/// darkens over several, a glitch drops at once.
-static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
+/// A presented frame's probe on its way back: the frame, the readback buffer
+/// [`probe`] recorded into (none for a format it does not read), and the
+/// flight whose copy list fills it (0: one that was waited for).
+struct Pending {
+    frame: u64,
+    buffer: Option<ID3D12Resource>,
+    flight: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the buffer is mapped by
+// whichever thread lands the probe, after its copy has run.
+unsafe impl Send for Pending {}
+
+/// Probes of every presented frame, oldest first, until their flight has run.
+static PENDING: std::sync::Mutex<std::collections::VecDeque<Pending>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
-pub(crate) fn recent_levels() -> Vec<u8> {
-    let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-    levels.iter().copied().collect()
+/// What the present of a frame names, for the black-frame log: the title
+/// resource and its state, the draws run since the last present, and the
+/// draws traced (debug logging of `victory_gpu::draw` only).
+static INFO: std::sync::Mutex<std::collections::VecDeque<(u64, String, Vec<String>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// The probed levels of the last frames ([`Levels`]).
+static LEVELS: std::sync::Mutex<Levels> = std::sync::Mutex::new(Levels {
+    seen: std::collections::VecDeque::new(),
+    after: None,
+});
+
+/// The brightest probed channel of each of the last frames, by frame number,
+/// oldest first; and a black frame whose next frames are still to be logged.
+struct Levels {
+    seen: std::collections::VecDeque<(u64, u8)>,
+    after: Option<u64>,
+}
+
+/// Frames a black frame's log shows before it, and after it.
+const BEFORE: usize = 12;
+const AFTER: u64 = 6;
+
+/// Notes, at the present of `frame` and before it is probed, what it
+/// presents ([`INFO`]).
+pub(crate) fn frame_info(frame: u64, what: String, traced: Vec<String>) {
+    let mut info = INFO.lock().unwrap_or_else(|e| e.into_inner());
+    if info.len() >= 64 {
+        info.pop_front();
+    }
+    info.push_back((frame, what, traced));
+}
+
+/// The probe of presented frame `frame`, recorded into the copy list of
+/// flight `flight` (0: a list that was waited for).
+pub(crate) fn probed(frame: u64, buffer: Option<ID3D12Resource>, flight: u64) {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    // A probe that never lands (a flight that never finishes) is not kept
+    // forever.
+    if pending.len() >= 256 {
+        pending.pop_front();
+    }
+    pending.push_back(Pending { frame, buffer, flight });
+}
+
+/// Lands the probes whose flights have run (`finished`: the last flight
+/// finished), in frame order: a probe waits behind an earlier one still in
+/// the air. Each frame's level goes to [`frame_level`].
+pub(crate) fn land_probes(finished: u64) {
+    loop {
+        let next = {
+            let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            match pending.front() {
+                Some(p) if p.flight <= finished => pending.pop_front(),
+                _ => None,
+            }
+        };
+        let Some(p) = next else { break };
+        if let Some(level) = p.buffer.as_ref().and_then(level) {
+            frame_level(p.frame, level);
+        }
+    }
+}
+
+/// How the frames before a black one went to black, from their levels
+/// (oldest first, the black one last): "fade" when each of the last four
+/// before it is darker than the one before and the last is below a quarter
+/// of the first (a fade of the title's, over frames), "drop" when it fell
+/// at once from a lit frame, "dark" when the frames before were already dim.
+pub(crate) fn how_black(before: &[u8]) -> &'static str {
+    let tail = &before[before.len().saturating_sub(4)..];
+    let fading = tail.len() >= 3
+        && tail.windows(2).all(|w| w[1] < w[0])
+        && u32::from(*tail.last().unwrap_or(&0)) * 4 < u32::from(tail[0]);
+    match before.last() {
+        _ if fading => "fade",
+        Some(&last) if last >= 64 => "drop",
+        _ => "dark",
+    }
+}
+
+/// The level of presented frame `frame`: logs a frame that is black (all
+/// probed channels below 8) after one that was not, with the levels of the
+/// frames before it and what it presented, and six frames on, the levels
+/// after it (a fade stays dark, a frame dropped once is lit again).
+fn frame_level(frame: u64, level: u8) {
+    let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
+    let lit_before = levels.seen.back().is_some_and(|&(f, l)| f + 1 == frame && l >= 8);
+    if levels.seen.len() == BEFORE {
+        levels.seen.pop_front();
+    }
+    levels.seen.push_back((frame, level));
+    if level < 8 && lit_before {
+        let before: Vec<u8> = levels.seen.iter().map(|&(_, l)| l).collect();
+        let (what, traced) = INFO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(f, ..)| *f == frame)
+            .map(|(_, what, traced)| (what.clone(), traced.clone()))
+            .unwrap_or_default();
+        tracing::warn!(
+            frame,
+            how = how_black(&before[..before.len() - 1]),
+            levels = ?before,
+            "a black frame after a frame that was not: {what}"
+        );
+        for d in traced {
+            tracing::warn!("black frame {frame}: {d}");
+        }
+        levels.after = Some(frame);
+    }
+    if let Some(black) = levels.after
+        && frame >= black + AFTER
+    {
+        let after: Vec<u8> = levels.seen.iter().filter(|&&(f, _)| f >= black).map(|&(_, l)| l).collect();
+        let dark = after.iter().take_while(|&&l| l < 8).count();
+        tracing::warn!(
+            frame = black,
+            levels = ?after,
+            black_frames = dark,
+            "levels from the black frame on: {}",
+            if dark == 1 { "lit again at once (one frame dropped)" } else { "dark for several frames (a fade or a cut through black)" }
+        );
+        levels.after = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A fade darkens frame by frame; a drop falls from a lit frame at once.
+    #[test]
+    fn black_frames_are_told_apart_by_the_frames_before() {
+        assert_eq!(super::how_black(&[200, 180, 120, 60, 20]), "fade");
+        assert_eq!(super::how_black(&[200, 210, 205, 199]), "drop");
+        assert_eq!(super::how_black(&[30, 31, 30, 29]), "dark");
+        // Darker each frame but not by much: not a fade.
+        assert_eq!(super::how_black(&[200, 199, 198, 197]), "drop");
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

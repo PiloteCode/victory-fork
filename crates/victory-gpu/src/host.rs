@@ -6302,8 +6302,13 @@ impl Host {
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
+            // Every frame is probed, those sent ahead too: probed only when
+            // read back at once (every 8th frame in the world), a black frame
+            // could not be told from a fade, and every probed black frame was
+            // logged as following a lit one (the frames between counted as
+            // lit).
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -6315,22 +6320,30 @@ impl Host {
                 ),
             ]);
             copy.close();
-            match slot {
+            let flown = match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
                     p.ahead[i].1 = flown;
+                    flown
                 }
-                None => self.execute(&[copy]),
+                None => {
+                    self.execute(&[copy]);
+                    0
+                }
+            };
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::capture::probed(frame, probe, flown);
+                crate::capture::land_probes(FINISHED.load(Ordering::Acquire));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = flown;
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
-            #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
-            #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
     }

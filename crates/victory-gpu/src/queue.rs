@@ -828,49 +828,29 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        blinks(frame, resource, state);
+        let _ = host.present(texture, state, frame);
+        crate::resource::host_transition(resource, state);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
 }
-/// Diagnostics: logs a presented frame that is black after one that was
-/// not, with what was presented and how many draws ran since.
+/// Diagnostics: what the present of `frame` names and the draws run since
+/// the last present, for the log of a frame that comes out black
+/// (`crate::capture::land_probes`: every frame is probed, its level known
+/// when its copy has run).
 #[cfg(all(windows, feature = "diagnostics"))]
-fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
-    static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+fn blinks(frame: u64, resource: This, state: u32) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
     let drawn = crate::draw::drawn();
-    let black = shown.unwrap_or(false);
-    let draws = crate::draw::take_frame();
-    if black && !last.0 {
-        last.2 += 1;
-        tracing::warn!(
-            frame,
-            resource = ?resource,
-            state = format_args!("{state:#x}"),
-            draws = drawn - last.1,
-            copied = shown.is_some(),
-            black_frames = last.2,
-            levels = ?crate::capture::recent_levels(),
-            "a black frame after a frame that was not"
-        );
-        for d in draws {
-            tracing::warn!("black frame {frame}: {d}");
-        }
-        AFTER.store(frame + 6, Ordering::Relaxed);
-    }
-    // Six frames on: the levels around it (a fade or a single drop).
-    static AFTER: AtomicU64 = AtomicU64::new(0);
-    if AFTER.load(Ordering::Relaxed) == frame {
-        tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
-    }
-    *last = (black, drawn, last.2);
+    let draws = drawn - LAST.swap(drawn, Ordering::Relaxed);
+    crate::capture::frame_info(
+        frame,
+        format!("resource {resource:?} state {state:#x}, {draws} draws since the last present"),
+        crate::draw::take_frame(),
+    );
 }
 
 /// A run of destination pages: how they are mapped (0 pool pages from
