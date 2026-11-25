@@ -73,7 +73,14 @@ shaders and emulates the one instruction.
    `VICTORY_BVH_QUARANTINE=1`
    also keeps the builder's stores out of title memory, for a first test). A
    partly working builder wrote garbage bounds into title memory and crashed
-   the title.
+   the title. While the builder does not run (before its first dispatch,
+   turned off, or with `VICTORY_BVH_BUILDER=0`), every node test of the
+   trace programs answers no hit without reading the node (a host word,
+   `USER_STRUCTURES`): their rays see an empty scene instead of whatever
+   bytes lie where the structures would be, which with the builder off made
+   screen-aligned dark tiles on sunlit hair and lit squares in shadow, and
+   changed the hair's light from run to run. `VICTORY_BVH_NO_HIT=0` lets
+   them walk those bytes, as before.
 6. **What running the builder in the game took so far** (2026-11-25, each a
    commit of its own):
    - *List upload memory where shaders reach it.* The builder writes the
