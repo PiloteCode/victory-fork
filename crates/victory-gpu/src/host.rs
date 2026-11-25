@@ -455,6 +455,143 @@ fn card_clock_watch(clock: &'static CardClock) {
     }
 }
 
+/// Whether a thread watches the card's progress through the sends to the
+/// host queue and names one it stays on for half a second or more
+/// (diagnostics; `VICTORY_HANG_WATCH=0`: no watch). Windows resets a card
+/// that runs one piece of work for 2 s, and the host device is then found
+/// removed seconds later by whichever thread calls next: the watch names
+/// the send while the card is on it, and the long sends of runs that do
+/// not lose the device too (flights sent ahead are timed by nothing else).
+#[cfg(feature = "diagnostics")]
+fn hang_watch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HANG_WATCH").is_none_or(|v| v != "0"))
+}
+
+/// The last sends to the host queue, newest last ([`hang_watch`]): the
+/// clock's value signalled behind each, when it was sent, what it was.
+#[cfg(feature = "diagnostics")]
+static SENDS: Mutex<std::collections::VecDeque<(u64, std::time::Instant, String)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// The fetch on the relay's copy queue the card has yet to finish, if any
+/// ([`hang_watch`]): its fence, the value it signals, when it was sent and
+/// what it copies.
+#[cfg(feature = "diagnostics")]
+static COPY_SENT: Mutex<Option<(ID3D12Fence, u64, std::time::Instant, String)>> = Mutex::new(None);
+
+/// What a submission sent to the host queue is ([`hang_watch`]): its
+/// number, whether it is sent ahead, its lists and (the first eight of)
+/// the pipelines they bind: made for every send, so kept short.
+fn describe_send(number: u64, late: bool, runs: &[&HostList], compare: bool) -> String {
+    #[cfg(feature = "diagnostics")]
+    {
+        const NAMED: usize = 8;
+        let mut pipelines: Vec<String> = Vec::new();
+        let mut bound = 0;
+        for list in runs {
+            let named = list.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            bound += named.len();
+            pipelines.extend(named.iter().take(NAMED.saturating_sub(pipelines.len())).cloned());
+        }
+        format!(
+            "submission {number} ({}), {} lists{}, binding {bound} pipelines, among them {pipelines:?}",
+            if late { "sent ahead" } else { "waited for" },
+            runs.len(),
+            if compare { " and the compare of card copies" } else { "" }
+        )
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = (number, late, runs, compare);
+        String::new()
+    }
+}
+
+/// The watch of the card's progress ([`hang_watch`]): every 100 ms, the
+/// send the card is on (the first whose clock signal it has not reached)
+/// and since when; one it stays on for 500 ms or more is named, with the
+/// sends behind it, and named again with its time once the card is past
+/// it. The same for a fetch on the relay's copy queue.
+#[cfg(feature = "diagnostics")]
+fn card_watch(clock: &'static CardClock) {
+    const LONG: std::time::Duration = std::time::Duration::from_millis(500);
+    // The clock value last seen reached, and since when.
+    let mut seen = (0u64, std::time::Instant::now());
+    // The send named as long, and since when the card was on it.
+    let mut named: Option<(u64, std::time::Instant)> = None;
+    let mut copy_named = 0u64;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // SAFETY: a plain query of the clock's fence.
+        let reached = unsafe { clock.fence.GetCompletedValue() };
+        if reached == u64::MAX {
+            // The device is gone (a removed device's fences read all ones).
+            if let Some((send, since)) = named {
+                tracing::error!("the host device went while the card was on send {send}, for {} ms", since.elapsed().as_millis());
+            }
+            return;
+        }
+        if reached != seen.0 {
+            if let Some((send, since)) = named
+                && reached >= send
+            {
+                tracing::warn!("the card got past send {send} after {} ms on it", since.elapsed().as_millis());
+                named = None;
+            }
+            seen = (reached, std::time::Instant::now());
+        }
+        let sent = clock.state.lock().unwrap_or_else(|e| e.into_inner()).0;
+        if reached < sent && named.is_none() {
+            let sends = SENDS.lock().unwrap_or_else(|e| e.into_inner());
+            let on = sends.iter().find(|(n, _, _)| *n == reached + 1);
+            // On it since the one before was done, or since it was sent.
+            let since = on.map_or(seen.1, |(_, at, _)| (*at).max(seen.1));
+            if since.elapsed() >= LONG {
+                let behind: Vec<&str> =
+                    sends.iter().filter(|(n, _, _)| *n > reached + 1).take(4).map(|(_, _, what)| what.as_str()).collect();
+                tracing::warn!(
+                    "the card has been on send {} of {sent} for {} ms: {}; behind it: {behind:?}; the submitting thread: {}",
+                    reached + 1,
+                    since.elapsed().as_millis(),
+                    on.map_or("(not among the last sends)", |(_, _, what)| what.as_str()),
+                    submitting_now()
+                );
+                named = Some((reached + 1, since));
+            }
+        }
+        let copy = COPY_SENT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((fence, value, at, what)) = copy.as_ref() {
+            // SAFETY: a plain query of the fetch's fence.
+            let done = unsafe { fence.GetCompletedValue() };
+            if done < *value && *value != copy_named && at.elapsed() >= LONG {
+                tracing::warn!(
+                    "the relay's copy queue has been on its fetch {value} for {} ms: {what}; the card's host queue is at send {} of {sent}",
+                    at.elapsed().as_millis(),
+                    reached + 1
+                );
+                copy_named = *value;
+            }
+        }
+    }
+}
+
+/// What the submitting thread does now, in the words of [`removal_context`].
+#[cfg(feature = "diagnostics")]
+fn submitting_now() -> String {
+    let phase = match SUBMITTING[0].load(Ordering::Relaxed) {
+        0 => "between submissions",
+        1 => "preparing a submission",
+        2 => "waiting for the card to run a submission",
+        _ => "copying back what a submission wrote",
+    };
+    format!(
+        "{phase}, of {} lists, for {:.1} ms",
+        SUBMITTING[1].load(Ordering::Relaxed),
+        now_us().saturating_sub(SUBMITTING[2].load(Ordering::Relaxed)) as f64 / 1000.0
+    )
+}
+
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
@@ -3422,14 +3559,21 @@ impl Host {
             if let Err(e) = std::thread::Builder::new().name("victory-card-clock".into()).spawn(move || card_clock_watch(clock)) {
                 tracing::warn!(error = %e, "no thread for the card's clock: the frame line's idle times stay 0");
             }
+            #[cfg(feature = "diagnostics")]
+            if hang_watch()
+                && let Err(e) = std::thread::Builder::new().name("victory-card-watch".into()).spawn(move || card_watch(clock))
+            {
+                tracing::warn!(error = %e, "no thread to watch the card's progress");
+            }
         });
         Some(clock)
     }
 
     /// Lists of ours just went to the queue: the clock's signal goes
     /// behind them, and an idle stretch of the card, if one was under way,
-    /// ends here ([`CARD_CLOCK_US`]).
-    fn card_sent(&self) {
+    /// ends here ([`CARD_CLOCK_US`]). `what` names the send for the watch
+    /// of the card's progress (diagnostics, [`hang_watch`]).
+    fn card_sent(&self, what: impl FnOnce() -> String) {
         let Some(clock) = self.card_clock() else {
             return;
         };
@@ -3437,6 +3581,17 @@ impl Host {
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        #[cfg(feature = "diagnostics")]
+        if hang_watch() {
+            let mut sends = SENDS.lock().unwrap_or_else(|e| e.into_inner());
+            // More than the sends of the 128 lists the relay keeps in the air.
+            if sends.len() >= 256 {
+                sends.pop_front();
+            }
+            sends.push_back((state.0, std::time::Instant::now(), what()));
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = what;
         if let Some((since, worked_then)) = state.1.take() {
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
             CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
@@ -4020,6 +4175,7 @@ impl Host {
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let copy_queue = f.queue.clone();
         let waiting = std::time::Instant::now();
+        let what = || format!("the relay's fetch of {} pieces of card copies, {total} bytes", pieces.len());
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -4047,11 +4203,16 @@ impl Host {
                         self.queue.ExecuteCommandLists(&lists);
                         let after = *order;
                         drop(order);
-                        self.card_sent();
+                        self.card_sent(what);
                         (&self.queue, after)
                     }
                 };
                 queue.Signal(&fence, sent)?;
+                #[cfg(feature = "diagnostics")]
+                if copy_queue.is_some() && hang_watch() {
+                    *COPY_SENT.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((fence.clone(), sent, std::time::Instant::now(), what()));
+                }
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
@@ -4449,7 +4610,7 @@ impl Host {
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    self.card_sent();
+                    self.card_sent(|| format!("the fetch of {} pieces of card copies, {total} bytes", pieces.len()));
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
@@ -4904,6 +5065,7 @@ impl Host {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        let compare = card.as_ref().is_some_and(|c| c.check.is_some());
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
@@ -4911,7 +5073,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
-            self.card_sent();
+            self.card_sent(|| describe_send(this_submission, true, runs, compare));
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -4950,7 +5112,7 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                self.card_sent();
+                self.card_sent(|| describe_send(this_submission, false, runs, compare));
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
