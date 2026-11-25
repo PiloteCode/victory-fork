@@ -1569,6 +1569,12 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_of(words, input_addr, false)
+    }
+
+    /// [`pixel`] with TEXCOORD0 a 16-bit attribute when `fp16` (one value in the low half of
+    /// each dword).
+    fn pixel_of(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1582,7 +1588,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16,
                     pack2: false,
                     row2: 0,
                 }],
@@ -1645,6 +1651,28 @@ mod barycentric_tests {
         let isg1 = isg1.part(FourCC::ISG1).unwrap().data;
         let rw: Vec<u8> = (0..2).map(|k| isg1[8 + 32 * k + 25]).collect();
         assert!(rw.contains(&0b110), "{rw:?}");
+        validate(&shader);
+    }
+
+    /// A 16-bit result written over a first interpolation half's register
+    /// (`v_fma_mixlo_f16` keeps the other half): the second half evaluates the pair, and
+    /// what the first half leaves in the half kept is no number the code reads.
+    #[test]
+    fn a_half_written_over_a_first_interpolation_half_translates() {
+        let [e0, e1] = exp_mrt0(4);
+        let words = [
+            0xD742_0002,
+            0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+            0xD75A_0003,
+            0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+            0xCC21_0002,
+            0x0A01_E503, // v_fma_mixlo_f16 v2, sel_lo(v3), 1.0, 0
+            0x7E08_1702, // v_cvt_f32_f16 v4, v2
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel_of(&words, PERSP_CENTER, true).unwrap();
         validate(&shader);
     }
 

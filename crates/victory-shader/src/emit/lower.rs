@@ -332,6 +332,9 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+/// A first interpolation half (`v_interp_p1*`) whose second half evaluates the pair: it has
+/// no value of its own.
+const FIRST_HALF: Why = "the first half of an interpolation";
 /// A descriptor joined from the ways into a block, where one of them brings what a heap index
 /// cannot stand for (an immediate sampler, say), or comes from later in the program.
 pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
@@ -7068,9 +7071,13 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                // (a first interpolation half held there before keeps nothing anyone reads:
+                // its pair is evaluated by the second half, and code reads the f16 result's
+                // half of the register)
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    Some(Err(FIRST_HALF)) | None => self.s.m.i32(0),
+                    Some(Err(why)) => return Err(why),
                 };
                 let h = self
                     .s
@@ -8568,7 +8575,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
