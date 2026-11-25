@@ -3077,6 +3077,13 @@ impl State {
                     made.iter().find(|(r, _)| r.len() >= at && r[..at] == records[..at]).map(|&(_, first)| first)
                 })
                 .flatten();
+            // With `VICTORY_HEAP_SYNC_TABLES=2|3` (fxceless #995, tunczzz):
+            // the heap sync number before the records are read, and each
+            // entry's record key, for `HostHeap::drawn_fresh` (the records
+            // the sync left to tables' draws that this draw read).
+            let stamps = crate::descriptor::host::sync_tables() >= 2;
+            let seq = crate::descriptor::host::sync_seq();
+            let mut read: Vec<u64> = Vec::with_capacity(if stamps { n as usize } else { 0 });
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -3084,7 +3091,11 @@ impl State {
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    words.hash(&mut h);
+                    if stamps {
+                        read.push(crate::descriptor::host::words_key(words));
+                    }
                 }
                 (table, n, h.finish())
             };
@@ -3093,6 +3104,11 @@ impl State {
                 crate::copystat::add(crate::copystat::C::TablesPrefix, 1);
             }
             if let Some(first) = longer.or_else(|| self.fresh_tables.get(&key).map(|&(first, _)| first)) {
+                if stamps && let Some(title) = heap.index(table) {
+                    for (k, &read) in (0..).zip(&read) {
+                        host.drawn_fresh(title + k, seq, read);
+                    }
+                }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -3143,6 +3159,11 @@ impl State {
             let mut has_cbv = false;
             for k in 0..n {
                 let index = first + k;
+                if let Some(title) = title_first
+                    && let Some(&read) = read.get(k as usize)
+                {
+                    host.drawn_fresh(title + k, seq, read);
+                }
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
