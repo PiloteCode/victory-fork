@@ -939,6 +939,17 @@ mod tests {
 
     use super::*;
 
+    /// Presenting a texture already in the copy source state moves it
+    /// nowhere: no barrier from a state to itself.
+    #[test]
+    fn a_barrier_to_the_same_state_is_not_made() {
+        let Some(host) = host() else { return };
+        let Some((buffer, _)) = host.upload_buffer(256) else { return };
+        let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        assert!(transition_if(&buffer, source, source).is_none());
+        assert!(transition_if(&buffer, dest, source).is_some());
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -9056,14 +9067,18 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
+            let before: Vec<_> = [
+                transition_if(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                Some(transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+                )),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            list.ResourceBarrier(&before);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -9078,14 +9093,18 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            let after: Vec<_> = [
+                transition_if(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                Some(transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            list.ResourceBarrier(&after);
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -9461,6 +9480,16 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
     }
     text
+}
+
+/// [`transition`], unless the states are the same (D3D12 refuses a barrier
+/// from a state to itself).
+fn transition_if(
+    resource: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> Option<D3D12_RESOURCE_BARRIER> {
+    (before != after).then(|| transition(resource, before, after))
 }
 
 pub(crate) fn transition(
