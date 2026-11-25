@@ -89,6 +89,7 @@ impl<'a> Lower<'a> {
         std::mem::swap(&mut self.strides, &mut t.strides);
         std::mem::swap(&mut self.clane, &mut t.clane);
         std::mem::swap(&mut self.partial_active, &mut t.partial_active);
+        std::mem::swap(&mut self.raw, &mut t.raw);
         self.upper = !self.upper;
     }
 
