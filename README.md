@@ -157,6 +157,7 @@ draws or more.
 | DirectStorage page numbers read again (`dstorage.rs`, `xmem.rs`) | a request whose page numbers the title wrote after enqueueing it failed (up to 302 in a burst at loading): its model or texture kept old data | no failed request since |
 | Shader translation fixes, second round (agent, `victory-shader`, `pipeline/host.rs`) | 76 programs: a float the console keeps constant packed beside an integer or the front face got another interpolation mode; 64-bit floats and wave sums of them (water); two reductions sharing their end block; blending asked on an integer target (the windshield-wiper mask pipeline was refused) | in the whole opening cutscene no pipeline is refused and no shader fails to translate; offline 25,680 of 25,953 programs pass (the rest: unused voxel geometry stages, mesh outputs over the host's limit that NVIDIA builds anyway, five ray-trace programs, one driver failure) |
 | Indirect records clamped into a ring, behind one enhanced barrier (`indirect.rs`, `host.rs`) | each clamp waited for the last indirect call to have read the one scratch buffer, and the call after it for the clamp | clamps 33 → 19 ms of card time a frame, the card's commands 102 → 95 ms; frames 179 → 171 ms (median), 210 → 189 ms (mean) |
+| Shader translation fixes, third round (agent, `victory-shader`, `pipeline/host.rs`) | 36 wave64 compute programs (shadow-mask tiles and traces, temporal resolves, irradiance-cache and fallback lighting, light clustering, scattering gathers, decal and fire resolves, the light atlas, a lens-flare scan) ran on 32-lane GPUs in an approximate form, each half-wave counting, ORing or electing over its own 32 lanes; 71 pedestrian, vehicle and prop mesh programs declared more output than D3D12's 32 KiB; `weatherParticle:CS_BeginUpdate` got no pipeline (NVIDIA's compiler refuses a group-shared atomic add of a negated value, E_OUTOFMEMORY, DXC's own HLSL included); `PS_VoxelizeVisiblity` did not translate (a lane mask parked in two VGPR lanes came back as two scalars) | the 36 run in the exact paired form (three more lens-flare scans were exact already: an allocation with a multiply-add); an oversized mesh program is linked with its pixel program for each pipeline (all 710 pairs tried offline and the 3 drawn so far link, validate and build); offline 25,682 of 25,953 programs pass (the rest: unused voxel geometry stages, five ray-trace programs, and the 71 mesh programs as translated alone, valid once linked) |
 
 Together: the opening of the gameplay went from 487 ms to about 175-195 ms a
 frame (2 → 5-5.5 fps), the opening cutscene's streaming from a median of 590 ms
@@ -185,7 +186,9 @@ compute and back for each of 2,500 a frame: the title's ~710 barriers a
 frame cut its runs of records short); ~60 ms a frame that the submitting
 thread waits for flights to land, because small constant buffers the card
 writes are copied into upload memory on the CPU (they are not on the
-256-byte line a host constant view needs).
+256-byte line a host constant view needs). The paired form makes 36 compute
+programs exact at about 2.9 times their DXIL size (a thread runs two console
+lanes, at half the threads): not timed in a run yet.
 
 To run it: `Lancer GTA6 (VIctory).bat` next to the game's files builds the
 release and starts the title.
@@ -392,6 +395,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_MESH_LINK=0` | a mesh pipeline whose mesh program's outputs pass 32 KiB is made of the shared translations, as before, not of the pair linked for it |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
