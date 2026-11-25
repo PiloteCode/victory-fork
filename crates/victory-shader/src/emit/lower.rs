@@ -301,6 +301,9 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// The program tests rays against tree nodes (`image_bvh*`): its loops
+    /// are cut at [`TRACE_LOOP_LIMIT`].
+    traces: bool,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
@@ -344,6 +347,18 @@ struct LaneState {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// Iterations after which a loop of a program that tests rays against tree
+/// nodes is left, unless [`super::loop_limit`] names a limit for all.
+///
+/// A ray's walk of a well-formed tree visits some hundreds of nodes at
+/// most. The title's shadow-mask rays ran to the compute limit of 4,096: the
+/// trees of moving objects are built by the title's builder, which is off,
+/// so a walk into one follows whatever its memory holds. At 4,096 the
+/// shadow mask took 11.7 ms of the card a frame, at 1,024 2.4 ms (timing
+/// runs of the opening of the gameplay, RTX 5090); a ray stopped either way
+/// leaves the program as killed, as before.
+pub(super) const TRACE_LOOP_LIMIT: u32 = 1 << 10;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -1679,6 +1694,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
             twin: paired.then(Box::default),
             upper: false,
@@ -11178,6 +11194,7 @@ impl<'a> Lower<'a> {
         let limit = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
             LOOP_LIMIT => 1 << 12,
             named => named,
         };
