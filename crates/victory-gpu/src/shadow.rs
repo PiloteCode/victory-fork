@@ -222,7 +222,7 @@ pub(crate) static MASKED_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4
 /// The mask of the bytes where `title` differs from `held` (the copy's
 /// offsets `[at, at + title.len())`), and those bytes copied into `held`.
 /// `None` if no byte differs.
-fn mask_into(at: usize, title: &[u8], held: &mut [u8]) -> Option<Masked> {
+pub(crate) fn mask_into(at: usize, title: &[u8], held: &mut [u8]) -> Option<Masked> {
     let n = title.len().min(held.len());
     let base = at & !3;
     let end = (at + n).next_multiple_of(4);
@@ -4522,6 +4522,124 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    /// `VICTORY_MERGE_MASKED=1`: the title rewrote every eighth byte of a
+    /// 64 KiB page under a flight's shader writes; the merge put those bytes
+    /// into the CPU side and a mask (`mask_into`). The flight's slot, fetched
+    /// before the mask's send, holds the card's older bytes there and a
+    /// shader's write beside them, one in a dword the title changed in part.
+    /// The relay's merge takes the shader's bytes and leaves the title's: while
+    /// the mask is still to go up, and when it went up with a later send than
+    /// the fetch. Fetched after the mask's send, the slot holds the title's
+    /// bytes (the pass wrote them) and nothing is left out. Without the mask
+    /// the older card bytes would be taken for shaders' writes.
+    #[test]
+    fn title_bytes_sent_by_a_mask_survive_a_slot_fetched_before_it() {
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        // Shader bytes: one alone, one in a dword whose byte 0 the title
+        // changed (byte 1 of dword 0x100).
+        let shader_bytes = [0x2345usize, 0x401];
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 13 + 5) as u8).collect();
+        let rewritten = |i: usize| i.is_multiple_of(8);
+        let land = |sent: Option<u64>, fetched_after: u64, slot_has_title: bool| -> Vec<u8> {
+            let mut title = content.clone();
+            for (i, b) in title.iter_mut().enumerate() {
+                if rewritten(i) {
+                    *b ^= 0x5a;
+                }
+            }
+            let mut side = content.clone();
+            let mut mask = super::mask_into(0, &title, &mut side).expect("changed bytes");
+            assert_eq!(side, title, "the merge puts the title's bytes into the CPU side");
+            let mut masked = Vec::new();
+            if let Some(sent) = sent {
+                mask.sent = sent;
+                masked.push(mask);
+            }
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            shadow.card = Some(Card {
+                staging: staging.clone(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                masked: Mutex::new(masked),
+                size: 0,
+            });
+            // The flight's slot: the card's bytes behind its lists.
+            let mut slot = if slot_has_title { title.clone() } else { content.clone() };
+            for &at in &shader_bytes {
+                slot[at] ^= 0xc3;
+            }
+            let written = shadow.card_merge_relay(0, &slot, fetched_after, &mut Vec::new());
+            assert!(written > 0);
+            drop(shadow);
+            title
+        };
+        let check = |title: &[u8], what: &str| {
+            for i in 0..LEN {
+                let want = if shader_bytes.contains(&i) {
+                    content[i] ^ 0xc3
+                } else if rewritten(i) {
+                    content[i] ^ 0x5a
+                } else {
+                    content[i]
+                };
+                assert_eq!(title[i], want, "{what}: byte {i:#x}");
+            }
+        };
+        // Still to go up (0), and sent with send 7, after the fetch's 6.
+        check(&land(Some(0), 6, false), "mask still to go up");
+        check(&land(Some(7), 6, false), "mask sent after the fetch");
+        // Fetched after send 7: the slot has the title's bytes.
+        check(&land(Some(7), 7, true), "mask sent before the fetch");
+        // No mask: the older card bytes win (what the mask is for).
+        let lost = land(None, 6, false);
+        assert_eq!(lost[8], content[8], "without the mask the title's byte is lost");
+    }
+
+    /// `mask_into` marks exactly the bytes that differ, from a dword-aligned
+    /// base, and copies them; `Masked::has` and `Card::hidden` read it back.
+    #[test]
+    fn a_mask_holds_exactly_the_changed_bytes() {
+        let held: Vec<u8> = (0..300).map(|i| (i * 7) as u8).collect();
+        let mut title = held.clone();
+        let changed = [0usize, 1, 2, 3, 5, 63, 64, 65, 200, 298, 299];
+        for &i in &changed {
+            title[i] ^= 0x11;
+        }
+        for at in [0usize, 1, 2, 3, 4, 4097] {
+            let mut side = held.clone();
+            let mask = super::mask_into(at, &title, &mut side).expect("changed bytes");
+            assert_eq!(side, title);
+            assert_eq!(mask.base % 4, 0);
+            assert!(mask.base <= at && mask.base + 4 * mask.dwords >= at + title.len());
+            for o in mask.base..mask.base + 4 * mask.dwords {
+                let want = o >= at && o < at + title.len() && changed.contains(&(o - at));
+                assert_eq!(mask.has(o), want, "at {at}: offset {o}");
+            }
+            let card = Card {
+                staging: match super::card_merge_tests::warp_buffer() {
+                    Some(b) => b,
+                    None => return,
+                },
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                masked: Mutex::new(vec![super::Masked { sent: 3, ..mask.clone() }]),
+                size: 0,
+            };
+            // Sent with send 3: left out for a fetch after send 2, not 3.
+            let hidden = card.hidden(at + 1, 100, 2).expect("hidden bytes");
+            for k in 0..100 {
+                assert_eq!(hidden[k / 64] >> (k % 64) & 1 != 0, changed.contains(&(k + 1)), "at {at}: byte {k}");
+            }
+            assert!(card.hidden(at + 1, 100, 3).is_none());
+            assert!(super::mask_into(at, &title, &mut side).is_none(), "nothing differs any more");
+        }
     }
 }
 
