@@ -1252,6 +1252,11 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
+        // The frame listing: which target is cleared, to what, where.
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!("CLEAR target {:?} to {color:?} rects {count}", record.resource)
+        });
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1306,6 +1311,15 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        // The frame listing: which depth texture is cleared (flags 1 depth,
+        // 2 stencil), to what, where.
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!(
+                "CLEAR depth {:?} flags {flags} depth {depth} stencil {stencil:#x} rects {count}",
+                record.resource
+            )
+        });
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

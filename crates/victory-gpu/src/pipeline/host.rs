@@ -207,6 +207,38 @@ impl GraphicsState {
         )
     }
 
+    /// The depth, stencil, cull and first target's blend state, as the
+    /// frame listing shows them after a draw (`depth_bounds`: whether the
+    /// host pipeline keeps the depth bounds test).
+    fn listed(&self, depth_bounds: bool) -> String {
+        let (d, r, b) = (&self.depth, &self.rasterizer, &self.blend.RenderTarget[0]);
+        let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+            format!(
+                "fail {} depth-fail {} pass {} func {}",
+                f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+            )
+        };
+        let bounds = if depth_bounds { " bounds true" } else { "" };
+        format!(
+            "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
+            d.DepthEnable.as_bool(),
+            d.DepthWriteMask.0,
+            d.DepthFunc.0,
+            d.StencilEnable.as_bool(),
+            d.StencilReadMask,
+            d.StencilWriteMask,
+            face(&d.FrontFace),
+            face(&d.BackFace),
+            r.CullMode.0,
+            r.FrontCounterClockwise.as_bool(),
+            b.BlendEnable.as_bool(),
+            b.SrcBlend.0,
+            b.DestBlend.0,
+            b.BlendOp.0,
+            b.RenderTargetWriteMask
+        )
+    }
+
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
         D3D12_DEPTH_STENCIL_DESC1 {
@@ -619,7 +651,9 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
-                state: String::new(),
+                // The world's draws are mostly mesh dispatches: the listing
+                // showed no depth or stencil state for them.
+                state: g.listed(depth_bounds),
             });
         }
 
@@ -735,34 +769,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
-            state: {
-                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
-                let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
-                    format!(
-                        "fail {} depth-fail {} pass {} func {}",
-                        f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
-                    )
-                };
-                let bounds = if depth_bounds { " bounds true" } else { "" };
-                format!(
-                    "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
-                    d.DepthEnable.as_bool(),
-                    d.DepthWriteMask.0,
-                    d.DepthFunc.0,
-                    d.StencilEnable.as_bool(),
-                    d.StencilReadMask,
-                    d.StencilWriteMask,
-                    face(&d.FrontFace),
-                    face(&d.BackFace),
-                    r.CullMode.0,
-                    r.FrontCounterClockwise.as_bool(),
-                    b.BlendEnable.as_bool(),
-                    b.SrcBlend.0,
-                    b.DestBlend.0,
-                    b.BlendOp.0,
-                    b.RenderTargetWriteMask
-                )
-            },
+            state: g.listed(depth_bounds),
         })
     }
 }
