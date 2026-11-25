@@ -49,16 +49,18 @@ pub(crate) fn listed(n: u64) -> bool {
     let after = n.wrapping_sub(first);
     named
         || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
-        || TIMED_FRAMES.iter().any(|f| f.load(std::sync::atomic::Ordering::Relaxed) == n)
+        || TIMED_FRAMES
+            .iter()
+            .any(|f| in_timed_run(f.load(std::sync::atomic::Ordering::Relaxed), n))
 }
 
-/// `VICTORY_CAPTURE_SECONDS` (comma-separated): the first frame begun at
+/// `VICTORY_CAPTURE_SECONDS` (comma-separated): at the first present at
 /// least that many seconds after the world's first frame (the frame of 500
-/// draws or more; `VICTORY_CAPTURE_WORLD` must be set) is listed as those of
-/// `VICTORY_CAPTURE_FRAMES` are. The opening cutscene keeps time with its
-/// sound, not with frames: a shot that came at frame 2,979 of one run came
-/// at frame 2,393 of a slower one, 296 and 278 seconds after the world's
-/// first frame.
+/// draws or more; `VICTORY_CAPTURE_WORLD` must be set), the next
+/// [`TIMED_RUN`] frames are listed as those of `VICTORY_CAPTURE_FRAMES` are.
+/// The opening cutscene keeps time with its sound, not with frames: a shot
+/// that came at frame 2,979 of one run came at frame 2,393 of a slower one,
+/// 296 and 278 seconds after the world's first frame.
 fn seconds() -> &'static [f64] {
     static LIST: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
@@ -69,8 +71,28 @@ fn seconds() -> &'static [f64] {
     })
 }
 
-/// The last frames listed by [`seconds`], a ring read without a lock (every
-/// operation recorded asks [`listed`]).
+/// The frames in a row that one of [`seconds`] lists. An operation goes to
+/// the listing of the frame after the last one presented when it is
+/// recorded, and the title records several frames' lists on its threads
+/// around a present: a frame's passes can land in its neighbours'
+/// listings. In wave 3's general test no listed frame held all of one
+/// frame's lighting: the gameplay's 3,341 had the shadow tile
+/// classification but no final gather, 3,419 the final gather but no
+/// classification, 3,434, 3,447 and 3,458 the screen probes' ray tracing
+/// but not the final gather that follows it, and 3,593 none of these
+/// (wave 1's 5,953 and 5,957 held all of them). Three listings in a row
+/// hold the middle frame whole as long as its passes land no further than
+/// its neighbours' listings.
+const TIMED_RUN: u64 = 3;
+
+/// Whether frame `n` is one of the run that begins at `first` (`u64::MAX`:
+/// a slot no time has given a frame yet).
+fn in_timed_run(first: u64, n: u64) -> bool {
+    first != u64::MAX && n.wrapping_sub(first) < TIMED_RUN
+}
+
+/// The first frames of the runs [`seconds`] lists, a ring read without a
+/// lock (every operation recorded asks [`listed`]).
 static TIMED_FRAMES: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 4];
 
@@ -78,8 +100,9 @@ static TIMED_FRAMES: [std::sync::atomic::AtomicU64; 4] =
 /// have been given a frame.
 static TIMED: std::sync::Mutex<(Option<std::time::Instant>, usize)> = std::sync::Mutex::new((None, 0));
 
-/// At the present of `frame`: the next frame is listed if it is the first
-/// to begin past one of [`seconds`] after the world's first frame.
+/// At the present of `frame`: the next [`TIMED_RUN`] frames are listed if
+/// this is the first present past one of [`seconds`] after the world's
+/// first frame.
 fn timed_frames(frame: u64) {
     let wanted = seconds();
     if wanted.is_empty() || WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
@@ -93,7 +116,12 @@ fn timed_frames(frame: u64) {
     }
     if timed.1 > given {
         TIMED_FRAMES[given % TIMED_FRAMES.len()].store(frame + 1, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!(frame = frame + 1, seconds = since, "a frame listed by its time after the world's first frame");
+        tracing::info!(
+            first = frame + 1,
+            last = frame + TIMED_RUN,
+            seconds = since,
+            "frames listed by their time after the world's first frame"
+        );
     }
 }
 
@@ -1019,6 +1047,16 @@ mod tests {
         assert_eq!(super::how_black(&[30, 31, 30, 29]), "dark");
         // Darker each frame but not by much: not a fade.
         assert_eq!(super::how_black(&[200, 199, 198, 197]), "drop");
+    }
+
+    /// A time lists the next three frames: neither the one presented then
+    /// nor the fourth; an empty slot lists none.
+    #[test]
+    fn a_time_lists_three_frames_in_a_row() {
+        let listed: Vec<u64> = (98..105).filter(|&n| super::in_timed_run(100, n)).collect();
+        assert_eq!(listed, [100, 101, 102]);
+        assert!(!(0..5).any(|n| super::in_timed_run(u64::MAX, n)));
+        assert!(!super::in_timed_run(u64::MAX, u64::MAX));
     }
 
     #[test]
