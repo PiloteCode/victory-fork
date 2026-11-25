@@ -12,6 +12,7 @@
 //! [`SLACK`] after each rounded operation, and a bound past the largest float is an infinity.
 
 use super::{Bin, Cast, Module, Op, TypeDef, V};
+use crate::emit::lower::legacy::Form;
 
 /// The smallest normal f32.
 const NORMAL: f64 = 1.175_494_350_822_287_5e-38;
@@ -19,8 +20,28 @@ const NORMAL: f64 = 1.175_494_350_822_287_5e-38;
 const LARGEST: f64 = 3.402_823_466_385_288_6e38;
 /// Relative widening of a rounded bound (f32 rounds by at most 2^-24).
 const SLACK: f64 = 1.0 / 1_048_576.0;
-/// How deep a value's makers are followed.
+/// How deep a value's makers are followed while the module is built.
 const DEPTH: u32 = 24;
+/// Rounds of [`Module::settled`] before bounds that still grow are widened, and in all.
+const WIDEN: u32 = 6;
+const ROUNDS: u32 = 24;
+
+/// Bounds of sums and products on the f32s at or beyond the exact ones
+/// ([`Facts::outward`]), and `0 - y` as the card computes it: part of `VICTORY_LEGACY_LOOPS`
+/// (on), so that with it off every program is as before it, bit for bit.
+fn on_floats() -> bool {
+    crate::emit::lower::legacy::loops_on()
+}
+
+/// No value at all (a join's start in [`Module::settled`]).
+const BOTTOM: Facts = Facts {
+    lo: f64::INFINITY,
+    hi: f64::NEG_INFINITY,
+    nan: false,
+    pz: false,
+    nz: false,
+    least: f64::INFINITY,
+};
 
 /// What every value of an f32 is known to satisfy.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -121,6 +142,39 @@ impl Facts {
         }
     }
 
+    /// No NaN among the bounds (what an operand without values may leave there).
+    fn tidy(self) -> Facts {
+        Facts {
+            lo: if self.lo.is_nan() {
+                f64::NEG_INFINITY
+            } else {
+                self.lo
+            },
+            hi: if self.hi.is_nan() {
+                f64::INFINITY
+            } else {
+                self.hi
+            },
+            least: if self.least.is_nan() { 0.0 } else { self.least },
+            ..self
+        }
+    }
+
+    /// `self` grown to hold `new`, a bound that moves going straight to its end.
+    fn widen(self, new: Facts) -> Facts {
+        let j = self.join(new);
+        Facts {
+            lo: if j.lo < self.lo {
+                f64::NEG_INFINITY
+            } else {
+                j.lo
+            },
+            hi: if j.hi > self.hi { f64::INFINITY } else { j.hi },
+            least: if j.least < self.least { 0.0 } else { j.least },
+            ..j
+        }
+    }
+
     fn join(self, o: Facts) -> Facts {
         Facts {
             lo: self.lo.min(o.lo),
@@ -170,6 +224,25 @@ impl Facts {
 
     /// A rounded result's bounds: widened, past the largest float an infinity.
     fn rounded(lo: f64, hi: f64) -> (f64, f64) {
+        if !on_floats() {
+            return Self::widened(lo, hi);
+        }
+        Self::outward(lo - lo.abs() * SLACK, hi + hi.abs() * SLACK)
+    }
+
+    /// The bounds of a sum or product of f32s within `[lo, hi]` before rounding:
+    /// [`Facts::outward`] with `VICTORY_LEGACY_LOOPS` (on), [`Facts::widened`] without.
+    fn exact_rounded(lo: f64, hi: f64) -> (f64, f64) {
+        if on_floats() {
+            Self::outward(lo, hi)
+        } else {
+            Self::widened(lo, hi)
+        }
+    }
+
+    /// Bounds widened by [`SLACK`], past the largest float an infinity: every rounded bound
+    /// without `VICTORY_LEGACY_LOOPS` (as before it, bit for bit).
+    fn widened(lo: f64, hi: f64) -> (f64, f64) {
         let widen = |x: f64, up: bool| {
             let w = x + if up { x.abs() } else { -x.abs() } * SLACK;
             if w > LARGEST {
@@ -181,6 +254,36 @@ impl Facts {
             }
         };
         (widen(lo, false), widen(hi, true))
+    }
+
+    /// The bounds of a result rounded once to nearest from a number within `[lo, hi]`: the
+    /// f32s at or beyond them (rounding never passes a float the number does not pass), a
+    /// result under the smallest normal possibly flushed to a zero of its sign, one past the
+    /// largest float an infinity. (Bounds of products and sums of f32s are exact in f64, or
+    /// within 2^-53 of exact, far inside an f32's step.)
+    fn outward(lo: f64, hi: f64) -> (f64, f64) {
+        let down = |x: f64| {
+            if x.is_nan() {
+                return f64::NEG_INFINITY;
+            }
+            let f = x as f32;
+            f64::from(if f64::from(f) > x { f.next_down() } else { f })
+        };
+        let up = |x: f64| {
+            if x.is_nan() {
+                return f64::INFINITY;
+            }
+            let f = x as f32;
+            f64::from(if f64::from(f) < x { f.next_up() } else { f })
+        };
+        let (mut lo, mut hi) = (down(lo), up(hi));
+        if lo > 0.0 && lo < NORMAL {
+            lo = 0.0;
+        }
+        if hi < 0.0 && hi > -NORMAL {
+            hi = 0.0;
+        }
+        (lo, hi)
     }
 
     /// Where the bounds keep every number away from zero, no zero, and the bound is a least
@@ -213,7 +316,7 @@ impl Facts {
             lo = lo.min(x);
             hi = hi.max(x);
         }
-        let (lo, hi) = Self::rounded(lo, hi);
+        let (lo, hi) = Self::exact_rounded(lo, hi);
         // (an operand without numbers other than zeros has an infinite least: none known)
         let least = self.least * o.least * (1.0 - SLACK);
         let least = if least.is_nan() { 0.0 } else { least };
@@ -275,7 +378,7 @@ impl Facts {
             || o.nan
             || (self.hi == f64::INFINITY && o.lo == f64::NEG_INFINITY)
             || (self.lo == f64::NEG_INFINITY && o.hi == f64::INFINITY);
-        let (lo, hi) = Self::rounded(self.lo + o.lo, self.hi + o.hi);
+        let (lo, hi) = Self::exact_rounded(self.lo + o.lo, self.hi + o.hi);
         let (lo, hi) = (
             if lo.is_nan() { f64::NEG_INFINITY } else { lo },
             if hi.is_nan() { f64::INFINITY } else { hi },
@@ -415,60 +518,57 @@ impl Module {
         }
     }
 
-    /// What is known of the f32 `v` (see [`Facts`]).
-    pub fn facts(&mut self, v: V) -> Facts {
+    /// What is known of the f32 `v` (see [`Facts`]) while the module is built: joins not
+    /// yet filled know nothing.
+    pub fn facts(&self, v: V) -> Facts {
         self.facts_at(v, 0)
     }
 
-    fn facts_at(&mut self, v: V, depth: u32) -> Facts {
-        if let Some(b) = self.float_bits(v) {
-            return Facts::constant(b);
+    fn facts_at(&self, v: V, depth: u32) -> Facts {
+        if let Some(f) = self.constant_facts(v) {
+            return f;
         }
         let V::Inst(i) = v else { return Facts::ANY };
-        if let Some(&f) = self.facts_seen.get(&i) {
+        let seen = self.facts_seen.borrow().get(&i).copied();
+        if let Some(f) = seen {
             return f;
         }
         if depth >= DEPTH {
             return Facts::ANY;
         }
         // (a join that comes round to itself knows nothing of itself)
-        self.facts_seen.insert(i, Facts::ANY);
-        let d = depth + 1;
-        let f = if let Some(&made) = self.made.get(&i) {
-            match made {
-                Made::MaxMin(max, a, b) => {
-                    let (fa, fb) = (self.facts_at(a, d), self.facts_at(b, d));
-                    fa.max_min(fb, max)
-                }
-                Made::Med3(a, b, c) => {
-                    let f = [
-                        self.facts_at(a, d),
-                        self.facts_at(b, d),
-                        self.facts_at(c, d),
-                    ];
-                    Facts::med3(f)
-                }
-                Made::Legacy(a, b) => {
-                    let (fa, fb) = (self.facts_at(a, d), self.facts_at(b, d));
-                    let r = fa.legacy(fb);
-                    if a == b { r.square() } else { r }
-                }
-            }
-        } else {
-            self.facts_of(i, d)
-        };
-        self.facts_seen.insert(i, f);
+        self.facts_seen.borrow_mut().insert(i, Facts::ANY);
+        let f = self.transfer(i, &mut |x| self.facts_at(x, depth + 1));
+        self.facts_seen.borrow_mut().insert(i, f);
         f
     }
 
-    fn facts_of(&mut self, i: u32, d: u32) -> Facts {
+    /// The facts of a value that is no instruction (a constant, or an instruction that
+    /// negates or takes the magnitude of one); `None` for any other instruction.
+    fn constant_facts(&self, v: V) -> Option<Facts> {
+        if let Some(b) = self.float_bits(v) {
+            return Some(Facts::constant(b));
+        }
+        (!matches!(v, V::Inst(_))).then_some(Facts::ANY)
+    }
+
+    /// What instruction `i` computes, from what `get` knows of its operands.
+    fn transfer(&self, i: u32, get: &mut dyn FnMut(V) -> Facts) -> Facts {
+        if let Some(&made) = self.made.get(&i) {
+            return match made {
+                Made::MaxMin(max, a, b) => get(a).max_min(get(b), max),
+                Made::Med3(a, b, c) => Facts::med3([get(a), get(b), get(c)]),
+                Made::Legacy(a, b) => {
+                    let r = get(a).legacy(get(b));
+                    if a == b { r.square() } else { r }
+                }
+            };
+        }
         let float = self.types[self.insts[i as usize].ty.0 as usize] == TypeDef::Float;
-        let op = self.insts[i as usize].op.clone();
-        match op {
+        match &self.insts[i as usize].op {
             // An i32 read as a float: the float it was, or a choice among such.
-            Op::Cast(Cast::Bitcast, x) if float => self.facts_at(x, d),
-            Op::Cast(Cast::Bitcast, x) if self.is_float_v(x) => self.facts_at(x, d),
-            Op::Cast(Cast::UiToFp | Cast::SiToFp, x) if float && !self.narrow(x) => Facts::ANY,
+            &Op::Cast(Cast::Bitcast, x) if float || self.is_float_v(x) => get(x),
+            &Op::Cast(Cast::UiToFp | Cast::SiToFp, x) if float && !self.narrow(x) => Facts::ANY,
             Op::Cast(Cast::UiToFp, _) if float => Facts {
                 lo: 0.0,
                 hi: 4_294_967_296.0,
@@ -485,27 +585,27 @@ impl Module {
                 nz: false,
                 least: 1.0,
             },
-            Op::Select(_, t, f) => {
-                let ft = self.facts_at(t, d);
-                ft.join(self.facts_at(f, d))
-            }
+            &Op::Select(_, t, f) => get(t).join(get(f)),
             Op::Phi(incoming) if !incoming.is_empty() => {
-                let mut r: Option<Facts> = None;
-                for (x, _) in incoming {
-                    let fx = self.facts_at(x, d);
-                    r = Some(r.map_or(fx, |r| r.join(fx)));
+                let mut r = BOTTOM;
+                for &(x, _) in incoming {
+                    r = r.join(get(x));
                 }
-                r.unwrap_or(Facts::ANY)
+                r
             }
-            Op::Bin(b, x, y) if float => {
-                let negation = b == Bin::Sub && self.float_bits(x) == Some(0x8000_0000);
-                let fy = self.facts_at(y, d);
-                if negation {
-                    return fy.neg();
+            &Op::Bin(b, x, y) if float => {
+                if b == Bin::Sub && self.float_bits(x) == Some(0x8000_0000) {
+                    return get(y).neg();
                 }
-                let fx = self.facts_at(x, d);
+                let (fx, fy) = (get(x), get(y));
                 match b {
                     Bin::Add => fx.add(fy, false),
+                    // `0 - y`: the RTX 5090's driver computes it as `-y`, which is -0 for a +0
+                    // y where IEEE's difference is +0 (`legacy_short_forms_are_the_consoles` on
+                    // the card): either.
+                    Bin::Sub if on_floats() && self.float_bits(x) == Some(0) => {
+                        fx.add(fy.neg(), false).join(fy.neg())
+                    }
                     Bin::Sub => fx.add(fy.neg(), false),
                     Bin::Mul if x == y => fx.mul(fy).square(),
                     Bin::Mul => fx.mul(fy),
@@ -515,27 +615,20 @@ impl Module {
                 }
             }
             Op::Call(f, args) if float => {
-                let name = self.funcs[f as usize].name.as_str();
+                let name = self.funcs[*f as usize].name.as_str();
                 let code = args.first().and_then(|&a| self.int_value(a));
                 match (name, code, &args[..]) {
-                    ("dx.op.unary.f32", Some(op), [_, x]) => {
-                        let fx = self.facts_at(*x, d);
-                        unary(op, fx)
-                    }
-                    ("dx.op.binary.f32", Some(op @ (35 | 36)), [_, x, y]) => {
-                        let (fx, fy) = (self.facts_at(*x, d), self.facts_at(*y, d));
+                    ("dx.op.unary.f32", Some(op), &[_, x]) => unary(op, get(x)),
+                    ("dx.op.binary.f32", Some(op @ (35 | 36)), &[_, x, y]) => {
+                        let (fx, fy) = (get(x), get(y));
                         // DXIL's FMax and FMin: either zero for two zeros.
                         let mut r = fx.max_min(fy, op == 35);
                         r.pz = (fx.pz || fy.pz) && r.lo < NORMAL && r.hi > -NORMAL;
                         r.nz = (fx.nz || fy.nz) && r.lo < NORMAL && r.hi > -NORMAL;
                         r
                     }
-                    ("dx.op.tertiary.f32", Some(46), [_, a, b, c]) => {
-                        let (fa, fb, fc) = (
-                            self.facts_at(*a, d),
-                            self.facts_at(*b, d),
-                            self.facts_at(*c, d),
-                        );
+                    ("dx.op.tertiary.f32", Some(46), &[_, a, b, c]) => {
+                        let (fa, fb, fc) = (get(a), get(b), get(c));
                         fa.mul(fb).add(fc, true)
                     }
                     _ => Facts::ANY,
@@ -543,6 +636,91 @@ impl Module {
             }
             _ => Facts::ANY,
         }
+    }
+
+    /// What is known of every instruction's value once every join is filled: facts that
+    /// hold for each instruction given its operands' (each holds at least what its rule gives
+    /// from its operands' facts, so by induction over a run every value lies within its
+    /// facts), reached from "no value" at every join, bounds that keep moving after [`WIDEN`]
+    /// rounds widened to infinity; `None` where that is not reached within [`ROUNDS`].
+    fn settled(&self) -> Option<Vec<Facts>> {
+        let mut order = Vec::new();
+        for b in &self.blocks {
+            order.extend(b.phis.iter().chain(&b.body).copied());
+        }
+        let mut cur = vec![BOTTOM; self.insts.len()];
+        for round in 0..ROUNDS {
+            let mut changed = false;
+            for &i in &order {
+                let f = {
+                    let table = &cur;
+                    let mut get = |x: V| match x {
+                        V::Inst(j) => table[j as usize],
+                        _ => self.constant_facts(x).unwrap_or(Facts::ANY),
+                    };
+                    self.transfer(i, &mut get).tidy()
+                };
+                let old = cur[i as usize];
+                let new = if round >= WIDEN { old.widen(f) } else { f };
+                if new != old {
+                    cur[i as usize] = new;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Some(cur);
+            }
+        }
+        None
+    }
+
+    /// Notes a legacy multiply left in its default form (`m` the product, `r` the select of
+    /// +0 or it), for [`Module::legacy_after_joins`].
+    pub fn legacy_site(&mut self, m: V, r: V, a: V, b: V) {
+        self.legacy_sites.push([m, r, a, b]);
+    }
+
+    /// Once every join is filled, the legacy multiplies noted by [`Module::legacy_site`]
+    /// whose operands' settled facts allow a shorter form (`choose`) take it in place: the
+    /// select becomes the form's last instruction and the product its first; the compares
+    /// are left to the clean-up. Returns how many changed.
+    pub(crate) fn legacy_after_joins(&mut self, choose: impl Fn(&Facts, &Facts) -> Option<Form>) -> u32 {
+        let sites = std::mem::take(&mut self.legacy_sites);
+        if sites.is_empty() {
+            return 0;
+        }
+        let Some(table) = self.settled() else {
+            return 0;
+        };
+        let facts = |m: &Module, v: V| match v {
+            V::Inst(j) => table[j as usize],
+            _ => m.constant_facts(v).unwrap_or(Facts::ANY),
+        };
+        let mut n = 0;
+        for [m, r, a, b] in sites {
+            let (V::Inst(mi), V::Inst(ri)) = (m, r) else {
+                continue;
+            };
+            let (fa, fb) = (facts(self, a), facts(self, b));
+            let Some(form) = choose(&fa, &fb) else {
+                continue;
+            };
+            let zero = self.f32(0);
+            let (mop, rop) = match form {
+                Form::Plain => (None, Op::Bin(Bin::Mul, a, b)),
+                Form::AddFirst { swap } => {
+                    let (x, k) = if swap { (b, a) } else { (a, b) };
+                    (Some(Op::Bin(Bin::Add, x, zero)), Op::Bin(Bin::Mul, m, k))
+                }
+                Form::AddAfter => (None, Op::Bin(Bin::Add, m, zero)),
+            };
+            if let Some(op) = mop {
+                self.insts[mi as usize].op = op;
+            }
+            self.insts[ri as usize].op = rop;
+            n += 1;
+        }
+        n
     }
 
     /// An integer of at most 32 bits.
@@ -703,6 +881,28 @@ mod tests {
             ..u
         });
         assert!(r.pz && !r.nz);
+    }
+
+    #[test]
+    fn rounded_bounds_stay_on_floats() {
+        // A product of numbers within [0, 1] stays within [0, 1] (so a product carried round
+        // a loop settles), a bound between floats goes to the next one out, a bound under
+        // the smallest normal may be a flushed zero, one past the largest an infinity.
+        use crate::emit::lower::legacy::TEST_LOOPS;
+        TEST_LOOPS.set(Some(true));
+        assert_eq!(Facts::outward(0.0, 1.0), (0.0, 1.0));
+        let (lo, hi) = Facts::outward(0.1, 0.1);
+        assert!(lo < 0.1 && hi > 0.1 && (hi - lo) < 1e-8);
+        assert_eq!(Facts::outward(1e-40, 1.0).0, 0.0);
+        assert_eq!(Facts::outward(0.0, 1e39).1, f64::INFINITY);
+        let unit = k(0.0).join(k(1.0));
+        let p = unit.mul(unit);
+        assert_eq!((p.lo, p.hi), (0.0, 1.0));
+        // Without VICTORY_LEGACY_LOOPS, widened as before it.
+        TEST_LOOPS.set(Some(false));
+        let p = unit.mul(unit);
+        assert!(p.hi > 1.0);
+        TEST_LOOPS.set(None);
     }
 
     #[test]

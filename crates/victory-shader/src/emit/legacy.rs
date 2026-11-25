@@ -35,8 +35,17 @@
 //! times a negative number goes through `0 - y` or a negation of it, which the same rewrite
 //! may reach, so none is used without a measurement on the card.
 //!
-//! Each switch is part of the translation (the shader cache keys on it); with both off each
-//! program is as before, bit for bit.
+//! A value carried round a loop is a join the lowering fills only once every block is
+//! lowered, so what is asked of it while lowering knows nothing. With `VICTORY_LEGACY_LOOPS`
+//! (on; `=0` turns it off) each multiply left in its default form is noted and looked at again
+//! once every join is filled, with facts settled over the loops to a fixed point
+//! (`Module::legacy_after_joins`): the forms above, under the same switches, in place of the
+//! select. With it the bounds of sums and products are the f32s at or beyond the exact
+//! bounds, not widened by a factor, so a product of values within [0, 1] stays within it.
+//!
+//! Each switch is part of the translation (the shader cache keys on it); with all three off
+//! each program is as before, bit for bit, and with `VICTORY_LEGACY_LOOPS=0` alone as before
+//! it.
 
 use super::{Bin, Lower, V};
 use crate::emit::bitcode::facts::{Facts, Made};
@@ -67,11 +76,24 @@ thread_local! {
     pub(crate) static TEST_PLAIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// A test's choice for [`zero_on`], for its thread only.
     pub(crate) static TEST_ZERO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`loops_on`], for its thread only.
+    pub(crate) static TEST_LOOPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The legacy multiplies the lowering left in their default form looked at again once every
+/// join is filled, with facts settled over loops (`VICTORY_LEGACY_LOOPS=0`: not).
+pub(crate) fn loops_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LOOPS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_LOOPS").is_none_or(|v| v != "0"))
 }
 
 /// Which shorter form a legacy multiply of operands with these facts takes, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Form {
+pub(crate) enum Form {
     /// `a * b`.
     Plain,
     /// `(a + 0) * b`, b positive (or with the operands swapped: `(b + 0) * a`).

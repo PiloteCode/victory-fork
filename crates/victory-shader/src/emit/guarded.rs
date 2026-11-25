@@ -57,12 +57,45 @@ fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_RAW").is_none_or(|v| v != "0"))
 }
 
+/// Whether the forms other than the paired one read guarded writes without their guard too
+/// (`VICTORY_WAVE_RAW_ALL=1`). Their guards are those of the lane masks a block narrows
+/// without a branch (`v_cmpx`, a saved EXEC), and the argument above holds for them as it
+/// does for the paired form's: it rests on the writer's and the reader's guards as functions
+/// of the same lane-mask atoms, and on what lanes outside a reader's guard do with what they
+/// compute, not on how the program's branches are taken.
+pub(super) fn all_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RAW_ALL.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_RAW_ALL").is_some_and(|v| v == "1"))
+}
+
+/// An image instruction whose level of detail comes from its quad's coordinates (a sample or
+/// gather without an explicit level, zero level or gradients; `image_get_lod`).
+fn implicit_level(name: &str) -> bool {
+    if name.starts_with("image_get_lod") {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("image_sample").or(name.strip_prefix("image_gather4")) else {
+        return false;
+    };
+    !rest.split('_').any(|t| matches!(t, "l" | "lz" | "d" | "cd" | "g16"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`all_on`], for its thread only.
+    pub(crate) static TEST_RAW_ALL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 impl Lower<'_> {
     /// The guard (and its value in the lane being lowered) under which instruction `i` of IR
     /// block `b` reads its sources, if they may be taken without their writers' guards: the
     /// paired form, a guarded instruction that reads only its own lane's registers.
     pub(super) fn raw_use_for(&mut self, b: usize, i: usize, inst: &Inst) -> Result<Option<(Bool, V)>, Why> {
-        if self.twin.is_none() || !on() {
+        if (self.twin.is_none() && !all_on()) || !on() {
             return Ok(None);
         }
         let Some(g) = self.x.st.guards[b][i] else {
@@ -77,7 +110,12 @@ impl Lower<'_> {
                     && !matches!(name, "v_swap_b32")
             }
             Fields::Ds { .. } => !name.starts_with("ds_swizzle") && !name.contains("permute"),
-            Fields::Image { .. } => !name.starts_with("image_bvh"),
+            // (outside the paired form, not a sample whose level comes from its quad's
+            // coordinates: lanes outside the guard keep their old coordinates on the console,
+            // and those are what its quad's differences take)
+            Fields::Image { .. } => {
+                !name.starts_with("image_bvh") && (self.twin.is_some() || !implicit_level(name))
+            }
             Fields::Buffer { .. } | Fields::Flat { .. } => true,
             _ => false,
         };
@@ -130,5 +168,18 @@ impl Lower<'_> {
             || r.guard == Bool::TRUE
             || !self.x.st.bools.meet_seen(&[(use_guard, true), (r.guard, false)], &mut self.raw_meets);
         implied.then_some(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn samples_whose_level_comes_from_the_quad() {
+        for n in ["image_sample", "image_sample_b", "image_sample_c_b_cl_o", "image_sample_cl", "image_get_lod", "image_gather4"] {
+            assert!(super::implicit_level(n), "{n}");
+        }
+        for n in ["image_sample_l", "image_sample_lz_o", "image_sample_c_d_cl", "image_sample_cd", "image_load", "image_gather4_lz"] {
+            assert!(!super::implicit_level(n), "{n}");
+        }
     }
 }

@@ -1403,6 +1403,46 @@ fn legacy_short_forms_are_the_consoles() {
         let x = med3(i[0], 0, 0x3F80_0000);
         vec![mul_legacy(mul_legacy(x, x), mad(x, 0xC000_0000, 0x4080_0000))]
     }));
+    // `0 - x` of x = v_med3_f32(v1, 0, 1) times 0.5: by IEEE never -0, so the product alone
+    // would do, but the card's driver makes `0 - x` the negation, -0 of +0: no short form
+    // (`VICTORY_LEGACY_LOOPS`'s facts follow the card).
+    let mut body = vop3(0x157, 6, [v(1), int(0), 242], NONE).to_vec();
+    body.push(vop2(0x04, 7, int(0), 6));
+    body.push(vop2(0x07, 5, 240, 7));
+    long.push(body.clone());
+    probes.push(probe(body, unary(F32_EDGES), F32, |i| {
+        let x = med3(i[0], 0, 0x3F80_0000);
+        vec![mul_legacy(0x3F00_0000, add(0, x ^ 0x8000_0000))]
+    }));
+    // A product carried round a loop (four passes): p = 1; p = p * x with x = min(max(v1,
+    // 0), 1). Its join is filled after the lowering: only the facts settled over the loop
+    // know p stays within [+0, 1] (`VICTORY_LEGACY_LOOPS`).
+    let mut body = vec![vop2(0x10, 7, int(0), 1), vop2(0x0F, 7, 242, 7), vop1(0x01, 6, 242)];
+    body.push(sop1(0x03, 20, int(4)));
+    body.push(vop2(0x07, 6, v(6), 7));
+    body.push(sop2(0x01, 20, s(20), int(1)));
+    body.push(sopc(0x07, s(20), int(0)));
+    body.push(0xBF85_FFFC); // s_cbranch_scc1 (back to the multiply)
+    body.push(vop1(0x01, 5, v(6)));
+    let looped = body.clone();
+    probes.push(probe(body, unary(F32_EDGES), F32, |i| {
+        let x = min_max(false, min_max(true, 0, i[0]), 0x3F80_0000);
+        let mut p = 0x3F80_0000;
+        for _ in 0..4 {
+            p = mul_legacy(p, x);
+        }
+        vec![p]
+    }));
+    {
+        use super::lower::legacy::TEST_LOOPS;
+        set(true, false);
+        TEST_LOOPS.set(Some(false));
+        let without = lower_program(&program(&looped, false)).expect("lowered").dxil;
+        TEST_LOOPS.set(Some(true));
+        let with = lower_program(&program(&looped, false)).expect("lowered").dxil;
+        TEST_LOOPS.set(None);
+        assert_ne!(without, with, "the product carried round the loop is shortened once the join is filled");
+    }
     // Each probe's program changes with the switches where a short form applies, and gives
     // the console's results with them and without.
     let before = TEST_SHORT.get();
@@ -1444,6 +1484,47 @@ fn legacy_short_forms_are_the_consoles() {
         eprintln!("VICTORY_LEGACY_ZERO (off by default) differs from the console on the card only:\n{f}");
     }
     assert_clean(other.into_iter().map(|(f, _)| f).collect());
+}
+
+/// Guarded writes read without their guard in a program of the plain form
+/// (`VICTORY_WAVE_RAW_ALL=1`): under `v_cmpx_lt_f32 0, v1` a chain of writes and reads of
+/// v5..v7, EXEC restored after; lanes outside the guard keep their old values, lanes inside
+/// get the console's results, with the switch (checked to change the program) and without.
+#[test]
+fn guarded_writes_read_raw_in_the_plain_form() {
+    use super::lower::guarded::TEST_RAW_ALL;
+    let body = vec![
+        vopc(0x11, int(0), 1),         // v_cmpx_lt_f32 0, v1
+        vop2(0x03, 6, v(1), 2),        // v_add_f32 v6, v1, v2
+        vop2(0x08, 5, v(6), 6),        // v_mul_f32 v5, v6, v6
+        vop2(0x04, 6, v(6), 2),        // v_sub_f32 v6, v6, v2
+        vop2(0x03, 7, v(6), 5),        // v_add_f32 v7, v6, v5
+        sop1(0x03, EXEC_LO as u8, 193), // s_mov_b32 exec_lo, -1
+    ];
+    let xs: Vec<u32> = F32_EDGES.iter().copied().filter(|&x| !denormal(x)).collect();
+    let inputs = pairs(&xs, &xs);
+    let model = |i: [u32; 4]| {
+        if nan(i[0]) || fl(ftz(i[0])) <= 0.0 {
+            return vec![i[3], i[3], i[3]];
+        }
+        let s = add(i[0], i[1]);
+        let v5 = mul(s, s);
+        let v6 = add(s, i[1] ^ 0x8000_0000);
+        vec![v5, v6, add(v6, v5)]
+    };
+    let lowered = |on: bool| {
+        TEST_RAW_ALL.set(Some(on));
+        let d = lower_program(&program(&body, false)).expect("lowered").dxil;
+        TEST_RAW_ALL.set(None);
+        d
+    };
+    assert_ne!(lowered(true), lowered(false), "reads without the guard");
+    for on in [true, false] {
+        TEST_RAW_ALL.set(Some(on));
+        let failures = check(&[probe(body.clone(), inputs.clone(), F32, model)]);
+        TEST_RAW_ALL.set(None);
+        assert_clean(failures);
+    }
 }
 
 /// Minimum, maximum, median, and `v_max_f32 x, x clamp` (the title's

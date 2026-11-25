@@ -51,7 +51,7 @@ mod float64;
 /// The paired form's guarded writes read without their guard where only lanes inside it read
 /// them, a child module so it shares the emitter's state.
 #[path = "guarded.rs"]
-mod guarded;
+pub(super) mod guarded;
 /// A geometry program's LDS rings as its inputs and outputs, a child module so it shares the
 /// emitter's state.
 #[path = "rings.rs"]
@@ -1123,7 +1123,16 @@ pub(super) fn base_direct_on() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "1" || v == "2"))
+}
+
+/// `VICTORY_WAVE_BASE_DIRECT=2`: as `=1`, for host groups of two and three dimensions too,
+/// numbered by their flattened thread index (x fastest, then y, then z), which NVIDIA and AMD
+/// cut into waves as they cut a one-dimension group's (the same promise D3D12 does not
+/// make). Off by default; a measurement of what the entry meeting costs groups of few threads.
+fn base_direct_any_shape() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "2"))
 }
 
 #[cfg(test)]
@@ -2703,6 +2712,11 @@ impl<'a> Lower<'a> {
             }
             self.fill_phis()?;
         }
+        // The legacy multiplies left in their default form, again with what every join brings.
+        let (plain, zero) = (legacy::plain_on(), legacy::zero_on());
+        let _shortened = self.s.m.legacy_after_joins(|fa, fb| legacy::choose(fa, fb, plain, zero));
+        #[cfg(test)]
+        legacy::TEST_SHORT.set(legacy::TEST_SHORT.get() + _shortened);
         // A linked stage's signatures without what it leaves out; an input left out must not
         // have been read.
         if !self.drop_in.is_empty() || !self.drop_out.is_empty() {
@@ -4233,17 +4247,29 @@ impl<'a> Lower<'a> {
             };
             if let Some(x) = tested {
                 let z = self.s.m.cmp(c, pred::OEQ, x, zero);
-                return self.s.m.select(c, z, zero, m);
+                let r = self.s.m.select(c, z, zero, m);
+                return self.legacy_site(m, r, a, b);
             }
             let az = self.s.m.cmp(c, pred::OEQ, ra, zero);
             let bz = self.s.m.cmp(c, pred::OEQ, rb, zero);
             let z = self.s.m.bin(c, Bin::Or, az, bz);
-            return self.s.m.select(c, z, zero, m);
+            let r = self.s.m.select(c, z, zero, m);
+            return self.legacy_site(m, r, a, b);
         }
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
-        self.s.m.select(c, z, zero, m)
+        let r = self.s.m.select(c, z, zero, m);
+        self.legacy_site(m, r, a, b)
+    }
+
+    /// `r`, a legacy multiply of `a` and `b` in its default form (`m` its product), noted for
+    /// a second look once every join is filled (`legacy::loops_on`).
+    fn legacy_site(&mut self, m: V, r: V, a: V, b: V) -> V {
+        if legacy::loops_on() && (legacy::plain_on() || legacy::zero_on()) {
+            self.s.m.legacy_site(m, r, a, b);
+        }
+        r
     }
 
     // ---- lane booleans ----
@@ -4355,7 +4381,7 @@ impl<'a> Lower<'a> {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        if base_direct_on() && matches!(self.s.threads, Some([_, 1, 1])) {
+        if base_direct_on() && (matches!(self.s.threads, Some([_, 1, 1])) || base_direct_any_shape()) {
             // A host group of one dimension (the paired form's always): NVIDIA and AMD give
             // each wave a run of 32 thread indices in a row, the first a multiple of 32, as
             // the lowering already takes it for a console wave run as one host wave. The
