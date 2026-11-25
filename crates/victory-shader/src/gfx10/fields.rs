@@ -235,19 +235,32 @@ impl Instruction {
             }
             Encoding::Sopp => Fields::Sopp { imm: w0 as u16 },
             Encoding::Smem => {
-                let data = match name {
-                    "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
-                    n if n.starts_with("s_dcache_discard") => None,
-                    "s_memtime" | "s_memrealtime" => Some(2),
-                    _ => Some(data_dwords(name)),
+                let sdata = (w0 >> 6 & 0x7F) as u8;
+                // s_atc_probe*: SDATA is a 7-bit immediate, not an SGPR. The
+                // buffer form's resource is 4 dwords. GLC and DLC are not operands.
+                let probe = matches!(name, "s_atc_probe" | "s_atc_probe_buffer");
+                let data = if probe {
+                    Some(Operand::Literal(u32::from(sdata)))
+                } else {
+                    match name {
+                        "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
+                        n if n.starts_with("s_dcache_discard") => None,
+                        "s_memtime" | "s_memrealtime" => Some(scalar(sdata, 2)),
+                        _ => Some(scalar(sdata, data_dwords(name))),
+                    }
                 };
-                let base = 2 + 2 * u8::from(name.starts_with("s_buffer_"));
+                let base =
+                    2 + 2 * u8::from(name.starts_with("s_buffer_") || name == "s_atc_probe_buffer");
                 Fields::Smem {
-                    data: data.map(|d| scalar((w0 >> 6 & 0x7F) as u8, d)),
+                    data,
                     base: scalar(((w0 & 0x3F) << 1) as u8, base),
                     offset: (w1 << 11) as i32 >> 11,
                     soffset: scalar((w1 >> 25) as u8, 1),
-                    cache: cache(bit(w0, 16), false, bit(w0, 14)),
+                    cache: if probe {
+                        Cache::default()
+                    } else {
+                        cache(bit(w0, 16), false, bit(w0, 14))
+                    },
                 }
             }
             Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc | Encoding::Vop3 | Encoding::Vop3p => {
@@ -405,6 +418,8 @@ impl Instruction {
                     saddr: (self.encoding != Encoding::Flat)
                         .then(|| scalar(saddr, 1 + u8::from(self.encoding == Encoding::Global))),
                     offset: match self.encoding {
+                        // GFX10 FLAT offsets are 11-bit and unsigned: the
+                        // hardware ignores bit 11.
                         Encoding::Flat => (w0 & 0x7FF) as i16,
                         _ => ((w0 << 4) as i16) >> 4,
                     },
@@ -727,7 +742,6 @@ fn salu_dwords(name: &str) -> (u8, u8, u8) {
 
 /// (vdst, [src0, src1, src2]) dwords of a VALU opcode.
 fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
-    let parts: Vec<&str> = name.split('_').collect();
     match name {
         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => (2, [1, 2, 2]),
         "v_ldexp_f64" | "v_trig_preop_f64" | "v_cmp_class_f64" | "v_cmpx_class_f64" => {
@@ -737,12 +751,24 @@ fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
         "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" => (2, [2, 1, 2]),
         "v_mqsad_u32_u8" => (4, [2, 1, 4]),
         "v_frexp_exp_i32_f64" => (1, [2; 3]),
-        _ if parts.len() == 4 && parts[1] == "cvt" => {
-            (type_dwords(parts[2]), [type_dwords(parts[3]); 3])
-        }
         _ => {
-            let n = type_dwords(parts.last().copied().unwrap_or(""));
-            (n, [n; 3])
+            let mut parts = name.split('_');
+            // `v_cvt_<dst type>_<src type>`, and nothing past it.
+            match (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) {
+                (Some(_), Some("cvt"), Some(dst), Some(src), None) => {
+                    (type_dwords(dst), [type_dwords(src); 3])
+                }
+                _ => {
+                    let n = type_dwords(name.rsplit('_').next().unwrap_or(""));
+                    (n, [n; 3])
+                }
+            }
         }
     }
 }

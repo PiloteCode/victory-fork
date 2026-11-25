@@ -11,7 +11,7 @@ mod translate;
 mod translate_diff;
 
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -59,15 +59,21 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout.
+    /// archives, if uncompressed) and report their layout. Shader packs
+    /// among the paths are listed last, their stages named from the
+    /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
+        /// Print one line per container found (and per pack pipeline).
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Instead list the effects of shader databases: technique, pass,
+        /// shaders (name, container hash, engine hash) and pass state.
+        #[arg(long)]
+        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -98,6 +104,11 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to warm for a different host.
         #[arg(long)]
         warm: Option<PathBuf>,
+        /// Upstream's warm-up: every container found, the same as `--warm
+        /// all` (upstream's pipeline pre-build, `--cache --pipelines`, is
+        /// not in this fork).
+        #[arg(long, conflicts_with_all = ["validate", "list", "hashes", "pipelines", "warm"])]
+        cache: bool,
     },
     /// Compare two `translate --list` outputs (two builds over the same
     /// shaders): the programs one validates and the other does not, with
@@ -170,7 +181,8 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+            effects,
+        } => shader::run(paths, verbose || disasm, disasm, effects),
         Command::Translate {
             paths,
             validate,
@@ -179,10 +191,11 @@ fn main() -> Result<()> {
             hashes,
             jobs,
             warm,
+            cache,
         } => {
             let view_limit = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok());
             let host_wave = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok());
-            if warm.is_some() && (view_limit.is_none() || host_wave.is_none()) {
+            if (warm.is_some() || cache) && (view_limit.is_none() || host_wave.is_none()) {
                 victory_hle::modules::d3d12x::prepare_shader_warm().map_err(anyhow::Error::msg)?;
             }
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
@@ -196,6 +209,9 @@ fn main() -> Result<()> {
             let jobs = jobs.map(NonZeroUsize::get);
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
+            }
+            if cache {
+                return translate::warm(paths, Path::new("all"), jobs);
             }
             translate::run(paths, validate, pipelines, list, hashes, jobs)
         }
@@ -235,6 +251,7 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

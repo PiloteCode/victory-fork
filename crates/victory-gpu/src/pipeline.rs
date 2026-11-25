@@ -931,6 +931,11 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        // A subobject that runs past the stream's end is not read
+        // (upstream 9c58a1c3).
+        if at + size > desc.size {
+            break;
+        }
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };

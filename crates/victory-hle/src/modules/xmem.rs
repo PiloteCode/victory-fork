@@ -1749,6 +1749,37 @@ pub mod low_guards {
             mb = total >> 20,
             "space below 4 GiB kept for the title"
         );
+        drop(guards);
+        // The GPU side's probe of the card's memory mapped for the
+        // processor asks through this whether such a mapping can land here.
+        #[cfg(windows)]
+        victory_gpu::set_low_room(probe_room);
+    }
+
+    /// For the GPU side's probe (`victory_gpu::set_low_room`): the
+    /// smallest guard of `bytes` or more is released, `place` is called
+    /// once (it maps something, notes the address, undoes the mapping and
+    /// returns that address, 0 for none), and the free space of the
+    /// released guard is guarded again. 0 if no guard is that large or
+    /// the guard could not be released. Held under the guards' lock: a
+    /// 32-bit request of the title meanwhile waits for it.
+    pub fn probe_room(bytes: usize, place: &mut dyn FnMut() -> usize) -> usize {
+        let mut guards = guards();
+        let Some(&(base, size)) = guards.iter().filter(|g| g.1 >= bytes).min_by_key(|g| g.1) else {
+            return 0;
+        };
+        // SAFETY: our own reservation, with no allocations inside it.
+        if unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } == 0 {
+            return 0;
+        }
+        guards.retain(|&(b, _)| b != base);
+        let at = place();
+        for (start, len) in free_runs(base, base + size) {
+            if guard(start, len) {
+                guards.push((start, len));
+            }
+        }
+        at
     }
 
     /// Try the smallest fitting guards first, then try smaller guards in
@@ -1820,6 +1851,51 @@ pub mod low_guards {
             guards().retain(|&(base, _)| base != first);
             // SAFETY: the guard the retry put back, ours.
             assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
+        }
+
+        /// The probe's room: the smallest guard that fits is released for
+        /// one call and comes back whole after it (the call undid what it
+        /// mapped); none that fits, no call.
+        #[test]
+        fn a_probe_gets_the_room_once_and_the_guard_comes_back() {
+            let _one = TEST.lock().unwrap();
+            // SAFETY: a fresh reservation, released at once.
+            let hole =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            assert_ne!(hole, 0);
+            // SAFETY: ours.
+            unsafe { VirtualFree(hole as *mut _, 0, MEM_RELEASE) };
+            assert!(guard(hole, 4 * GRANULE));
+            guards().push((hole, 4 * GRANULE));
+            let mut calls = 0;
+            assert_eq!(
+                probe_room(5 * GRANULE, &mut || {
+                    calls += 1;
+                    1
+                }),
+                0
+            );
+            assert_eq!(calls, 0, "no guard that large: not called");
+            let got = probe_room(3 * GRANULE, &mut || {
+                calls += 1;
+                // The room is free now: something maps there, then goes.
+                // SAFETY: a reservation at a known free address, released.
+                unsafe {
+                    let at = VirtualAlloc(hole as *const _, 3 * GRANULE, MEM_RESERVE, PAGE_NOACCESS)
+                        as usize;
+                    if at != 0 {
+                        VirtualFree(at as *mut _, 0, MEM_RELEASE);
+                    }
+                    at
+                }
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(got, hole);
+            assert!(guards().contains(&(hole, 4 * GRANULE)), "the guard is back whole");
+            guards().retain(|&(b, _)| b != hole);
+            // SAFETY: the guard put back, ours.
+            assert_ne!(unsafe { VirtualFree(hole as *mut _, 0, MEM_RELEASE) }, 0);
         }
 
         /// A released guard is guarded again around what took part of it.

@@ -306,6 +306,7 @@ pub fn run(
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     let dump = FailDump::from_env();
+    let started = std::time::Instant::now();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -320,31 +321,42 @@ pub fn run(
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut t = Tally {
-                            list,
-                            hashes,
-                            ..Tally::default()
-                        };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            names: pairs.iter().flat_map(|(v, p)| [v.clone(), p.clone()]).collect(),
-                            current: None,
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                        };
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let dump = dump.as_ref();
-                            translate(job, entry.path(), &seen, dump, &mut t, &mut checks);
-                        }
-                        lock(&total).merge(t);
-                    });
-                }
+                let workers: Vec<_> = (0..threads.min(jobs.len()))
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut t = Tally {
+                                list,
+                                hashes,
+                                ..Tally::default()
+                            };
+                            let mut checks = Checks {
+                                keep: (!pairs.is_empty()).then(|| kept.clone()),
+                                names: pairs.iter().flat_map(|(v, p)| [v.clone(), p.clone()]).collect(),
+                                current: None,
+                                validator: validate
+                                    .then(|| Validator::load(dll.as_deref()).ok())
+                                    .flatten(),
+                                host: pipelines
+                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                    .flatten(),
+                            };
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                let dump = dump.as_ref();
+                                translate(job, entry.path(), &seen, dump, &mut t, &mut checks);
+                            }
+                            lock(&total).merge(t);
+                        })
+                    })
+                    .collect();
+                report(
+                    entry.path(),
+                    jobs.len(),
+                    "containers",
+                    &next,
+                    started,
+                    &workers,
+                    String::new,
+                );
             });
         }
     }
@@ -455,6 +467,52 @@ pub fn run(
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
     Ok(())
+}
+
+/// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
+/// hands them out) until they finish: on a terminal one line rewritten
+/// every second, else a line every 10 s; then the file's last line.
+pub(crate) fn report<T>(
+    file: &Path,
+    jobs: usize,
+    what: &str,
+    next: &AtomicUsize,
+    started: std::time::Instant,
+    workers: &[std::thread::ScopedJoinHandle<'_, T>],
+    extra: impl Fn() -> String,
+) {
+    use std::io::IsTerminal;
+    if workers.is_empty() {
+        return;
+    }
+    let terminal = std::io::stderr().is_terminal();
+    let every = std::time::Duration::from_secs(if terminal { 1 } else { 10 });
+    let line = || {
+        // `next` counts jobs handed out; a worker still running holds one.
+        let busy = workers.iter().filter(|w| !w.is_finished()).count();
+        let taken = next.load(Ordering::Relaxed).min(jobs);
+        let done = taken.saturating_sub(busy);
+        format!(
+            "{}: {done} of {jobs} {what} ({}%), {:.0} s{}",
+            file.display(),
+            done * 100 / jobs.max(1),
+            started.elapsed().as_secs_f64(),
+            extra()
+        )
+    };
+    let mut shown = std::time::Instant::now();
+    while !workers.iter().all(|w| w.is_finished()) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if shown.elapsed() >= every {
+            shown = std::time::Instant::now();
+            if terminal {
+                eprint!("\r{}", line());
+            } else {
+                eprintln!("{}", line());
+            }
+        }
+    }
+    eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
 }
 
 fn translate(

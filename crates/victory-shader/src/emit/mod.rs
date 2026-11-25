@@ -98,6 +98,8 @@ mod descriptor_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod early_depth_tests;
+#[cfg(all(test, windows))]
 mod geometry_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -114,6 +116,8 @@ mod own_bits;
 mod quad_tests;
 mod rect;
 mod sampler;
+#[cfg(all(test, windows))]
+mod semantics_tests;
 mod shader;
 mod split;
 mod threading;

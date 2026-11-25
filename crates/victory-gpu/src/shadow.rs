@@ -2565,7 +2565,7 @@ impl Shadow {
                 };
                 let at = at + first;
                 crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
-                crate::watch::writing(start + at, n);
+                let _writing = crate::watch::writing(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
@@ -2665,7 +2665,7 @@ impl Shadow {
         if self.put_back_own(start + at, &title[..]) {
             return n;
         }
-        crate::watch::writing(start + at, n);
+        let _writing = crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
@@ -3374,7 +3374,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::host::shaders_write(start + at, &title[..]);
-                crate::watch::writing(start + at, n);
+                let _writing = crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
@@ -3457,7 +3457,7 @@ impl Shadow {
         if self.put_back_own(start + at, &title[..]) {
             return n;
         }
-        crate::watch::writing(start + at, n);
+        let _writing = crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n

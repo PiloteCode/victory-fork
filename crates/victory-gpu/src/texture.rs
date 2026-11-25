@@ -120,6 +120,16 @@ fn add_to_address_index(staging: &Arc<Staging>) {
     entries.push(Arc::downgrade(staging));
 }
 
+/// The staged textures whose memory starts in `[start, end)`, and their
+/// bytes of title memory (`crate::uheap`'s tally).
+pub(crate) fn staged_between(start: usize, end: usize) -> (usize, u64) {
+    let index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    index
+        .range(start..end)
+        .flat_map(|(_, entries)| entries.iter().filter_map(Weak::upgrade))
+        .fold((0, 0), |(n, bytes), staging| (n + 1, bytes + staging.memory().1 as u64))
+}
+
 /// Removes entries of [`STAGED_BY_ADDRESS`] whose staging state was let go.
 fn prune_address_index() {
     let mut index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1137,6 +1147,9 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
+        if read > 0 {
+            crate::uheap::layer_read(self.memory as usize, read, crate::uheap::Read::Texture);
+        }
         let us = whole.elapsed().as_micros() as u64;
         REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         crate::framelog::add(crate::framelog::T::RefreshUs, us);
@@ -1672,7 +1685,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         }
         None => {
             SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            host.upload_buffer(class)?
+            // Written by the processor only (detiled texels): in the card's
+            // memory with `VICTORY_GPU_UPLOAD_HEAP=1` (`crate::uheap`).
+            host.written_buffer(class)?
         }
     };
     crate::host::name(&buffer, || {

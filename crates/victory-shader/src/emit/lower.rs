@@ -109,6 +109,11 @@ mod interp;
 #[path = "export.rs"]
 mod export;
 
+/// Changes taken from the official repository (Marvisak/VIctory), a child module so they share
+/// the emitter's state.
+#[path = "official.rs"]
+mod official;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -152,7 +157,14 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether depth and stencil are tested before it runs.
+    #[cfg(test)]
+    pub early_depth: bool,
 }
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
+/// Linux's `gc_10_3_0_sh_mask.h`).
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -303,6 +315,7 @@ struct Lower<'a> {
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
+    mode16: official::Mode16,
     /// DXIL block each IR block ends in (guarded stores split blocks).
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
@@ -1277,6 +1290,18 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        // The console tests depth and stencil before the program runs
+        // (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12, as the compiler
+        // sets it for `[earlydepthstencil]`): so must the host. Without the
+        // flag a host runs a program that writes unordered views for hidden
+        // pixels too, tests depth after it, and keeps those writes.
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = &x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
         // do not run, and all of them in a program with a loop closed by a
@@ -1409,6 +1434,7 @@ impl<'a> Lower<'a> {
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
+            mode16: official::Mode16::new(p),
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
@@ -2293,6 +2319,7 @@ impl<'a> Lower<'a> {
                 self.lds_meeting();
             }
             self.lds_last = None;
+            self.mode16.enter(b);
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 if self.twin.is_some() {
@@ -2300,6 +2327,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.inst(b, i)?;
                 }
+                self.mode16.after(&p.blocks[b].insts[i]);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         if self.twin.is_some() {
@@ -2377,6 +2405,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4307,13 +4337,8 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let mut f = f;
-        match v.omod {
-            0 => {}
-            k => {
-                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
-                let c = self.s.m.f32(factor.to_bits());
-                f = self.s.m.bin(self.cur, Bin::Mul, f, c);
-            }
+        if v.omod != 0 {
+            f = self.omod(f, v.omod);
         }
         if v.clamp {
             f = self.unary(7, f);

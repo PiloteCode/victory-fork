@@ -137,8 +137,10 @@ const SHADER_VISIBLE: u32 = 1;
 /// made or dropped. It was a mutex, and [`sync_heaps`] holds it for its
 /// whole pass (15 ms a frame on the submitting thread): the profile of run
 /// 225 has the title's six recording threads waiting 48.5 ms a frame in
-/// [`shader_slot`] for it, each lookup itself a few nanoseconds. Readers no
-/// longer wait for each other. Nothing a holder calls takes it again.
+/// `shader_slot` for it, each lookup itself a few nanoseconds. Readers no
+/// longer wait for each other. Nothing a holder calls takes it again. A
+/// reader holds it while it uses the heap it found (upstream #52: [`mirror`],
+/// [`with_shader_slot`]), so `Heap::drop`, a writer, cannot free it meanwhile.
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
@@ -146,23 +148,39 @@ static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLo
 #[cfg(windows)]
 static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The shader-visible heap holding `handle`, and the descriptor's index.
+/// Runs `f` with the shader-visible heap holding `handle` and the
+/// descriptor's index, with `SHADER_HEAPS` locked throughout so that
+/// `Heap::drop` cannot free the heap meanwhile (as [`mirror`] does,
+/// upstream #52).
 #[cfg(windows)]
-fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
+fn with_shader_slot<R>(handle: u64, f: impl FnOnce(&Heap, u32) -> R) -> Option<R> {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
-    // SAFETY: registered heaps are live (removed when dropped).
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
     let heap = unsafe { &*(at as *const Heap) };
-    Some((heap, heap.index(handle)?))
+    let index = heap.index(handle)?;
+    Some(f(heap, index))
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap.
+/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
+/// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
-    let Some((heap, index)) = shader_slot(handle) else {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&(_, _, at)) = heaps
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&handle))
+    else {
+        return;
+    };
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
+    let heap = unsafe { &*(at as *const Heap) };
+    let Some(index) = heap.index(handle) else {
         return;
     };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -980,16 +998,15 @@ pub(crate) fn make_waiting() {
             // texture without a host copy must go on waiting).
             // (Looked up first: the handle is read only while its heap is
             // there.)
-            let Some((heap, index)) = shader_slot(handle) else {
-                continue;
-            };
-            let same = match view(handle) {
-                Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
-                _ => false,
-            };
-            if same && let Some(Some(host)) = heap.host.get() {
-                host.mirror(index, handle, true);
-            }
+            with_shader_slot(handle, |heap, index| {
+                let same = match view(handle) {
+                    Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
+                    _ => false,
+                };
+                if same && let Some(Some(host)) = heap.host.get() {
+                    host.mirror(index, handle, true);
+                }
+            });
         }
     }
 }
@@ -1138,7 +1155,9 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
-    let step = u64::from(increment(kind).unwrap_or(0));
+    let Some(step) = increment(kind).map(u64::from) else {
+        return;
+    };
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
@@ -1245,6 +1264,9 @@ pub(crate) extern "system" fn create_heap(
     let placed = placement.address != 0 && placement.size == size;
     tracing::debug!(?desc, placed, "descriptor heap");
     let (start, memory) = if placed {
+        if placement.address.checked_add(size).is_none() {
+            return E_INVALIDARG;
+        }
         (placement.address, None)
     } else {
         match Memory::zeroed(size, 64) {

@@ -692,6 +692,14 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Others recorded into the host list (`crate::external`, upstream
+    /// 0b35b7fe): its heaps, root signatures and pipeline are set again
+    /// before the next draw or dispatch.
+    pub(crate) fn host_state_lost(&mut self) {
+        // No title heaps (0) differ from what the host list has, too.
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {

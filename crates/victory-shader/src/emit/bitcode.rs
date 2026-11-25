@@ -734,13 +734,19 @@ impl Module {
             }
         }
         let mut fold = vec![None; self.blocks.len()];
+        let dead_phis = dead_phi_latches();
         for &b in &post {
             let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
+            // A latch whose phis are all unread (none is written) is as empty (official
+            // VIctory #1471, be3202de).
+            let empty = if dead_phis {
+                blk.phis.iter().all(|&i| !live[i as usize])
+            } else {
+                blk.phis.is_empty()
+            };
+            if let (Some(Term::Br(h)), true, [p]) =
+                (blk.term, empty && blk.body.is_empty(), &preds[b][..])
+                && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
             {
                 fold[b] = Some((*p, h));
@@ -906,6 +912,14 @@ impl Module {
         w.exit();
         w.finish()
     }
+}
+
+/// Whether an empty loop latch holding only unread phis is folded as an empty one is
+/// (official VIctory #1471, be3202de): `VICTORY_DEAD_PHI_LATCHES=0` turns that off. Part of
+/// the translation, so the shader cache keys on it (`build.rs` lists the switch).
+fn dead_phi_latches() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DEAD_PHI_LATCHES").map_or(true, |v| v.trim() != "0"))
 }
 
 const MODULE_BLOCK: u64 = 8;
@@ -1205,6 +1219,47 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    /// Official VIctory #1471 (be3202de): two loops alike but for an unread phi in the empty
+    /// latch of one; both fold the latch and write the same bitcode.
+    #[test]
+    fn empty_latch_with_dead_phis_is_folded() {
+        let build = |with_dead_phi: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
+            m.terminate(exit, Term::Ret);
+            m.write()
+        };
+        if dead_phi_latches() {
+            assert_eq!(build(false), build(true));
+        }
     }
 
     #[test]
