@@ -84,6 +84,8 @@ mod texture;
 #[cfg(windows)]
 mod uheap;
 #[cfg(windows)]
+mod waits;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

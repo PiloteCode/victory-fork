@@ -386,6 +386,27 @@ fn submission_us(i: usize, us: u64) {
 fn preparing(i: usize, n: u64) {
     PREPARING[i].fetch_add(n, Ordering::Relaxed);
     crate::framelog::add([crate::framelog::T::CopyUs, crate::framelog::T::CopyBytes][i], n);
+    #[cfg(feature = "diagnostics")]
+    if i == 1 {
+        COPIED_UP.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Bytes of title memory copied for submissions since the start, never
+/// reset (diagnostics): a flight's share is what its preparing added, the
+/// bytes its lists bring over the bus (`crate::waits`: a count that does
+/// not depend on the bus's speed, as the waits' times do).
+#[cfg(feature = "diagnostics")]
+static COPIED_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`COPIED_UP`] now (0 without diagnostics).
+fn copied_up() -> u64 {
+    #[cfg(feature = "diagnostics")]
+    {
+        COPIED_UP.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    0
 }
 
 /// Adds to [`COPY_BACK`] and to the frame log's totals.
@@ -1048,6 +1069,13 @@ pub(crate) struct HostList {
     /// The pair of timestamps its run is timed with since its last reset
     /// (`crate::cardmeter`), or none.
     meter: AtomicU32,
+    /// Draws recorded into it since its last reset ([`HostList::drew`]):
+    /// what `VICTORY_SUBMIT_EVERY` cuts submissions by (`crate::waits`).
+    draws: AtomicU32,
+    /// Of them, those not sent to the card yet (diagnostics: the draws
+    /// recorded and not sent when a wait for flights begins).
+    #[cfg(feature = "diagnostics")]
+    unsent: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     /// Shared with [`NOTED`], where the report of a removal finds them.
@@ -1057,6 +1085,16 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// A list let go of with draws never sent (taken by a submission that did
+/// not run it, or released by the title unsent): they are no longer on
+/// their way (diagnostics, `crate::waits`).
+#[cfg(feature = "diagnostics")]
+impl Drop for HostList {
+    fn drop(&mut self) {
+        crate::waits::sent(self.unsent.swap(0, Ordering::Relaxed));
+    }
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1975,9 +2013,21 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// The merge's "fetched after" is the flight's own send number
 /// (`CardPlan::sent_as`): see [`Host::relay_card_back`] for why that is
 /// exact and when a landing falls back to the old fetch.
+///
+/// `VICTORY_READBACK_DIRECT=1` (stage 1 of the coherence plan's name for
+/// it: small critical read-backs on the direct queue, right behind their
+/// producer) turns it on too. The fetch on the relay's copy queue waits for
+/// the flight's fence across queues, and the relay thread waited 37 ms a
+/// frame for those fetches in wave 7's gameplay; NVIDIA advises against a
+/// copy queue for work waited for at once.
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        relay()
+            && ["VICTORY_CARD_FETCH_INFLIGHT", "VICTORY_READBACK_DIRECT"]
+                .iter()
+                .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
+    })
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to
@@ -2756,6 +2806,8 @@ type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 struct Sent {
     /// Its number among the submissions started.
     number: u64,
+    /// The bytes of title memory its preparing copied ([`copied_up`]).
+    up: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
     /// Its bottom-of-pipe writes.
@@ -2771,10 +2823,65 @@ struct Flight {
     fence: u64,
     /// When it joined the line ([`now_us`]).
     sent_us: u64,
+    /// The draws its host lists recorded, and the bytes of title memory
+    /// its preparing copied (`crate::waits`).
+    draws: u64,
+    up: u64,
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+}
+
+/// Flights the thread that lands them has taken out of [`LINE`] and not
+/// landed yet ([`relay`]): the card has run them.
+static IN_HAND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// What a wait for flights finds in the air (`crate::waits::Air`); with
+/// `producer`, which says whether a flight's declared ranges (in order,
+/// joined) hold what the wait is for, also what is behind the last flight
+/// that may write it.
+fn air(line: &Line, producer: Option<&dyn Fn(&[(usize, usize)]) -> bool>) -> crate::waits::Air {
+    // SAFETY: a plain query.
+    let completed = host().map_or(0, |h| unsafe { h.fence.GetCompletedValue() });
+    let in_hand = IN_HAND.load(Ordering::Relaxed);
+    let mut air = crate::waits::Air {
+        flights: in_hand,
+        done: in_hand,
+        ..Default::default()
+    };
+    let flights: Vec<&Flight> = line
+        .line
+        .iter()
+        .filter_map(|l| match l {
+            Late::Run(flight) => Some(flight),
+            _ => None,
+        })
+        .collect();
+    for flight in &flights {
+        air.flights += 1;
+        if flight.fence <= completed {
+            air.done += 1;
+        } else {
+            air.lists += flight.order.len() as u32;
+            air.draws += flight.draws;
+            air.up += flight.up;
+        }
+    }
+    if let Some(produces) = producer {
+        let last = flights.iter().rposition(|flight| {
+            let mut ranges = Vec::new();
+            join_ranges(&mut ranges, flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+            produces(&ranges)
+        });
+        let after = last.map_or(0, |i| i + 1);
+        air.behind = Some((
+            (flights.len() - after) as u32,
+            flights[after..].iter().map(|f| f.draws).sum(),
+            flights[after..].iter().map(|f| f.up).sum(),
+        ));
+    }
+    air
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3616,7 +3723,27 @@ mod fill_check {
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
+    stale_under_flights_within(runs, &mut merge_runs())
+}
+
+/// The most changed runs [`stale_under_flights`] sends up to copies in the
+/// card's memory beside flights' shader writes, each a copy of its own
+/// there (`VICTORY_MERGE_RUNS`, 512; run 218 had 500 to 5,400 changed runs
+/// a frame of a few bytes each, and the cap settled the flights twice a
+/// frame, 50 ms of the submitting thread).
+fn merge_runs() -> usize {
+    static RUNS: OnceLock<usize> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
+    })
+}
+
+/// [`stale_under_flights`] with `runs_left` changed runs left to send up.
+/// What could not be merged is noted (`crate::shadow::take_refused`).
+fn stale_under_flights_within(runs: &[&HostList], runs_left: &mut usize) -> bool {
     use std::sync::Arc;
+    // A note of an earlier call is not this one's.
+    let _ = crate::shadow::take_refused();
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
@@ -3634,17 +3761,10 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there.
-        // (`VICTORY_MERGE_RUNS`: the cap. Run 218 had 500 to 5,400 changed
-        // runs a frame of a few bytes each, and the cap of 512 settled the
-        // flights twice a frame, 50 ms of the submitting thread.)
-        static RUNS: OnceLock<usize> = OnceLock::new();
-        let mut runs_left = *RUNS.get_or_init(|| {
-            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
-        });
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        // settle is still due where that could not be done. At most
+        // `runs_left` changed runs go up to copies in the card's memory
+        // ([`merge_runs`]).
+        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
@@ -3750,7 +3870,13 @@ pub(crate) fn land_before_remap(address: u64, len: u64) {
     if relay() {
         // Only until the flights that may write there have landed (the
         // landing thread recomputes `written` from those still in the air).
-        relay_wait(WHY_SYNC, |line| !line.settling && !touches(&line.written, from, to));
+        let produces = move |written: &[(usize, usize)]| touches(written, from, to);
+        relay_wait_for(
+            WHY_SYNC,
+            |line| !line.settling && !touches(&line.written, from, to),
+            Some(&produces),
+            Some((from, to)),
+        );
     } else {
         settle_now(WHY_SYNC);
     }
@@ -3880,10 +4006,23 @@ fn late_threads() {
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    relay_wait_for(why, done, None, None);
+}
+
+/// [`relay_wait`], told what the wait is for (`crate::waits` counts what
+/// is queued behind it): `producer` says whether a flight's declared ranges
+/// (in order, joined) hold it, `what` is its range if it is one.
+fn relay_wait_for(
+    why: usize,
+    done: impl Fn(&Line) -> bool,
+    producer: Option<&dyn Fn(&[(usize, usize)]) -> bool>,
+    what: Option<(usize, usize)>,
+) {
     let mut line = line();
     if done(&line) {
         return;
     }
+    let begun = crate::waits::begin(why, || air(&line, producer), what);
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
@@ -3898,6 +4037,48 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     submission_us(1, us);
+    crate::waits::end(begun, None);
+}
+
+/// Waits until the flights in the air that may write title memory
+/// `[from, to)` have landed: what their shaders wrote there is in title
+/// memory (and in the CPU sides of its host copies), and no flight still
+/// in the air declared a write there. Never a wait for the rest of the
+/// card's work, beyond the flights the producers come after (the card
+/// runs them in order, and they land in order). Returns at once if none
+/// may. With [`relay`] only (else nothing lands beside the caller): false
+/// without it, and then the caller settles as before.
+///
+/// For the coherence stages (fence per producer): the caller may hold the
+/// submission lock; it must not hold a lock the thread that lands flights
+/// takes (a host copy's locks, the line's).
+pub(crate) fn wait_producers(from: usize, to: usize, why: usize) -> bool {
+    if !relay() {
+        return false;
+    }
+    let produces = move |written: &[(usize, usize)]| touches(written, from, to);
+    relay_wait_for(why, |line| !touches(&line.written, from, to), Some(&produces), Some((from, to)));
+    true
+}
+
+/// The last flight in the air whose shaders may write title memory
+/// `[from, to)`: its submission number and the value of the host's fence
+/// signalled behind it (reached when the card has run it); `(0, 0)` if it
+/// is being landed (the card ran it). `None`: no flight may write there,
+/// what was written has landed ([`wait_producers`] returns at once).
+#[allow(dead_code)]
+pub(crate) fn producer_of(from: usize, to: usize) -> Option<(u64, u64)> {
+    let line = line();
+    if !touches(&line.written, from, to) {
+        return None;
+    }
+    let last = line.line.iter().rev().find_map(|item| match item {
+        Late::Run(flight) if flight.back.iter().any(|(_, r)| r.iter().any(|&(a, e)| a < to && from < e)) => {
+            Some((flight.number, flight.fence))
+        }
+        _ => None,
+    });
+    Some(last.unwrap_or((0, 0)))
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -3934,6 +4115,7 @@ fn relay_worker() {
             let mut line = line();
             loop {
                 if line.line.is_empty() {
+                    crate::waits::relay_phase(crate::waits::IDLE);
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
@@ -3954,6 +4136,10 @@ fn relay_worker() {
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
+                IN_HAND.store(
+                    items.iter().filter(|l| matches!(l, Late::Run(_))).count() as u32,
+                    Ordering::Relaxed,
+                );
                 line.in_hand = items
                     .iter()
                     .filter_map(|l| match l {
@@ -3965,8 +4151,12 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(items) => {
+                crate::waits::relay_phase(crate::waits::LANDING);
+                host.relay_land(items, &mut fetch);
+            }
             Err(target) => {
+                crate::waits::relay_phase(crate::waits::CARD);
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
@@ -4137,6 +4327,8 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
+    // What the waits above found ahead of them (coh-submit).
+    crate::waits::line(frames);
 }
 
 #[cfg(test)]
@@ -4567,6 +4759,9 @@ impl Host {
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
+                draws: AtomicU32::new(0),
+                #[cfg(feature = "diagnostics")]
+                unsent: AtomicU32::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes,
                 #[cfg(feature = "diagnostics")]
@@ -5713,6 +5908,7 @@ impl Host {
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
+            IN_HAND.store(0, Ordering::Relaxed);
             // What is still in the air, from the flights that are.
             written.clear();
             *lists = 0;
@@ -5915,10 +6111,40 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         }
+        // `VICTORY_SUBMIT_EVERY` (`crate::waits::cut`): flights of about
+        // that many draws, cut between host lists, in order (a list the
+        // submission names twice keeps it whole).
+        if crate::waits::every().is_some() && order.iter().enumerate().all(|(k, i)| !order[..k].contains(i)) {
+            let draws: Vec<u32> = order.iter().map(|&i| lists[i].host().draws()).collect();
+            let mut ends = crate::waits::cut(&draws);
+            if !ends.is_empty() {
+                ends.push(order.len());
+                let mut taken: Vec<Option<crate::list::Detached>> = lists.into_iter().map(Some).collect();
+                let mut from = 0;
+                for (k, &to) in ends.iter().enumerate() {
+                    let mut part: Vec<crate::list::Detached> = order[from..to].iter().filter_map(|&i| taken[i].take()).collect();
+                    let part_order: Vec<usize> = (0..part.len()).collect();
+                    if k + 1 == ends.len() {
+                        // Lists taken and not run go with the last flight,
+                        // which lets them go when it lands, as before.
+                        part.extend(taken.iter_mut().filter_map(Option::take));
+                    }
+                    self.execute_late_one(part, part_order);
+                    from = to;
+                }
+                return;
+            }
+        }
+        self.execute_late_one(lists, order);
+    }
+
+    /// [`Host::execute_late`] for one flight.
+    fn execute_late_one(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
         late_threads();
-        let sent = {
+        let (sent, draws) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, true)
+            let draws = runs.iter().map(|l| u64::from(l.draws())).sum::<u64>();
+            (self.submit(&runs, true), draws)
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -5938,6 +6164,8 @@ impl Host {
                 number: sent.number,
                 fence: *target,
                 sent_us: now_us(),
+                draws,
+                up: sent.up,
                 lists,
                 order,
                 card: sent.card,
@@ -5993,6 +6221,8 @@ impl Host {
                 number,
                 fence: *target,
                 sent_us: now_us(),
+                draws: 0,
+                up: sent.up,
                 lists: Vec::new(),
                 order: Vec::new(),
                 card: sent.card,
@@ -6021,6 +6251,19 @@ impl Host {
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
     fn settle(&self, submitted: &mut u64, why: usize) {
+        self.settle_for(submitted, why, None, None);
+    }
+
+    /// [`Host::settle`], told what the settle is for, as [`relay_wait_for`]
+    /// is (for the counts of `crate::waits`): everything in the air is
+    /// settled all the same.
+    fn settle_for(
+        &self,
+        submitted: &mut u64,
+        why: usize,
+        producer: Option<&dyn Fn(&[(usize, usize)]) -> bool>,
+        what: Option<(usize, usize)>,
+    ) {
         if !late() {
             return;
         }
@@ -6030,9 +6273,14 @@ impl Host {
             // nothing is being landed. Every point that settled before
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
-            relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            relay_wait_for(why, |line| line.line.is_empty() && !line.settling, producer, what);
             return;
         }
+        let begun = {
+            let line = line();
+            (!line.line.is_empty()).then(|| crate::waits::begin(why, || air(&line, producer), what))
+        };
+        let mut card_us = 0;
         let was_working = working(true);
         let mut counted = false;
         loop {
@@ -6071,6 +6319,7 @@ impl Host {
                     }
                 }
                 let gpu = waiting.elapsed();
+                card_us += gpu.as_micros() as u64;
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 submission_us(1, gpu.as_micros() as u64);
@@ -6158,6 +6407,60 @@ impl Host {
             }
         }
         working(was_working);
+        if let Some(begun) = begun {
+            crate::waits::end(begun, Some(card_us));
+        }
+    }
+
+    /// The flights are settled because `runs` refresh title memory that
+    /// the title changed under their shader writes and that could not be
+    /// merged beside them ([`stale_under_flights`] said so). `asked`: the
+    /// ranges of the submission's one write-watch asking, asked again after
+    /// a settle (what landed wrote title memory).
+    ///
+    /// With `VICTORY_WAIT_PRODUCER=1` (and [`relay`], [`late_exact`]): only
+    /// until the flights that may write the memory that was refused have
+    /// landed ([`wait_producers`]), then the merge is tried again, a few
+    /// rounds at most; what is still refused then settles everything, as
+    /// before. Without it everything is settled at once, and the counts
+    /// say how much of the line was behind the producer.
+    fn settle_stale(&self, submitted: &mut u64, runs: &[&HostList], asked: Option<&[(usize, usize)]>) {
+        /// Producer waits before everything is settled.
+        const ROUNDS: usize = 4;
+        let mut refused = crate::shadow::take_refused();
+        if crate::waits::producer() && relay() && late_exact() {
+            let mut rounds = 0;
+            // One more budget of changed runs for all the rounds together.
+            let mut runs_left = merge_runs();
+            while let Some((from, to)) = refused {
+                if rounds == ROUNDS {
+                    break;
+                }
+                rounds += 1;
+                wait_producers(from, to, WHY_STALE);
+                if let Some(ranges) = asked {
+                    crate::watch::ask_once(ranges);
+                }
+                if !stale_under_flights_within(runs, &mut runs_left) {
+                    crate::waits::PRODUCER_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    crate::waits::PRODUCER_STATS[1].fetch_add(rounds as u64, Ordering::Relaxed);
+                    return;
+                }
+                refused = crate::shadow::take_refused();
+            }
+            crate::waits::PRODUCER_STATS[1].fetch_add(rounds as u64, Ordering::Relaxed);
+            crate::waits::PRODUCER_STATS[2].fetch_add(1, Ordering::Relaxed);
+        }
+        match refused {
+            Some((from, to)) => {
+                let produces = move |written: &[(usize, usize)]| touches(written, from, to);
+                self.settle_for(submitted, WHY_STALE, Some(&produces), Some((from, to)));
+            }
+            None => self.settle(submitted, WHY_STALE),
+        }
+        if let Some(ranges) = asked {
+            crate::watch::ask_once(ranges);
+        }
     }
 
     /// [`Host::execute`], or with `late` the first half of
@@ -6189,7 +6492,8 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                let produces = |written: &[(usize, usize)]| blocked_by(written, runs, false).is_some();
+                relay_wait_for(why, |line| blocked_by(&line.written, runs, false).is_none(), Some(&produces), None);
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -6245,6 +6549,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::SWEEP, &mut part);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        let up_from = copied_up();
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -6284,13 +6589,12 @@ impl Host {
             // title memory, which other copies of it must see.
             if behind && stale_under_flights(runs) {
                 let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
+                self.settle_stale(&mut submitted, runs, Some(&ranges));
                 settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
+            self.settle_stale(&mut submitted, runs, None);
             settled += settling.elapsed();
         }
         #[cfg(feature = "diagnostics")]
@@ -6299,6 +6603,7 @@ impl Host {
             submit_parts::add(submit_parts::WAITS, settled);
         }
         for list in runs {
+            list.sending();
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
@@ -6378,6 +6683,7 @@ impl Host {
             crate::copystat::submission_ends(lock);
             let sent = Sent {
                 number: this_submission,
+                up: copied_up().saturating_sub(up_from),
                 card,
                 back,
                 writes,
@@ -6918,6 +7224,10 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.draws.store(0, Ordering::Relaxed);
+        // Recorded and never sent: no longer on their way.
+        #[cfg(feature = "diagnostics")]
+        crate::waits::sent(self.unsent.swap(0, Ordering::Relaxed));
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -7543,6 +7853,28 @@ impl HostList {
     /// [`HostList::writes_declared_since`].
     pub(crate) fn steps(&self) -> usize {
         self.deferred().copies.len()
+    }
+
+    /// A draw was recorded into the list (`crate::draw`).
+    pub(crate) fn drew(&self) {
+        self.draws.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.unsent.fetch_add(1, Ordering::Relaxed);
+            crate::waits::recorded(1);
+        }
+    }
+
+    /// The draws recorded into the list since its last reset.
+    pub(crate) fn draws(&self) -> u32 {
+        self.draws.load(Ordering::Relaxed)
+    }
+
+    /// The list goes to the card (diagnostics: its draws are no longer
+    /// "recorded and not sent").
+    fn sending(&self) {
+        #[cfg(feature = "diagnostics")]
+        crate::waits::sent(self.unsent.swap(0, Ordering::Relaxed));
     }
 
     /// An upload of `staging` into the host texture `copy` for the list's
@@ -10205,5 +10537,153 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+
+    /// The settle for title memory changed under flights' shader writes
+    /// (`WHY_STALE`, [`Host::settle_stale`]): the title rewrites a page that
+    /// a flight in the air declared it writes, too densely for the merge
+    /// beside its writes (more changed runs than `VICTORY_MERGE_RUNS`), and
+    /// the next submission refreshes the page and reads the title's new
+    /// bytes on the card. Settled for every flight in the air, or with
+    /// `VICTORY_WAIT_PRODUCER=1` only until that flight has landed (the
+    /// flights behind it still in the air), the same title memory must come
+    /// out: the title's bytes, the first flight's write in the page, the
+    /// later flights' writes elsewhere, and what the last one read.
+    ///
+    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_RELAY=2
+    ///  [VICTORY_WAIT_PRODUCER=1] cargo test -p victory-gpu --features
+    ///  diagnostics warp_title_bytes_under -- --test-threads=1`
+    #[test]
+    fn warp_title_bytes_under_shader_writes_go_up_once_their_producer_landed() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let Some(host) = host() else {
+            return;
+        };
+        // SAFETY: a plain query.
+        let software = host
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if !software || !relay() || !late_exact() {
+            eprintln!(
+                "queue2_tests: skipped, needs the software adapter and the relay (VICTORY_D3D12_WARP=1 VICTORY_RELAY=2, diagnostics)"
+            );
+            return;
+        }
+        const PIECE: usize = 64 << 10;
+        const LEN: usize = 4 << 20;
+        // The page the title rewrites under the first flight's writes.
+        const P: usize = 3;
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        assert!(!title.is_null());
+        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
+        let old = |at: usize| 0x5A00_0000 | (at / 4) as u32;
+        for i in 0..LEN / 4 {
+            // SAFETY: inside the allocation.
+            unsafe { dword(i * 4).write_volatile(old(i * 4)) };
+        }
+        crate::shadow::register(0x51_5152, title as u64, LEN as u64);
+        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        if !shadow.carded() {
+            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            return;
+        }
+        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        // A flight: refreshes the whole copy, declares page `page` written,
+        // and stores `memory[from] + add` at `to` after `spin` steps.
+        let send = |page: usize, to: usize, from: usize, add: u32, spin: u32| {
+            let list = host.new_list().expect("a host list");
+            shadow.refresh(&list, title as u64, LEN as u64);
+            shadow.gpu_writes(&list, (title as usize + page * PIECE) as u64, PIECE as u64);
+            // SAFETY: an open list; the copy's buffer, with unordered
+            // access; the shader's own root signature.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                let constants = [to as u32, from as u32, add, spin];
+                list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute_own(&list);
+            list
+        };
+        let before = [0, 1, 2].map(|i| crate::waits::PRODUCER_STATS[i].load(Ordering::Relaxed));
+        // A, long: writes a dword of page P. Then four short flights behind
+        // it, each writing a page of its own.
+        let a_to = P * PIECE + 256;
+        let mut lists = vec![send(P, a_to, PIECE, 1, 3_000_000)];
+        let b_to = |k: usize| (40 + k) * PIECE + 64;
+        for k in 0..4 {
+            lists.push(send(40 + k, b_to(k), 2 * PIECE, k as u32, 1_000));
+        }
+        // The title rewrites every eighth byte of page P but A's dword:
+        // 8,191 changed runs.
+        let rewritten = |i: usize| (i.is_multiple_of(8) && !(256..260).contains(&i)).then_some((i / 8) as u8 ^ 0xC3);
+        for i in 0..PIECE {
+            if let Some(byte) = rewritten(i) {
+                // SAFETY: inside the allocation.
+                unsafe { title.add(P * PIECE + i).write_volatile(byte) };
+            }
+        }
+        // C: refreshes page P (the settle under test) and reads a rewritten
+        // dword of it on the card.
+        let c_from = P * PIECE + 512;
+        let c_to = 50 * PIECE + 32;
+        lists.push(send(50, c_to, c_from, 5, 1));
+        settle_now(WHY_SYNC);
+        let after = [0, 1, 2].map(|i| crate::waits::PRODUCER_STATS[i].load(Ordering::Relaxed));
+        eprintln!(
+            "queue2_tests: producer waits {} (rounds {}), settles of everything after them {} (VICTORY_WAIT_PRODUCER: {})",
+            after[0] - before[0],
+            after[1] - before[1],
+            after[2] - before[2],
+            crate::waits::producer()
+        );
+        // What the title wrote, and what each flight wrote.
+        let mut expected: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for at in (P * PIECE..(P + 1) * PIECE).step_by(4) {
+            let mut bytes = old(at).to_le_bytes();
+            for (j, b) in bytes.iter_mut().enumerate() {
+                if let Some(byte) = rewritten(at - P * PIECE + j) {
+                    *b = byte;
+                }
+            }
+            expected.insert(at, u32::from_le_bytes(bytes));
+        }
+        expected.insert(a_to, old(PIECE) + 1);
+        for k in 0..4 {
+            expected.insert(b_to(k), old(2 * PIECE) + k as u32);
+        }
+        let c_read = expected[&c_from];
+        expected.insert(c_to, c_read + 5);
+        for i in 0..LEN / 4 {
+            let at = i * 4;
+            // SAFETY: inside the allocation.
+            let got = unsafe { dword(at).read_volatile() };
+            let want = expected.get(&at).copied().unwrap_or_else(|| old(at));
+            assert_eq!(got, want, "title memory at {at:#x}: {got:#x}, not {want:#x}");
+        }
+        drop(lists);
     }
 }
