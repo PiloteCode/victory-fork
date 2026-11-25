@@ -1395,6 +1395,60 @@ pub(crate) fn note_overlap(this: This) {
     );
 }
 
+/// Diagnostics, for a texture the host writes (a target, depth or unordered
+/// access texture) the title has just made at `start`, described by `desc`:
+/// whether another such texture alive lies in its memory. On the console
+/// the two share their bytes, and what one is drawn with the other shows;
+/// on the host each has a copy of its own, and nothing passes between them.
+/// The first pairs are logged, then every power of two, with a count.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_target_over_target(
+    targets: &std::collections::BTreeMap<u64, usize>,
+    start: u64,
+    desc: &ResourceDesc,
+    this: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(size) = footprint(desc).map(|f| f.size) else {
+        return;
+    };
+    let end = start + size;
+    // The targets that begin before this one ends, nearest first.
+    let hit = targets.range(..end).rev().take(256).find_map(|(&at, &other)| {
+        let o = resource(other as This);
+        let len = footprint(&o.desc).map_or(0, |f| f.size);
+        (other != this && at + len > start).then_some((at, len, other))
+    });
+    let Some((at, len, other)) = hit else {
+        return;
+    };
+    let n = SEEN.fetch_add(1, Relaxed) + 1;
+    if n > 32 && !n.is_power_of_two() {
+        return;
+    }
+    let o = resource(other as This);
+    let shape = |d: &ResourceDesc| {
+        format!(
+            "{}x{}x{} levels {} format {} flags {:#x} dim {}",
+            d.width, d.height, d.depth_or_array_size, d.mip_levels, d.format, d.flags, d.dimension
+        )
+    };
+    let now = crate::frame::current();
+    let written = o.host.written.load(Relaxed).checked_sub(1).map(|f| now.saturating_sub(f));
+    tracing::info!(
+        texture = format_args!("{this:#x}"),
+        at = format_args!("{start:#x}+{size:#x}"),
+        shape = %shape(desc),
+        other = format_args!("{other:#x}"),
+        other_at = format_args!("{at:#x}+{len:#x}"),
+        other_shape = %shape(&o.desc),
+        frames_since_the_host_wrote_the_other = ?written,
+        count = n,
+        "a texture the host writes is made in the memory of another one alive: each has a host copy of its own"
+    );
+}
+
 /// Diagnostics: views of placed textures [`note_overlap`] looked at, and of
 /// them those over a texture the host wrote in this frame or the last.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -2471,10 +2525,10 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
         if !fills(&desc) {
-            TARGETS_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+            let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            note_target_over_target(&targets, resource.data() as u64, &desc, at);
+            targets.insert(resource.data() as u64, at);
         }
         if !lazy() {
             let _ = hosted(at as This, true);

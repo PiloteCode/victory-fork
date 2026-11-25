@@ -272,6 +272,58 @@ make them with the frame listings and target dumps:
   (address 0). In the runs after these changes no buffer view was left null,
   and 196 raw views of the gameplay run were made on their own bytes.
 
+### Picture checks, second round (2026-11-25 afternoon)
+
+- **Tiles left out of the screen-probe indirect light**: the final gather of
+  the indirect diffuse light (`indirect_diffuse_lighting:CS_FinalGather_*`)
+  is an indirect dispatch of one group per 8x8 tile of each of two layers at
+  2560x1440, up to 2 x 57,600 = 115,200 groups in x; one host dispatch runs
+  at most 65,535. The clamp of indirect records cut such a record to 65,535,
+  so the groups past it never ran: 0.3 to 3.5 records a frame in the
+  opening, about one a frame in the save's gameplay (68,952 to 75,816
+  groups asked there, in a static shot). With the tiles in reading order, a
+  cut leaves everything after one point of the picture without its gather:
+  the rows below it, and the end of its own row. That is the shape of the
+  blocks this section's first round put on the missing ray-tracing
+  structures (blocks "mostly along the bottom of the picture"), and of the
+  kitchen shot's blinds, unprocessed below a row and right of a column.
+  Compute programs now count their groups in x from a base the host gives
+  them (a user-data word, `USER_GROUP_BASE`; not programs with a spilled
+  user-data table, whose root signature is near the host's 64 dwords), and
+  a dispatch of more groups runs as several: a direct one as several
+  dispatches, an indirect one through records the clamp splits in four
+  (base, counts), up to 262,140 groups in x. The two final-gather programs
+  named are now run whole; no pipeline was refused for the extra word. In
+  the save's gameplay (the inmate at the cell window, the same static view):
+  before, about 0.8 records a frame were cut and blue and white blocks lined
+  the bottom edge, and the hair and the head's half over the window took a
+  washed-out orange light with a vertical seam (taken for frosted glass
+  drawn over the head); after, 166 frame lines asked for more than 65,535
+  groups and none was cut, the bottom edge is clean and the hair is lit as
+  the rest of the room (the build after also has `integration`'s newer
+  commits; the cut was the one thing measured to stop).
+- **The opening's later montage** (a woman on a field and over a valley at
+  dusk, a terrace, an aerial flight, 280 to 360 s after the world's first
+  frame): flat untextured ground and low-poly figures and buildings (their
+  lowest levels of detail), the lower part of the picture unlit or in
+  blocks. A build of `main` (no upstream merge) shows the same shots the
+  same way (one run of each), so they do not come from the upstream changes;
+  in some runs of either the montage holds a shot for tens of seconds while
+  the streaming catches up. The blocks and unlit bottom match the cut final
+  gather above; the low detail is the streaming's (not traced further).
+- **New diagnostics**: `VICTORY_CAPTURE_SECONDS=<s>,...` lists (and with
+  `VICTORY_DUMP_TARGETS` dumps) the first frame past each time after the
+  world's first frame (the opening keeps time with its sound: frame numbers
+  name other shots in every run). Note that target dumps of a listed frame
+  take 15 to 20 s each and the cutscene stalls on its shot meanwhile, and
+  `VICTORY_CAPTURE_WORLD` lists four frames of its own: a run with dumps
+  is not timed like one without. The listing now shows mesh pipelines'
+  depth, stencil and blend state and the title's clears; a texture the host
+  writes made in the memory of another one alive is logged (in the opening
+  only shadow-map depth textures of a pool overlap that way, re-rendered
+  each frame); a program whose indirect dispatch asks for more groups than
+  run is named.
+
 ### Known problems
 
 - Everything in shadow is black (see above).

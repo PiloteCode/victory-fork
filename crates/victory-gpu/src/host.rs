@@ -1453,6 +1453,12 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// 65,535 one dispatch runs (cut to that: the groups past it do not run).
 static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame line: the most indirect work one list's run spent
+/// (vertex instances and threads, as the clamp charges them), and the runs
+/// that reached the budget (`crate::indirect::BUDGET`): the records clamped
+/// after that point ran empty, whatever they draw.
+static BUDGET_SPENT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -6200,6 +6206,11 @@ impl HostList {
                 let (widest, cut) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 COMPUTE_GROUPS[0].fetch_max(u64::from(widest), Ordering::Relaxed);
                 COMPUTE_GROUPS[1].fetch_add(u64::from(cut), Ordering::Relaxed);
+                // And the work its last run spent: at the budget, the
+                // records after the one that reached it ran empty.
+                let spent = words.read_volatile();
+                BUDGET_SPENT[0].fetch_max(u64::from(spent), Ordering::Relaxed);
+                BUDGET_SPENT[1].fetch_add(u64::from(spent >= crate::indirect::BUDGET), Ordering::Relaxed);
                 for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
@@ -6957,7 +6968,13 @@ impl Meter {
         let compute_widest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
         let compute_cut = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
+            "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535, or 4 x 65535 for a program that counts its groups from a base), {compute_cut:.1} records per frame asked for more and were cut to that"
+        );
+        let spent_most = BUDGET_SPENT[0].swap(0, Ordering::Relaxed);
+        let spent_out = BUDGET_SPENT[1].swap(0, Ordering::Relaxed);
+        tracing::info!(
+            "indirect work of a list's run: at most {spent_most} vertex instances and threads (budget {}), {spent_out} runs reached the budget (their later records ran empty)",
+            crate::indirect::BUDGET
         );
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
