@@ -3499,7 +3499,13 @@ mod submit_parts {
 
     /// A flush of refreshes took `d`.
     pub(super) fn flushed(d: std::time::Duration) {
-        add(REFRESH, d);
+        flushed_to(REFRESH, d);
+    }
+
+    /// A flush done inside a step took `d`, counted to part `i` (and not
+    /// to the step's).
+    pub(super) fn flushed_to(i: usize, d: std::time::Duration) {
+        add(i, d);
         FLUSHED.with(|f| f.set(f.get() + d.as_nanos() as u64));
     }
 
@@ -8408,6 +8414,12 @@ impl HostList {
                         fill_check::runs(src, len);
                     }
                     crate::uheap::layer_read(src, len, crate::uheap::Read::Fill);
+                    // Gathered, done together at the next flush
+                    // ([`wide_fills`]).
+                    if wide_fills() {
+                        batch.fills.push((dst, src, len));
+                        continue;
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -8423,6 +8435,10 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        // Our host work may read or write what a gathered
+                        // fill writes: those before it are done first.
+                        batch.flush_fills();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
@@ -8540,6 +8556,102 @@ struct Batch {
     /// With [`wide_textures`]: the staging buffers to refresh at the next
     /// flush, each once.
     staged: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// With [`wide_fills`]: the fills of upload memory (destination,
+    /// source, bytes) not done yet, in order ([`Batch::flush_fills`]).
+    fills: Vec<(usize, usize, usize)>,
+}
+
+/// Whether a submission's fills of upload memory (`Step::Fill`) are
+/// gathered and done together on several threads (`VICTORY_WIDE_FILLS=1`;
+/// off by default). From fxceless #995 (tunczzz).
+///
+/// Each fill is one read of title memory through the kernel (or in place,
+/// `crate::plaincopy`), 0.7 us however small: 13,000 a frame were 9.5 ms
+/// on the submitting thread (#995's run n37; wave 8's "fills and title
+/// copies" 5-7 ms). A fill reads title memory and writes the list's own
+/// upload memory, which nothing else of the preparing reads or writes. So
+/// fills wait, in order, until a step that writes title memory (a title
+/// copy, work of ours: [`Batch::title_written`], [`Batch::title_wrote`]), a
+/// step of our host work, or the end of the steps ([`Batch::flush`]), and
+/// are then done on the kept threads (`crate::shadow::wide_run`). The bytes
+/// each fill writes are the ones it wrote in place: nothing between it and
+/// the flush writes title memory or upload memory. Fills whose destinations
+/// overlap, and fewer than [`WIDE_FILLS_MIN`], are done one after the
+/// other, in order, on the submitting thread.
+fn wide_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_FILLS").is_some_and(|v| v == "1"))
+}
+
+/// Fewer gathered fills than this are done on the submitting thread.
+const WIDE_FILLS_MIN: usize = 64;
+
+/// [`wide_fills`] since the last frame line: fills done on several
+/// threads, flushes that did so, fills done in order on the submitting
+/// thread (too few, or overlapping), and the nanoseconds the flushes took.
+static FILLS_WIDE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Does the gathered `fills` ([`wide_fills`]): the bytes, and whether they
+/// went to several threads.
+fn do_fills(fills: &[(usize, usize, usize)]) -> (usize, bool) {
+    let bytes: usize = fills.iter().map(|f| f.2).sum();
+    if fills.len() < WIDE_FILLS_MIN || !fills_apart(fills) {
+        for &(dst, src, len) in fills {
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+        return (bytes, false);
+    }
+    // A job's share: bytes plus the cost of a kernel read, so that many
+    // small fills and a few big ones spread alike.
+    const CALL: usize = 4096;
+    const JOBS: usize = 8;
+    let each = (bytes + CALL * fills.len()).div_ceil(JOBS).max(1);
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(JOBS + 1);
+    let mut group: Vec<(usize, usize, usize)> = Vec::new();
+    let mut weight = 0;
+    for &fill in fills {
+        group.push(fill);
+        weight += fill.2 + CALL;
+        if weight >= each {
+            let mine = std::mem::take(&mut group);
+            jobs.push(Box::new(move || {
+                for (dst, src, len) in mine {
+                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                }
+            }));
+            weight = 0;
+        }
+    }
+    if !group.is_empty() {
+        jobs.push(Box::new(move || {
+            for (dst, src, len) in group {
+                copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+        }));
+    }
+    crate::shadow::wide_run(jobs);
+    (bytes, true)
+}
+
+/// Whether no two of `fills` write the same byte: then the order they are
+/// done in does not matter.
+fn fills_apart(fills: &[(usize, usize, usize)]) -> bool {
+    let mut at: Vec<(usize, usize)> = fills.iter().filter(|f| f.2 > 0).map(|f| (f.0, f.0 + f.2)).collect();
+    at.sort_unstable();
+    at.windows(2).all(|w| w[0].1 <= w[1].0)
+}
+
+/// [`wide_fills`]' line, with the frame line's others.
+fn fills_wide_line(frames: f64) {
+    let [wide, flushes, alone, ns] = [0, 1, 2, 3].map(|i| FILLS_WIDE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if wide_fills() {
+        tracing::info!(
+            "fills of upload memory gathered per frame (VICTORY_WIDE_FILLS=1): {wide:.0} done on several threads in \
+             {flushes:.1} flushes, {alone:.0} in order on the thread that submits (fewer than {WIDE_FILLS_MIN} or \
+             overlapping), {:.2} ms on that thread",
+            ns / 1e6
+        );
+    }
 }
 
 /// Whether a submission's texture refreshes (staging buffers of textures
@@ -8681,7 +8793,31 @@ impl Batch {
         });
     }
 
+    /// [`wide_fills`]: the gathered fills, now.
+    fn flush_fills(&mut self) {
+        if self.fills.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut fills = std::mem::take(&mut self.fills);
+        let (bytes, wide) = do_fills(&fills);
+        let took = started.elapsed();
+        preparing(0, took.as_micros() as u64);
+        preparing(1, bytes as u64);
+        FILLS_WIDE[if wide { 0 } else { 2 }].fetch_add(fills.len() as u64, Ordering::Relaxed);
+        if wide {
+            FILLS_WIDE[1].fetch_add(1, Ordering::Relaxed);
+        }
+        FILLS_WIDE[3].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        submit_parts::flushed_to(submit_parts::FILLS, took);
+        // The vector's room is kept for the next ones.
+        fills.clear();
+        self.fills = fills;
+    }
+
     fn flush(&mut self) {
+        self.flush_fills();
         #[cfg(feature = "diagnostics")]
         let flushing = std::time::Instant::now();
         self.flush_all();
@@ -9313,6 +9449,7 @@ impl Meter {
                 );
             }
         }
+        fills_wide_line(frames);
         {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if copies > 0.0 {
@@ -10167,6 +10304,65 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod wide_fills_tests {
+    use super::{do_fills, fills_apart};
+
+    /// Title-like source bytes and fills of many sizes into one upload
+    /// buffer, laid out apart: the fills done on several threads leave the
+    /// same bytes as the fills done one after the other (fxceless #995,
+    /// tunczzz).
+    #[test]
+    fn wide_fills_write_what_fills_in_order_write() {
+        let source: Vec<u8> = (0..1 << 20).map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let mut fills_at = Vec::new();
+        let (mut src, mut dst) = (0usize, 0usize);
+        for i in 0..3000usize {
+            let len = [4, 16, 64, 256, 300, 1024, 4096, 17][i % 8];
+            fills_at.push((dst, src % (source.len() - len), len));
+            src += 7919 * (i + 1);
+            dst += len + (i % 3) * 16;
+        }
+        let size = dst;
+        let run = |wide: bool| {
+            let mut upload = vec![0xAAu8; size];
+            let fills: Vec<(usize, usize, usize)> = fills_at
+                .iter()
+                .map(|&(d, s, n)| (upload.as_mut_ptr() as usize + d, source.as_ptr() as usize + s, n))
+                .collect();
+            if wide {
+                let (bytes, went) = do_fills(&fills);
+                assert!(went);
+                assert_eq!(bytes, fills_at.iter().map(|f| f.2).sum::<usize>());
+            } else {
+                for &(d, s, n) in &fills {
+                    super::copy_mapped(d as *mut u8, s as *const u8, n, false);
+                }
+            }
+            upload
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    /// Fills whose destinations overlap are done in order: the later one
+    /// wins, as in place.
+    #[test]
+    fn overlapping_fills_keep_their_order() {
+        let source: Vec<u8> = (0..=255).collect();
+        let mut upload = vec![0u8; 4096];
+        let base = upload.as_mut_ptr() as usize;
+        let mut fills: Vec<(usize, usize, usize)> =
+            (0..100).map(|i| (base + i * 16, source.as_ptr() as usize + i, 16)).collect();
+        // The last one writes over the first.
+        fills.push((base + 8, source.as_ptr() as usize + 200, 16));
+        assert!(!fills_apart(&fills));
+        let (_, went) = do_fills(&fills);
+        assert!(!went);
+        assert_eq!(&upload[8..24], &source[200..216]);
+        assert_eq!(&upload[0..8], &source[0..8]);
     }
 }
 
