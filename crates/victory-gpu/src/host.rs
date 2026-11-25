@@ -2144,9 +2144,10 @@ struct Deferred {
     /// The ranges of title memory the list's shaders may write as declared
     /// so far (`Step::GpuWrite`, whatever host copy: copies of the same
     /// bytes count alike), each once (the world's passes declare the same
-    /// ranges dozens of times).
-    written: Vec<(usize, usize)>,
-    written_once: std::collections::HashSet<(usize, usize)>,
+    /// ranges dozens of times), with the list's steps before its last
+    /// declaration ([`HostList::steps`]), and where each is in that list.
+    written: Vec<(usize, usize, usize)>,
+    written_once: std::collections::HashMap<(usize, usize), usize>,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -6911,9 +6912,17 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let range = (address, address.saturating_add(len));
-        if deferred.written_once.insert(range) {
-            deferred.written.push(range);
+        let (from, to, step) = (address, address.saturating_add(len), deferred.copies.len());
+        let at = deferred.written.len();
+        match deferred.written_once.entry((from, to)) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let at = *e.get();
+                deferred.written[at].2 = step;
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(at);
+                deferred.written.push((from, to, step));
+            }
         }
         deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
     }
@@ -6921,8 +6930,20 @@ impl HostList {
     /// Whether the list's shaders recorded so far may write a byte of
     /// `[from, to)` of title memory, as they declare their writes
     /// ([`HostList::defer_gpu_write`]).
-    pub(crate) fn writes_declared(&self, (from, to): (usize, usize)) -> bool {
-        self.deferred().written.iter().any(|&(a, b)| a < to && from < b)
+    pub(crate) fn writes_declared(&self, range: (usize, usize)) -> bool {
+        self.writes_declared_since(range, 0)
+    }
+
+    /// [`HostList::writes_declared`] by the shaders recorded after the mark
+    /// `since` ([`HostList::steps`]).
+    pub(crate) fn writes_declared_since(&self, (from, to): (usize, usize), since: usize) -> bool {
+        self.deferred().written.iter().any(|&(a, b, at)| at >= since && a < to && from < b)
+    }
+
+    /// The list's deferred steps so far: a mark for
+    /// [`HostList::writes_declared_since`].
+    pub(crate) fn steps(&self) -> usize {
+        self.deferred().copies.len()
     }
 
     /// An upload of `staging` into the host texture `copy` for the list's

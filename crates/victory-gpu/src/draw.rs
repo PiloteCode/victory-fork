@@ -136,6 +136,37 @@ struct Window {
     scratch: ID3D12Resource,
     /// Where in `scratch` the window's first record lies.
     scratch_at: u64,
+    /// The first record's title address, and the list's steps when the
+    /// window was clamped (`HostList::steps`): a window of dispatch
+    /// records ([`dispatch_windows`]) holds while no shader recorded since
+    /// may write its records.
+    at: u64,
+    mark: usize,
+}
+
+/// Whether indirect dispatches get windows of clamped records too
+/// (`VICTORY_INDIRECT_DISPATCH_WINDOW=1`; off by default; with the ring).
+///
+/// Their records are mostly written in their own list by an earlier
+/// dispatch (763 of 955 clamps a frame in the save's gameplay, 650 of
+/// them a short step after the last dispatch's record: run
+/// integ-general-2-play-base), so they are clamped in the list, each
+/// between the compute stage and the indirect read, and the dispatches'
+/// shaders store, which windows did not take: a dispatch may write the
+/// records the next one reads. A window of dispatch records holds for a
+/// dispatch while no shader recorded since the window was clamped may
+/// write its records (by the writes the list's shaders declare; the
+/// dispatch's own are declared when it is bound, after its record is
+/// read), and ends as a draw window does at a direct draw or dispatch.
+/// Not split dispatches (their clamped records are four to one), nor
+/// records whose writes may go undeclared: in title memory in place
+/// (`VICTORY_INPLACE`), or in a list whose shaders store through
+/// addresses (`crate::memory`).
+fn dispatch_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::indirect::ring() && std::env::var_os("VICTORY_INDIRECT_DISPATCH_WINDOW").is_some_and(|v| v == "1")
+    })
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -3254,10 +3285,14 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
-            && kind != DISPATCH
             && max == 1
             && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
+            && ((kind != DISPATCH && !p.stages.iter().any(|stage| stage.translated().stores))
+                || (kind == DISPATCH
+                    && split.is_none()
+                    && dispatch_windows()
+                    && !args.in_place()
+                    && !list.asked(crate::memory::STORES)));
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         if !windowed || list.first_use(WINDOW_USE) {
@@ -3269,6 +3304,14 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+            .filter(|w| {
+                // A dispatch window: no shader since may write its records
+                // (none storing through addresses, which declare nothing).
+                let end = w.at + u64::from(w.step) * u64::from(w.records);
+                w.kind != DISPATCH
+                    || !(list.asked(crate::memory::STORES)
+                        || list.writes_declared_since((w.at as usize, end as usize), w.mark))
+            })
             .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base), w.step));
         #[cfg(feature = "diagnostics")]
         {
@@ -3277,7 +3320,7 @@ impl State {
                 None
             } else if hit.is_some() {
                 Some(C::IndirectWindowHit)
-            } else if kind == DISPATCH {
+            } else if kind == DISPATCH && !windowed {
                 Some(C::IndirectNotWindowedDispatch)
             } else if count.is_some() {
                 Some(C::IndirectNotWindowedCount)
@@ -3403,6 +3446,7 @@ impl State {
                     self.host_pipeline = 0;
                     self.host_roots[1] = 0;
                 }
+                let mark = list.steps();
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -3412,6 +3456,8 @@ impl State {
                     records,
                     scratch: bounded.clone(),
                     scratch_at: bounded_at,
+                    at: arguments,
+                    mark,
                 });
                 (bounded, bounded_at)
             }
