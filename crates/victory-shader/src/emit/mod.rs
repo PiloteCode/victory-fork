@@ -1535,7 +1535,7 @@ mod atomic_tests {
 mod barycentric_tests {
     use super::container::SigElement;
     use super::*;
-    use crate::native::{PsInput, StageIo, Usage};
+    use crate::native::{PsInput, ResourceType, RootParam, RootType, StageIo, Usage, UsedResource};
 
     /// `SPI_PS_INPUT_ADDR` bits: PERSP_CENTER, LINEAR_CENTER.
     const PERSP_CENTER: u32 = 1 << 1;
@@ -1569,18 +1569,24 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
-        pixel_of(words, input_addr, false)
+        pixel_of(words, input_addr, false, Vec::new(), Vec::new())
     }
 
     /// [`pixel`] with TEXCOORD0 a 16-bit attribute when `fp16` (one value in the low half of
-    /// each dword).
-    fn pixel_of(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
+    /// each dword), and the root parameters `layout` and used resources `used`.
+    fn pixel_of(
+        words: &[u32],
+        input_addr: u32,
+        fp16: bool,
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
             vgprs: 8,
-            layout: vec![],
-            used: vec![],
+            layout,
+            used,
             io: StageIo::Ps {
                 inputs: vec![PsInput {
                     usage: Usage::Generic,
@@ -1672,7 +1678,54 @@ mod barycentric_tests {
             e1,
             0xBF81_0000,
         ];
-        let shader = pixel_of(&words, PERSP_CENTER, true).unwrap();
+        let shader = pixel_of(&words, PERSP_CENTER, true, Vec::new(), Vec::new()).unwrap();
+        validate(&shader);
+    }
+
+    /// A level-of-detail query of a 2D array texture: the layer is no coordinate of the
+    /// level, and DXIL wants it undefined (the validator refused three of the title's
+    /// deferred programs: "out of bound coord must be undef").
+    #[test]
+    fn a_level_query_of_an_array_leaves_the_layer_out() {
+        // A table of textures at s0, one of samplers at s1.
+        let table = |user_data| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        let range = |kind, dwords, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data,
+            slot: user_data,
+        };
+        let [e0, e1] = exp_mrt0(4);
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0101,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null
+            0xBE8C_0301, // s_mov_b32 s12, s1
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0406,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], null
+            0x7E04_0280, // v_mov_b32 v2, 0 (layer 0)
+            0xF180_0328,
+            0x0081_0400, // image_get_lod v[4:5], v[0:2], s[4:11], s[16:19] dmask:0x3 2D array
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let layout = vec![table(0), table(1)];
+        let used = vec![range(ResourceType::Srv, 8, 0), range(ResourceType::Sampler, 4, 1)];
+        let shader = pixel_of(&words, PERSP_CENTER, false, layout, used).unwrap();
         validate(&shader);
     }
 
