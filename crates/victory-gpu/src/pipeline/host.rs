@@ -1189,6 +1189,154 @@ mod tests {
         return float4(p * 2.0 - 1.0, 0.5, 1.0);
     }";
 
+    /// A triangle over the whole target, from a mesh shader.
+    const MS_FULL: &str = "struct V { float4 p : SV_Position; };
+        [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
+        void main(out vertices V v[3], out indices uint3 t[1]) {
+            SetMeshOutputCounts(3, 1);
+            v[0].p = float4(-1, -1, 0.5, 1);
+            v[1].p = float4(-1, 3, 0.5, 1);
+            v[2].p = float4(3, -1, 0.5, 1);
+            t[0] = uint3(0, 1, 2);
+        }";
+
+    /// The depth bounds test through a mesh pipeline (the title's world draws are
+    /// mesh draws; the test above makes a vertex pipeline): one triangle over four
+    /// texels whose depths are 0.1, 0.4, 0.6 and 0.9, under bounds 0.3 and 0.7 set
+    /// on the list, colours the two middle texels only; the same pipeline state
+    /// without the test colours all four.
+    #[test]
+    fn a_mesh_pipeline_keeps_only_the_pixels_within_the_depth_bounds() {
+        use windows::Win32::Foundation::RECT;
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.depth_bounds() || !host.mesh_shaders() {
+            eprintln!("no depth bounds test or mesh shaders on the host GPU; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS_FULL, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let texture = |format, flags, state| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut out) }
+                .unwrap();
+            out.unwrap()
+        };
+        let back = {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe {
+                host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut out)
+            }
+            .unwrap();
+            out.unwrap()
+        };
+        for bounds in [true, false] {
+            let mut g = GraphicsState::default();
+            g.depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            g.depth_bounds = bounds;
+            g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+            g.targets.NumRenderTargets = 1;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            g.depth_format = DXGI_FORMAT_D32_FLOAT;
+            let name = super::super::library::name("mesh depth-bounds test", &root_blob, &[&ms, &ps], &g.describe());
+            let pso = mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, bounds, &name).expect("made");
+            let target = texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            let depth = texture(DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            let list = host.new_list().unwrap();
+            let (rtv, dsv) = (host.rtv(Some(&target), None), host.dsv(&depth, None));
+            // SAFETY: an open list of ours, live resources, views just made.
+            unsafe {
+                let l = &list.list;
+                l.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                for (x, d) in [0.1f32, 0.4, 0.6, 0.9].into_iter().enumerate() {
+                    let x = x as i32;
+                    let column = [RECT { left: x, top: 0, right: x + 1, bottom: 1 }];
+                    l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, d, 0, Some(&column));
+                }
+                l.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+                l.RSSetViewports(&[D3D12_VIEWPORT { Width: 4.0, Height: 1.0, MaxDepth: 1.0, ..Default::default() }]);
+                l.RSSetScissorRects(&[RECT { left: 0, top: 0, right: 4, bottom: 1 }]);
+                l.SetGraphicsRootSignature(&root);
+                l.SetPipelineState(&pso);
+                crate::draw::depth_bounds(&list, 0.3, 0.7);
+                l.cast::<ID3D12GraphicsCommandList6>().unwrap().DispatchMesh(1, 1, 1);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &target,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: 4,
+                                Height: 1,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&target),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the copy has run (the submission is waited for); four texels.
+            let red: Vec<u8> = unsafe {
+                back.Map(0, None, Some(&mut data)).unwrap();
+                let red = std::slice::from_raw_parts(data.cast::<u8>(), 16).chunks(4).map(|t| t[0]).collect();
+                back.Unmap(0, None);
+                red
+            };
+            let want = if bounds { vec![0, 255, 255, 0] } else { vec![255; 4] };
+            assert_eq!(red, want, "depth bounds test {bounds}");
+        }
+    }
+
     /// A graphics pipeline with `DepthBoundsTestEnable` loads back from the
     /// pipeline library and culls or passes fragments according to
     /// `OMSetDepthBounds` (including across a command-list cut).
