@@ -5634,10 +5634,32 @@ impl<'a> Lower<'a> {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
+            let src = Source::Loaded { load: site, first: 0 };
+            let used = self.used_kind(&src);
+            let view = |dwords| {
+                used.is_none_or(|u| {
+                    matches!(u.kind, ResourceType::Srv | ResourceType::Uav) && u.dwords == dwords
+                })
+            };
+            // A buffer's descriptor in a table that the code reads the record count of
+            // (`GetDimensions` of a buffer it does not read, the title's water simulation),
+            // or the address (below): a handle of the view the table entry describes gives
+            // the count, the host the address.
+            if count == 4 && used.is_some() && view(4) {
+                let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if stride >= 4 && stride.is_multiple_of(4) {
+                    (12 | u, stride)
+                } else {
+                    (11 | u, 0)
+                };
+                (0, used, uav, props, None, true)
+            } else
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
             // from the host, the other dwords have no value.
-            if count <= 4
+            if count < 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
                 for k in 0..count {
@@ -5654,26 +5676,22 @@ impl<'a> Lower<'a> {
                     }
                 }
                 return Ok(());
+            } else {
+                // An image's descriptor (eight dwords) that the code reads the size of and
+                // nothing else: `GetDimensions` of a texture the program does not sample
+                // (the title's puddle shaders take the texel size of a heap texture so). No
+                // instruction names the image's kind, so the handle is a 2D texture's, and
+                // only what a 2D view has (width, height, levels) gets a value: depth and
+                // layers (dword 4) stay without one.
+                // shortcut: the view in the heap is taken to be a 2D texture; one of
+                // another kind is queried through a 2D texture's handle.
+                if count != 8 || !view(8) {
+                    return Err("a descriptor read only as data");
+                }
+                let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                (0, used, uav, (2 | u, 0x409), Some(2), true)
             }
-            // An image's descriptor (eight dwords) that the code reads the size of and
-            // nothing else: `GetDimensions` of a texture the program does not sample (the
-            // title's puddle shaders take the texel size of a heap texture so). No
-            // instruction names the image's kind, so the handle is a 2D texture's, and
-            // only what a 2D view has (width, height, levels) gets a value: depth and
-            // layers (dword 4) stay without one.
-            // shortcut: the view in the heap is taken to be a 2D texture; one of another
-            // kind is queried through a 2D texture's handle.
-            let src = Source::Loaded { load: site, first: 0 };
-            let used = self.used_kind(&src);
-            let view = used.is_none_or(|u| {
-                matches!(u.kind, ResourceType::Srv | ResourceType::Uav) && u.dwords == 8
-            });
-            if count != 8 || !view {
-                return Err("a descriptor read only as data");
-            }
-            let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
-            let u = if uav { 0x1000 } else { 0 };
-            (0, used, uav, (2 | u, 0x409), Some(2), true)
         };
         let src = Source::Loaded { load: site, first };
         let h = self.handle(site, &src, false, props)?;
@@ -5741,14 +5759,15 @@ impl<'a> Lower<'a> {
                     n
                 };
                 let mut words = vec![(2, n)];
-                // Its address too, where the code computes with it and the
-                // host can tell it.
+                // Its address too, where the code computes with it (or, using
+                // the descriptor for nothing else, may read it) and the host
+                // can tell it.
                 let computed = (0..2u8).any(|k| {
                     inst.write(Reg::S(code + first + k))
                         .is_some_and(|v| self.computed_with(v, 6))
                 });
                 if first == 0
-                    && computed
+                    && (computed || sized)
                     && let Some((lo, hi)) = self.view_address(site)
                 {
                     words.extend([(0, lo), (1, hi)]);

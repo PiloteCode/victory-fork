@@ -1,7 +1,7 @@
-//! End-to-end tests of descriptors that no instruction names alone: an image's descriptor the
-//! code reads only the size of, and an immediate sampler each arm of a uniform branch sets
-//! its own of. Synthetic GFX10 compute programs translated ([`super::emit`]), validated by
-//! `dxil.dll` when present, and run on the host GPU and WARP.
+//! End-to-end tests of descriptors that no instruction names alone: an image's or a buffer's
+//! descriptor the code reads only the size of, and an immediate sampler each arm of a uniform
+//! branch sets its own of. Synthetic GFX10 compute programs translated ([`super::emit`]),
+//! validated by `dxil.dll` when present, and run on the host GPU and WARP.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, validator};
@@ -16,21 +16,31 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// with a texture's descriptor at dword 0 and a raw UAV's at dword 8; `body` follows the
 /// loads of the texture's descriptor into s[8:15] and the UAV's into s[16:19].
 fn native(body: &[u32]) -> NativeProgram {
+    native_of(body, 8, 0)
+}
+
+/// [`native`] with a view of `dwords` dwords (8: a texture, 4: a buffer of elements of
+/// `stride` bytes) at dword 0, loaded into s8 on.
+fn native_of(body: &[u32], dwords: u8, stride: u32) -> NativeProgram {
+    let load = match dwords {
+        8 => 0xF40C_0202, // s_load_dwordx8 s[8:15], s[4:5], null
+        _ => 0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], null
+    };
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
-        0xF40C_0202,
-        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+        load,
+        0xFA00_0000,
         0xF408_0402,
         0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
     ];
     words.extend_from_slice(body);
     words.push(S_ENDPGM);
-    let range = |kind, table_offset_dwords, dwords| UsedResource {
+    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
         table_offset_dwords,
         lower_bound: 0,
-        stride: 0,
+        stride,
         dwords,
         user_data: 4,
         slot: 1,
@@ -57,7 +67,10 @@ fn native(body: &[u32]) -> NativeProgram {
                 slot: 1,
             },
         ],
-        used: vec![range(ResourceType::Srv, 0, 8), range(ResourceType::Uav, 8, 4)],
+        used: vec![
+            range(ResourceType::Srv, 0, dwords, stride),
+            range(ResourceType::Uav, 8, 4, 0),
+        ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
             threads: [1, 1, 1],
@@ -157,6 +170,30 @@ fn a_texture_read_only_for_its_size_gives_the_views_size() {
     for (label, words) in results {
         // 13 x 7 texels, one level (the last is level 0).
         assert_eq!(words, [13, 7, 0, 0], "{label}");
+    }
+}
+
+#[test]
+fn a_buffer_read_only_for_its_size_gives_the_views_element_count() {
+    // The title's water simulation: whether a structured buffer has any elements, from its
+    // descriptor's record count, the buffer itself not read; stored to the UAV.
+    let shader = translate(&native_of(
+        &[
+            0x7E02_020A, // v_mov_b32 v1, s10
+            0xE070_0000,
+            0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+        ],
+        4,
+        16,
+    ));
+    let data = [0u32; 4 * 9];
+    let buffer = View::Buffer {
+        data: &data,
+        stride: super::host::Stride::Structured(16),
+    };
+    for (label, words) in run(&shader, 0, buffer) {
+        // nine elements of 16 bytes
+        assert_eq!(words[0], 9, "{label}");
     }
 }
 
