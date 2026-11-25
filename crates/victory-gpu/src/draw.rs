@@ -2113,7 +2113,10 @@ impl State {
             // uploaded again with their bytes as its own large levels (#995's
             // runs n7-n14: the most re-uploaded slots 4, 8 and 16 KiB apart,
             // 344-684 KiB each; the blocks on the near surfaces at the bottom
-            // of the picture).
+            // of the picture). A neighbour whose view is older than the
+            // texture's does not end it: see `texture_own_bytes`
+            // (`VICTORY_OWN_BYTES=next`: any neighbour, as in #995; `=0`: the
+            // whole span, as before it).
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 let own = crate::descriptor::host::texture_own_bytes(at, len);
                 let now = crate::texture::fingerprint(at, own);
