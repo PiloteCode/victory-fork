@@ -483,6 +483,7 @@ impl Lanes {
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
+                destination_waits = DESTINATION_WAITS.swap(0, Ordering::Relaxed),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
@@ -958,22 +959,55 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    let count = (offset + len).div_ceil(PAGE);
+    // The page numbers as the title has them now: it may still be writing
+    // them (read each time, not kept).
+    let read_pages = || -> Vec<usize> {
+        (0..count)
+            // SAFETY: the title passes a page number per 64 KiB of
+            // destination, which holds at least `len` bytes from `offset`.
+            .map(|i| unsafe { std::ptr::read_volatile(request.destination.cast::<usize>().add(i)) })
+            .collect()
     };
+    let mut pages = read_pages();
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
+    // A page number not known yet: the title may fill the array after it
+    // enqueued the request, and a queue submits on its own once half full,
+    // so a worker can come to it first. (Failed at once, 302 requests of a
+    // burst at the opening's loading went unwritten in one run, 44 and 9 in
+    // others.) Read again for a while; a page still unknown then fails.
+    let waiting = std::time::Instant::now();
+    let mut tries = 0u32;
+    while !super::xmem::pages_known(&pages, offset, n) && waiting.elapsed() < std::time::Duration::from_millis(250) {
+        tries += 1;
+        if tries < 16 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        pages = read_pages();
+    }
+    if tries > 0 {
+        DESTINATION_WAITS.fetch_add(1, Ordering::Relaxed);
+        if super::xmem::pages_known(&pages, offset, n) {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| {
+                tracing::info!(
+                    tries,
+                    us = waiting.elapsed().as_micros() as u64,
+                    "dstorage: a destination's page numbers were known only after the request was taken (read again until they were)"
+                );
+            });
+        }
+    }
+    let known = super::xmem::pages_known(&pages, offset, n);
+    if known && super::xmem::write_physical(&pages, offset, &data[..n]) {
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result
@@ -984,11 +1018,17 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+            why = if known { "the host could not map them" } else { "a page number is unknown" },
+            "dstorage: a destination's physical pages could not be written; its request fails"
         );
         Err(E_INVALIDARG)
     }
 }
+
+/// Requests whose destination page numbers were read again because one was
+/// not known when a worker took the request.
+static DESTINATION_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).

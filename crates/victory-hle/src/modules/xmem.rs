@@ -536,6 +536,17 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Whether every page that `[offset, offset + len)` of `pages` reaches is
+/// a page the title allocated.
+pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
+    let end = offset.saturating_add(len.max(1));
+    let Some(pages) = pages.get(offset / PAGE..end.div_ceil(PAGE)) else {
+        return false;
+    };
+    let physical = physical();
+    pages.iter().all(|page| physical.pages.contains_key(page))
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
