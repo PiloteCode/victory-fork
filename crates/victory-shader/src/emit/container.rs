@@ -72,7 +72,11 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), then by name offset:
+    // of two elements packed into one register, the one first in element
+    // order comes first whatever its columns (a sort by column made the
+    // validator refuse 72 of the title's vertex, mesh and pixel programs:
+    // "does not match expected for module").
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -90,7 +94,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -399,6 +403,41 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two elements packed into one register are written in element order, not by column
+    /// (the title's packed pedestrian outputs: TEXCOORD22 in columns 1-2 of the register
+    /// whose column 0 is COLOR0, listed after it).
+    #[test]
+    fn rows_of_one_register_keep_the_element_order() {
+        let element = |name: &str, index, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let part = signature(
+            &[
+                element("TEXCOORD", 19, 13, 0, 3),
+                element("TEXCOORD", 22, 14, 1, 2),
+                element("COLOR", 0, 14, 0, 1),
+                element("TEXCOORD", 21, 15, 0, 3),
+            ],
+            false,
+        );
+        let u32_at = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap());
+        // (register, semantic index, mask) of each 32-byte row after the 8-byte header
+        let rows: Vec<(u32, u32, u8)> = (0..4)
+            .map(|k| 8 + 32 * k)
+            .map(|at| (u32_at(at + 20), u32_at(at + 8), part[at + 24]))
+            .collect();
+        assert_eq!(rows, [(13, 19, 0b111), (14, 22, 0b110), (14, 0, 0b1), (15, 21, 0b111)]);
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
