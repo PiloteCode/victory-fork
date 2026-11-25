@@ -44,6 +44,9 @@ static RESERVATIONS: Mutex<BTreeMap<usize, Reservation>> = Mutex::new(BTreeMap::
 /// at an address of its choice), with the title's own `kind`, XMem `flags`
 /// and console `protect` (before the runtime cleans them).
 pub fn title_memory_reserved(at: usize, len: usize, kind: u32, flags: u64, protect: u32) {
+    if at != 0 && len != 0 {
+        crate::uheap::reserved(at, len, kind, flags, protect);
+    }
     if !(on() || skip_wc_back()) || at == 0 || len == 0 {
         return;
     }
@@ -120,9 +123,20 @@ pub(crate) fn skip_back(start: u64, bytes: u64) -> bool {
 }
 
 /// Host resources made, by where: count and bytes ([`made`]).
-const KINDS: [&str; 9] = ["read-back", "upload", "shared", "uav", "texture", "reserved texture", "depth twin", "placed in title memory", "host list"];
-static MADE: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
-static MADE_LAST: Mutex<[u64; 18]> = Mutex::new([0; 18]);
+const KINDS: [&str; 10] = [
+    "read-back",
+    "upload",
+    "shared",
+    "uav",
+    "texture",
+    "reserved texture",
+    "depth twin",
+    "placed in title memory",
+    "host list",
+    "gpu upload heap",
+];
+static MADE: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+static MADE_LAST: Mutex<[u64; 20]> = Mutex::new([0; 20]);
 
 /// With the census on: a host resource of kind `kind` ([`KINDS`]) and
 /// `bytes` (0 when not known) was asked of the device.
@@ -208,7 +222,7 @@ pub(crate) fn fetched(start: u64, bytes: u64) {
 }
 
 /// The console protection bits the runtime drops, spelled out.
-fn protect_words(p: u32) -> String {
+pub(crate) fn protect_words(p: u32) -> String {
     let mut w = Vec::new();
     if p & 0x400 != 0 {
         w.push("WC");
@@ -324,7 +338,7 @@ fn report_if_due() {
     {
         use std::sync::atomic::Ordering;
         let mut last = MADE_LAST.lock().unwrap_or_else(|e| e.into_inner());
-        let now_made: [u64; 18] = std::array::from_fn(|i| MADE[i].load(Ordering::Relaxed));
+        let now_made: [u64; 20] = std::array::from_fn(|i| MADE[i].load(Ordering::Relaxed));
         let parts: Vec<String> = KINDS
             .iter()
             .enumerate()

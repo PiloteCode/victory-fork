@@ -1322,6 +1322,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    crate::uheap::page_written(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1591,6 +1592,7 @@ pub(crate) fn remap_hooks_line(frames: f64) {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::uheap::remapped(at, len);
     #[cfg(feature = "diagnostics")]
     let mut part = std::time::Instant::now();
     // A placed texture there arrives, goes or changes with no descriptor

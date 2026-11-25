@@ -324,6 +324,28 @@ writes are copied into upload memory on the CPU (they are not on the
 programs exact at about 2.9 times their DXIL size (a thread runs two console
 lanes, at half the threads): not timed in a run yet.
 
+### GPU upload heaps: title memory in the card's own memory? (study, first step)
+
+The console has one memory; here every byte the title's processor writes for
+the card is found (write watch or guard), copied, sent up, and what shaders
+write comes back. Direct3D 12's GPU upload heaps (video memory the processor
+writes through a resizable BAR; on this machine the BAR is 32 GB and the
+system runtime, SDK version 616, has them) could hold title memory itself, with
+nothing to copy either way. What stands in the way: the processor sees such
+memory where the kernel maps it, while the title places its pages itself
+(`XMemMapPhysicalPages` into placeholders it reserved, some pages at several
+addresses at once), and its busiest buffer, the 174 MiB pool at 0x34750000 that
+every settle of a gameplay frame waits on (60-95 ms a frame), is 32-bit
+physical-page memory; and the processor reads video memory uncached, so nothing
+it reads may live there. A first step behind `VICTORY_GPU_UPLOAD_HEAP=1` moves
+only what the processor never reads back (scratch memory, texture staging) and
+probes the rest; `VICTORY_GPU_UPLOAD_TALLY=1` counts, per title reservation,
+what moving it would take. Putting the pool itself in video memory (its pages'
+bytes kept there, the layer's reads of it done on the card) is the step that
+would remove the settles; whether it can be done depends on what the probe and
+the tally report (a mapping below 4 GiB, no aliased or remapped pages there).
+Not timed in a game run yet.
+
 ### Upstream's second night, merged (f85101b)
 
 Where upstream and this fork had each done the same thing, one was kept:
@@ -732,6 +754,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_VIEW_SET=0` | the guards' checks of view memory walk every block of a range, as before (by default they are answered from the view blocks that are not clean, and a block found uncommitted in a placeholder is parked until the runtime maps it; `VICTORY_PARK_EPOCH=<n>`: submissions between looks at parked blocks that are no placeholder, 32) |
 | `VICTORY_CENSUS=1` | every 10 s (`VICTORY_CENSUS_SECONDS=<s>`) a census of the card copies of title buffers: the reservation each lies in with the flags the title asked for, bytes sent up and fetched back a frame; and the host resources made a frame, by kind |
 | `VICTORY_SKIP_WC_BACK=1`, `VICTORY_SKIP_WC_COMPARE=1` | experiments, off: what shaders wrote to card copies of write-combining title memory is not fetched back (`_COMPARE`: those copies are not hashed or compared either); right only if the title's processor never reads what the card wrote there |
+| `VICTORY_GPU_UPLOAD_HEAP=1` | off by default: the lists' scratch memory and texture staging buffers, which the processor only writes, are made in GPU upload heaps (the card's memory, written through the resizable BAR) instead of upload memory, where the device has them (`OPTIONS16`; said in the log at device creation in every run); and a probe runs once (where such a mapping lands, also with room made below 4 GiB; processor write and read speeds through the BAR; the card's copy speeds). `=probe`: the probe alone |
+| `VICTORY_GPU_UPLOAD_TALLY=1` | logging only: per title reservation of 1 MB or more the runtime placed, what the layer copies and reads of it per frame and how the title maps pages there (remaps, pages shown at another address, DirectStorage writes, textures staged there): what it would take for that memory to be the card's own |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_MESH_LINK=0` | a mesh pipeline whose mesh program's outputs pass 32 KiB is made of the shared translations, as before, not of the pair linked for it (or, without a pixel program, of the mesh program with its system values only) |

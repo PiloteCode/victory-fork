@@ -82,6 +82,8 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod uheap;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
@@ -90,6 +92,8 @@ pub use host::on_failure;
 pub use census::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use uheap::{LowRoom, set_low_room};
 #[cfg(windows)]
 pub use watch::{
     title_memory_committed, title_memory_reading, title_memory_reading_range, title_memory_remapped,
