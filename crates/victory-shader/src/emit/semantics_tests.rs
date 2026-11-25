@@ -1278,6 +1278,37 @@ fn arithmetic_matches_the_hardware() {
     assert_clean(check(&passing(arithmetic_probes())));
 }
 
+/// The legacy multiply and multiply-add of a register by itself (`x * x`), which the lowering
+/// takes as the plain multiply (`VICTORY_LEGACY_SQUARE`, on by default): the console's
+/// results over zeros, infinities, NaNs and denormals, with the rule and without it.
+#[test]
+fn a_legacy_square_is_the_consoles() {
+    // (the rule applies: the program differs with it)
+    let lowered = |on: bool| {
+        let was = super::lower::TEST_LEGACY_SQUARE.replace(Some(on));
+        let shader = lower_program(&program(&[vop2(0x07, 5, v(1), 1)], false));
+        super::lower::TEST_LEGACY_SQUARE.set(was);
+        shader.expect("lowered").dxil
+    };
+    assert_ne!(lowered(true), lowered(false), "a square without its compare and select");
+    let squares = pairs(F32_EDGES, &[0]);
+    let roots = triples(F32_EDGES, &[0], F32_THIRD);
+    for on in [true, false] {
+        let was = super::lower::TEST_LEGACY_SQUARE.replace(Some(on));
+        let probes = vec![
+            // v_mul_legacy_f32 v5, v1, v1
+            probe([vop2(0x07, 5, v(1), 1)], squares.clone(), F32, |i| vec![mul_legacy(i[0], i[0])]),
+            // v_mov_b32 v5, v3; v_mac_legacy_f32 v5, v1, v1
+            probe([vop1(0x01, 5, v(3)), vop2(0x06, 5, v(1), 1)], roots.clone(), tolerant(1, NONE), |i| {
+                vec![mad_legacy(i[0], i[0], i[2])]
+            }),
+        ];
+        let failures = check(&probes);
+        super::lower::TEST_LEGACY_SQUARE.set(was);
+        assert_clean(failures);
+    }
+}
+
 /// Minimum, maximum, median, and `v_max_f32 x, x clamp` (the title's
 /// saturate) with NaN, -0 and denormals.
 fn min_max_probes() -> Vec<Probe> {

@@ -339,6 +339,10 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// With `split_lds` and [`lds_reads_on`]: the host block whose last LDS access was a read
+    /// after its meeting, which a read that follows in that block needs no meeting of its
+    /// own after.
+    lds_read_met: Option<usize>,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -365,6 +369,12 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange`: two pairs of exchange dwords for each console wave, taken in turn
+    /// ([`exchange2_on`]), and per host block the pair its next exchange takes with the
+    /// meeting after the last one's reads (taken out again when another exchange follows in
+    /// that block).
+    exchange_two: bool,
+    exchange_turn: HashMap<usize, (bool, Option<V>)>,
     /// With `exchange`, in a program for dispatches by thread counts ([`with_thread_limits`]):
     /// whether the other host wave of this thread's console wave has a launched thread (made
     /// in the entry block). One that has none has left, and its exchange dword holds 0.
@@ -1051,6 +1061,84 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_WAVE_EXCHANGE2=1`: the two host waves of a console wave exchange through two
+/// pairs of dwords taken in turn, and meet once an exchange instead of twice where another
+/// exchange follows in the same host block ([`Lower::exchange_halves`]). Off by default.
+pub(super) fn exchange2_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EXCHANGE2.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EXCHANGE2").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_LEGACY_MUL=ieee`: `v_mul_legacy_f32`, `v_mac_legacy_f32` and `v_mad_legacy_f32`
+/// multiply as the host does, without D3D9's `0 × anything = 0` (a zero times an infinity or
+/// a NaN gives a NaN, a zero's sign is the product's). Not the console's results: a
+/// measurement of what the exact form costs on the card, the title's most frequent
+/// instruction being `v_mul_legacy_f32`, which the exact form makes a multiply, two compares,
+/// an OR and a select. Off by default.
+fn legacy_mul_ieee() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LEGACY_MUL").is_ok_and(|v| v.trim() == "ieee"))
+}
+
+/// A legacy multiply of a value by itself is the plain multiply (the same bits: `±0 × ±0`
+/// is +0, and a value that is not zero gives the host's product either way); on by default,
+/// `VICTORY_LEGACY_SQUARE=0` turns it off.
+fn legacy_square_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LEGACY_SQUARE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_SQUARE").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_WAVE_LDS_READS=1`: where the two host waves of a console wave meet before each LDS
+/// access (`split_lds`), an LDS read right after another in the same host block goes without
+/// its meeting. Off by default.
+pub(super) fn lds_reads_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_READS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_LDS_READS").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_WAVE_BASE_DIRECT=1`: a console wave64 program in host waves of 32 whose host group
+/// has one dimension numbers its host waves from their first thread index
+/// ([`Lower::wave_base`]), not from an LDS counter the group meets around at its start. Off by
+/// default: it takes NVIDIA's and AMD's order of a one-dimension group's threads in waves,
+/// which D3D12 does not promise.
+pub(super) fn base_direct_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BASE_DIRECT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`exchange2_on`], for its thread only.
+    pub(super) static TEST_EXCHANGE2: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The meetings left out on this thread: exchanges' second ones ([`Lower::exchange_halves`])
+    /// and those before LDS reads that follow a read ([`lds_reads_on`]).
+    pub(super) static TEST_MEETINGS_DROPPED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A test's choice for [`lds_reads_on`], for its thread only.
+    pub(super) static TEST_LDS_READS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`legacy_square_on`], for its thread only.
+    pub(super) static TEST_LEGACY_SQUARE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`base_direct_on`], for its thread only.
+    pub(super) static TEST_BASE_DIRECT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The wave bases made from thread indices on this thread ([`Lower::wave_base`]).
+    pub(super) static TEST_BASES_DIRECT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -1319,6 +1407,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // with `exchange`: two pairs of exchange dwords a console wave (`exchange2_on`)
+        let mut exchange_two = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
@@ -1421,8 +1511,18 @@ impl<'a> Lower<'a> {
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
+                                // (two pairs of them with `exchange2_on`, where the group's LDS
+                                // still fits: not for a group cut short by thread counts, whose
+                                // departed half leaves 0 in its dword of the first pair only)
+                                let waves = group.div_ceil(64);
+                                exchange_two = group > 32
+                                    && exchange2_on()
+                                    && !LOCAL_WAVES.get()
+                                    && !THREAD_LIMITS.get()
+                                    && super::group_sync() != 0
+                                    && s.lds_dwords + 4 * waves <= 8192;
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += (if exchange_two { 4 } else { 2 }) * waves;
                             }
                         }
                     }
@@ -1626,6 +1726,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_read_met: None,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -1654,6 +1755,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            exchange_two,
+            exchange_turn: HashMap::new(),
             partner_live: None,
             halves,
             wave_base: None,
@@ -4061,6 +4164,16 @@ impl<'a> Lower<'a> {
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        // (`VICTORY_LEGACY_MUL=ieee`, a measurement: the host's multiply as it is)
+        if legacy_mul_ieee() {
+            return m;
+        }
+        // A value times itself is +0 for either zero, as D3D9's rule gives it, and the host's
+        // product otherwise: the multiply alone, bit for bit (`VICTORY_LEGACY_SQUARE=0`: the
+        // compare and select as for any two values).
+        if a == b && legacy_square_on() {
+            return m;
+        }
         let zero = self.s.m.f32(0);
         if super::lean_math() >= 1 {
             // The same values for every input, with fewer tests: the result is
@@ -4198,13 +4311,34 @@ impl<'a> Lower<'a> {
     /// consecutive thread indices (NVIDIA's 8 x 8 groups), so each wave takes the next 32 (64)
     /// from an LDS counter instead: every thread zeroes it, the group meets, each wave's first
     /// lane adds 32 (64) and the wave takes what it found. Branch-free, in the entry block,
-    /// which every thread runs.
+    /// which every thread runs. With [`base_direct_on`], a host group of one dimension takes
+    /// its wave's first thread index instead.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
+        if base_direct_on() && matches!(self.s.threads, Some([_, 1, 1])) {
+            // A host group of one dimension (the paired form's always): NVIDIA and AMD give
+            // each wave a run of 32 thread indices in a row, the first a multiple of 32, as
+            // the lowering already takes it for a console wave run as one host wave. The
+            // wave's first index rounded down, with no LDS and no meeting.
+            let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+            let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
+            let mask = self.s.m.i32(!31);
+            let mut base = self.s.m.bin(e, Bin::And, first, mask);
+            if self.twin.is_some() {
+                // (two console lanes a thread: host wave n is console wave n)
+                let one = self.s.m.i32(1);
+                base = self.s.m.bin(e, Bin::Shl, base, one);
+            }
+            self.s.flags |= flags::WAVE_OPS;
+            #[cfg(test)]
+            TEST_BASES_DIRECT.set(TEST_BASES_DIRECT.get() + 1);
+            self.wave_base = Some(base);
+            return Some(base);
+        }
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
@@ -4275,10 +4409,10 @@ impl<'a> Lower<'a> {
     }
 
     /// A group barrier with an LDS fence in `block`.
-    fn group_sync(&mut self, block: usize) {
+    fn group_sync(&mut self, block: usize) -> V {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode])
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -4302,7 +4436,16 @@ impl<'a> Lower<'a> {
             return (lo, hi);
         }
         // the pair of dwords of this thread's console wave: its half's, then both
-        let pair = self.exchange_pair(slot);
+        let mut pair = self.exchange_pair(slot);
+        // (`exchange_two`) the other pair than the last exchange of this host block took
+        let (second, before) = match self.exchange_two {
+            true => self.exchange_turn.get(&at).copied().unwrap_or((false, None)),
+            false => (false, None),
+        };
+        if second {
+            let two = self.s.m.i32(2);
+            pair = self.s.m.bin(at, Bin::Add, pair, two);
+        }
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -4318,12 +4461,26 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        self.group_sync(at);
+        let after = self.group_sync(at);
+        if self.exchange_two {
+            // The last exchange of this host block took the other pair, and every thread read
+            // it before the meeting above (its reads come first in the block): that pair is
+            // written again, by the exchange after this one, only past this one's meeting. So
+            // the last exchange's second meeting goes; the last of the block keeps its own,
+            // which every later write of either pair comes after.
+            if let Some(b) = before {
+                self.s.m.unlink(at, b);
+                #[cfg(test)]
+                TEST_MEETINGS_DROPPED.set(TEST_MEETINGS_DROPPED.get() + 1);
+            }
+            self.exchange_turn.insert(at, (!second, Some(after)));
+        }
         (lo, hi)
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// block): a group of several console waves has a pair for each (two with
+    /// `exchange_two`, the second two dwords on).
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -4332,7 +4489,7 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
+        let one = self.s.m.i32(if self.exchange_two { 2 } else { 1 });
         let twice = self.s.m.bin(e, Bin::Shl, wave, one);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
@@ -5099,9 +5256,19 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // (`VICTORY_WAVE_LDS_READS=1`: a read right after a read in the same host block
+            // needs no meeting of its own. Neither half writes between the two, and each
+            // half's next write comes after a meeting that both reads come before.)
+            let read = name.starts_with("ds_read");
+            if !(read && lds_reads_on() && self.lds_read_met == Some(self.cur)) {
+                let mode = self.s.m.i32(meeting_mode());
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            } else {
+                #[cfg(test)]
+                TEST_MEETINGS_DROPPED.set(TEST_MEETINGS_DROPPED.get() + 1);
+            }
+            self.lds_read_met = (read && lds_reads_on()).then_some(self.cur);
         }
         // (a guard with no host value: the instruction's own lowering says so where it needs it)
         self.raw_use = self.raw_use_for(b, i, inst).unwrap_or(None);

@@ -9,6 +9,22 @@ use super::{
     Val, Why, flags, need, pred, quad,
 };
 
+/// `a` again for the second source `b` of a legacy multiply whose two sources are one value
+/// (the same operand with the same modifiers, from this lane: no DPP or SDWA), so that the
+/// multiply knows it as a square (`super::legacy_square_on`); `b` otherwise.
+fn square_or(inst: &Inst, a: V, b: V) -> V {
+    let Fields::Valu(v) = &inst.fields else {
+        return b;
+    };
+    let same = v.dpp.is_none()
+        && v.sdwa.is_none()
+        && v.src.len() >= 2
+        && v.src[0] == v.src[1]
+        && (v.abs & 1 != 0) == (v.abs & 2 != 0)
+        && (v.neg & 1 != 0) == (v.neg & 2 != 0);
+    if same && super::legacy_square_on() { a } else { b }
+}
+
 impl Lower<'_> {
     pub(super) fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -431,7 +447,7 @@ impl Lower<'_> {
                     "v_sub_f32" => self.s.m.bin(c, Bin::Sub, a, bb),
                     "v_subrev_f32" => self.s.m.bin(c, Bin::Sub, bb, a),
                     "v_mul_f32" => self.s.m.bin(c, Bin::Mul, a, bb),
-                    "v_mul_legacy_f32" => self.legacy_mul(a, bb),
+                    "v_mul_legacy_f32" => self.legacy_mul(a, square_or(inst, a, bb)),
                     "v_max_f32" => self.max_min(true, a, bb),
                     _ => self.max_min(false, a, bb),
                 };
@@ -612,7 +628,7 @@ impl Lower<'_> {
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
-                        let m = self.legacy_mul(a, bb);
+                        let m = self.legacy_mul(a, square_or(inst, a, bb));
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                 };
@@ -621,7 +637,7 @@ impl Lower<'_> {
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
+                    self.legacy_mul(a, square_or(inst, a, bb))
                 } else {
                     self.s.m.bin(c, Bin::Mul, a, bb)
                 };

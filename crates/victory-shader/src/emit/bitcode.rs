@@ -459,6 +459,15 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// Takes instruction `v` out of `block` again (an effect made before the emitter knew it
+    /// is not needed): nothing is written for it, and the passes that walk the blocks no
+    /// longer see it.
+    pub fn unlink(&mut self, block: usize, v: V) {
+        if let V::Inst(i) = v {
+            self.blocks[block].body.retain(|&x| x != i);
+        }
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
