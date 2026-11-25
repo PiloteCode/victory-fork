@@ -11108,10 +11108,11 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(i32t);
         let record = k * LOOP_NOTE_DWORDS * 4;
         // The loop's first code byte plus 1 (0: no record), then the count.
-        let (at, first) = (self.s.m.i32(record), self.s.m.i32(self.x.p.blocks[header].offset as u32 + 1));
+        let at = self.s.m.i32(record);
+        let first = self.s.m.i32(self.x.p.blocks[header].offset as u32 + 1);
         let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
-        self.s
-            .op(n, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, at, iu, first, iu, iu, iu, mask, align]);
+        let args = [h, at, iu, first, iu, iu, iu, mask, align];
+        self.s.op(n, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
         let (add, one) = (self.s.m.i32(0), self.s.m.i32(1));
         let count = self.s.m.i32(record + if killed { 8 } else { 4 });
         self.s
@@ -11127,7 +11128,15 @@ impl<'a> Lower<'a> {
     /// those that wanted to take the back edge when it is the branch's taken
     /// side (`back_taken`), those that did not otherwise. The block the branch
     /// now goes to, and the one `to` is now entered from.
-    fn note_exit(&mut self, b: usize, to: usize, via: usize, header: usize, wanted: V, back_taken: bool) -> (usize, usize) {
+    fn note_exit(
+        &mut self,
+        b: usize,
+        to: usize,
+        via: usize,
+        header: usize,
+        wanted: V,
+        back_taken: bool,
+    ) -> (usize, usize) {
         let (test, join) = (self.s.m.new_block(), self.s.m.new_block());
         let note = self.note_block(header, false, join);
         let term = if back_taken {
