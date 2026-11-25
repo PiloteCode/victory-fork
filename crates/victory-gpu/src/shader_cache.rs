@@ -106,6 +106,23 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// The translation of a console compute program for dispatches by thread
+/// counts whose last groups are cut short
+/// (`victory_shader::emit::translate_thread_limited`), from the cache when
+/// there is one, under a key of its own.
+pub(crate) fn host_shader_thread_limited(container: &[u8]) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| victory_shader::emit::translate_thread_limited(c).map_err(|e| e.to_string());
+    match CACHE.get() {
+        Some(cache) => {
+            let mut key = blake3::Hasher::new();
+            key.update(&build());
+            key.update(b"thread counts\0");
+            cached(cache, key.finalize().as_bytes(), container, translate)
+        }
+        None => translate(container),
+    }
+}
+
 /// The cache entry's converter: the build and the container in, the
 /// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
