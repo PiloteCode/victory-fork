@@ -249,6 +249,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Of them, the large ones ([`LARGE_TABLE`]) by table: the records each
+    /// was made from and its first dynamic slot. A draw that reads less of
+    /// one takes it if the records it reads are the same ([`table_longest`]).
+    large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -294,10 +298,49 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.large_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
     }
+}
+
+/// Tables of this many entries and more are made at the longest length
+/// shaders read them to ([`table_longest`]).
+const LARGE_TABLE: u32 = 64;
+
+/// Whether a large descriptor table made afresh is made at the longest
+/// length any shader has read it to, and a draw that reads less of it
+/// takes one made for a longer read while the entries it reads are the
+/// same (on by default; `VICTORY_TABLE_LONGEST=0` makes each at the length
+/// its draw reads, as before).
+///
+/// Shaders read the world's big tables to many lengths, and each length
+/// was a copy of its own: a run of Belobug's fork ran its 524,288 dynamic
+/// slots out after six minutes (draws dropped), copies of one table at
+/// several lengths taking most of them; with this its peak was 369,107,
+/// none refused (its df715461). Ours are 262,144 on a card that caps view
+/// heaps at 1,000,000 views, and the opening cutscene refused up to 721
+/// tables a frame.
+fn table_longest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_LONGEST").is_none_or(|v| v != "0"))
+}
+
+/// The longest table `table` of `heap` has been asked for, now that a draw
+/// asks for `n` entries: that length if the heap has slots for all of it
+/// and the dynamic slots can hold it, else `n`.
+fn longest_read(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
+    static LONGEST: std::sync::Mutex<Option<std::collections::HashMap<u64, u32>>> = std::sync::Mutex::new(None);
+    let most = {
+        let mut all = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
+        let most = all.get_or_insert_default().entry(table).or_insert(n);
+        *most = (*most).max(n);
+        *most
+    };
+    let fits = most <= crate::descriptor::host::DYNAMIC
+        && table.checked_add(u64::from(most - 1) * 32).and_then(|last| heap.index(last)).is_some();
+    if fits { most } else { n }
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
@@ -2847,6 +2890,27 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            // A large table: made at the longest read of it, and one made
+            // for a longer read whose entries this draw reads are the same
+            // serves it ([`table_longest`]).
+            let needed = n;
+            let large = table_longest() && n >= LARGE_TABLE;
+            let n = if large { longest_read(heap, table, n) } else { n };
+            let records: Vec<[u32; 3]> = if large {
+                (0..n)
+                    // SAFETY: descriptor slots in title memory (the heap has them all).
+                    .map(|k| unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let longer = large
+                .then(|| {
+                    let made = self.large_tables.get(&table)?;
+                    let at = needed as usize;
+                    made.iter().find(|(r, _)| r.len() >= at && r[..at] == records[..at]).map(|&(_, first)| first)
+                })
+                .flatten();
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -2858,7 +2922,11 @@ impl State {
                 }
                 (table, n, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            #[cfg(feature = "diagnostics")]
+            if longer.is_some() {
+                crate::copystat::add(crate::copystat::C::TablesPrefix, 1);
+            }
+            if let Some(&first) = longer.as_ref().or_else(|| self.fresh_tables.get(&key)) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2879,13 +2947,29 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            // No room for the longest read: the length this draw reads, kept
+            // for this draw alone.
+            let (n, first) = match host.dynamic(n) {
+                Some(first) => (n, Some(first)),
+                None if n > needed => (needed, host.dynamic(needed)),
+                None => (n, None),
+            };
+            let Some(first) = first else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            if n == key.1 {
+                self.fresh_tables.insert(key, first);
+                if large {
+                    #[cfg(feature = "diagnostics")]
+                    if n > needed {
+                        crate::copystat::add(crate::copystat::C::TablesLonger, 1);
+                    }
+                    self.large_tables.entry(table).or_default().push((records, first));
+                }
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
