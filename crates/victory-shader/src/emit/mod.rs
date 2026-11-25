@@ -93,6 +93,8 @@ mod descriptor_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+#[cfg(all(test, windows))]
+mod loop_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
@@ -103,6 +105,7 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
+mod trip;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -123,31 +126,67 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    LOOP_NOTE_DWORDS, LOOP_NOTES, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    SLOT_FAULTS, SLOT_LOOPS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES,
+    USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit,
+    view_heap_limit,
 };
 
-/// The loop limit without an override: 2^20.
-pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+/// The iteration counts after which a translated loop whose end the data
+/// decides is left, per lane and per entry into the loop, by stage (a loop
+/// whose code fixes its count runs to its end: `trip`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopLimits {
+    pub pixel: u32,
+    /// Vertex and mesh programs.
+    pub vertex: u32,
+    pub compute: u32,
+    /// Compute programs that test rays against tree nodes (`image_bvh*`).
+    pub trace: u32,
+}
 
-/// The iteration count after which a translated loop is left, per lane and
-/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
+/// The limits without an override (see `lower::count_iteration`).
+pub const DEFAULT_LOOP_LIMITS: LoopLimits = LoopLimits {
+    pixel: lower::PIXEL_LOOP_LIMIT,
+    vertex: lower::VERTEX_LOOP_LIMIT,
+    compute: lower::COMPUTE_LOOP_LIMIT,
+    trace: lower::TRACE_LOOP_LIMIT,
+};
+
+/// The iteration limits of translated loops: [`DEFAULT_LOOP_LIMITS`].
 ///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
-/// every lane of a full-screen pass still runs for seconds (2^20 times a
-/// 4K screen is about 10^13 iterations); a much lower limit shows whether
-/// such loops are what makes a frame slow. The value is part of the
-/// translation, so the shader cache must key on it (`victory-gpu`'s does).
-pub fn loop_limit() -> u32 {
-    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
+/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` sets them
+/// instead: one number (decimal or `0x` hex, at least 1) for every stage,
+/// or `stage:number` pairs separated by commas for those stages alone
+/// (`pixel`, `vertex` for vertex and mesh, `compute`, `trace`), e.g.
+/// `pixel:1024,vertex:4096`. A loop that hits the limit in every lane of a
+/// full-screen pass runs for seconds at a million iterations; a much lower
+/// limit shows whether such loops are what makes a frame slow, a higher one
+/// whether the stage's loops need more. The limits are part of the
+/// translation, so the shader cache must key on them (`victory-gpu`'s does).
+pub fn loop_limits() -> LoopLimits {
+    static LIMITS: std::sync::OnceLock<LoopLimits> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
         if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
+            parse_loop_limits(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
         } else {
-            lower::LOOP_LIMIT
+            DEFAULT_LOOP_LIMITS
         }
+    })
+}
+
+/// Whether translated loops count the lanes that reach their iteration
+/// limit ([`SLOT_LOOPS`]): with the `diagnostics` feature,
+/// `VICTORY_LOOP_NOTES=1`. Each lane that reaches a limit adds one to its
+/// loop's record (a helper lane of a pixel shader writes nothing); the host
+/// logs the records by program. It adds a root UAV to every program with a
+/// loop, so it is off unless asked for. Part of the translation: the shader
+/// cache keys on it (`victory-gpu`'s does).
+pub fn loop_notes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_LOOP_NOTES").is_ok_and(|v| v.trim() == "1")
     })
 }
 
@@ -176,6 +215,17 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether a helper lane of a pixel program is its own first lane in the
+/// title's first-lane reads (`lower::Lower::helper_own`; on by default).
+/// `VICTORY_HELPER_OWN=0` turns it off: helper lanes then read the host
+/// wave's first lane, as before 2026-11-25, for telling what the fix changes
+/// on screen. Part of the translation: the shader cache keys on it (it is
+/// one of the switches `translation_fingerprint` reads).
+pub fn helper_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HELPER_OWN").map_or(true, |v| v.trim() != "0"))
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -219,7 +269,11 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
-    out.extend_from_slice(&loop_limit().to_le_bytes());
+    let limits = loop_limits();
+    for limit in [limits.pixel, limits.vertex, limits.compute, limits.trace] {
+        out.extend_from_slice(&limit.to_le_bytes());
+    }
+    out.push(u8::from(loop_notes()));
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out
@@ -237,19 +291,45 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
 }
 
-/// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
-/// unreadable or 0. Pure, for testing.
-fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
+/// `VICTORY_SHADER_LOOP_LIMIT`'s value ([`loop_limits`]); the defaults for
+/// what is unset, unreadable or 0. Pure, for testing.
+fn parse_loop_limits(value: Option<&str>) -> LoopLimits {
+    let number = |v: &str| {
+        let v = v.trim();
+        match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
+        }
+        .filter(|&n| n > 0)
+    };
+    let mut limits = DEFAULT_LOOP_LIMITS;
+    let Some(value) = value else {
+        return limits;
+    };
+    if let Some(n) = number(value) {
+        return LoopLimits {
+            pixel: n,
+            vertex: n,
+            compute: n,
+            trace: n,
+        };
     }
+    for pair in value.split(',') {
+        let Some((stage, n)) = pair.split_once(':') else {
+            continue;
+        };
+        let Some(n) = number(n) else {
+            continue;
+        };
+        match stage.trim() {
+            "pixel" => limits.pixel = n,
+            "vertex" => limits.vertex = n,
+            "compute" => limits.compute = n,
+            "trace" => limits.trace = n,
+            _ => {}
+        }
+    }
+    limits
 }
 
 /// A translated shader and what the host binds for it.
@@ -1077,8 +1157,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::bitcode::Attr;
-    use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{DEFAULT_LOOP_LIMITS, LoopLimits, parse_loop_limits};
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
@@ -1093,13 +1172,28 @@ mod tests {
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
-        assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
-        assert_eq!(parse_loop_limit(Some("4096")), 4096);
-        assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);
-        assert_eq!(parse_loop_limit(Some("1")), 1);
-        for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
-            assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        let all = |n| LoopLimits {
+            pixel: n,
+            vertex: n,
+            compute: n,
+            trace: n,
+        };
+        assert_eq!(parse_loop_limits(None), DEFAULT_LOOP_LIMITS);
+        assert_eq!(parse_loop_limits(Some("4096")), all(4096));
+        assert_eq!(parse_loop_limits(Some(" 0x1000 ")), all(4096));
+        assert_eq!(parse_loop_limits(Some("1")), all(1));
+        for bad in ["", "0", "-5", "lots", "0x", "4294967296", "pixel:0", "mesh:5"] {
+            assert_eq!(parse_loop_limits(Some(bad)), DEFAULT_LOOP_LIMITS, "{bad:?}");
         }
+        // Stages alone, the others as they are.
+        assert_eq!(
+            parse_loop_limits(Some("pixel:1024, vertex:0x1000,compute:bad")),
+            LoopLimits {
+                pixel: 1024,
+                vertex: 4096,
+                ..DEFAULT_LOOP_LIMITS
+            }
+        );
     }
     use super::container::SigElement;
     use super::shader::Shader;

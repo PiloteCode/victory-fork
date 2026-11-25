@@ -30,6 +30,19 @@ pub(super) mod intersect;
 #[path = "descriptor_data.rs"]
 mod descriptor_data;
 
+/// The iteration limit of translated loops and the loop notes, a child module so it shares the
+/// emitter's state.
+#[path = "loops.rs"]
+mod loops;
+#[cfg(test)]
+pub(super) use loops::TEST_NOTES;
+pub(super) use loops::{COMPUTE_LOOP_LIMIT, PIXEL_LOOP_LIMIT, TRACE_LOOP_LIMIT, VERTEX_LOOP_LIMIT};
+use loops::notes_on;
+/// Blocks every lane runs (the regions of lane branches), a child module.
+#[path = "regions.rs"]
+mod regions;
+use regions::{all_lane_blocks, lane_regions};
+
 /// 64-bit floats (the water volumetrics' wave sums of doubles, taken back as floats), a child
 /// module so it shares the emitter's state.
 #[path = "float64.rs"]
@@ -303,14 +316,28 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
+    /// Loop headers' iteration counters (see [`PIXEL_LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Loops whose code fixes how often they go round again
+    /// (`trip::constant_passes`), by header IR block.
+    passes: HashMap<usize, u32>,
+    /// Counted loops that go round by jumps back alone, innermost first: the
+    /// header and the blocks of the loop ([`Self::jump_loop_exit`]).
+    jump_loops: Vec<(usize, Vec<bool>)>,
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
-    /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
+    /// The block a loop stopped by its limit leaves the program from.
     abort: Option<usize>,
+    /// With loop notes ([`super::loop_notes`]): each counted loop's number in
+    /// its program's notes (`shader::SLOT_LOOPS`), by header IR block.
+    notes: Option<HashMap<usize, u32>>,
+    /// A pixel program that reads first lanes (`v_readfirstlane_b32`): what
+    /// scalar code makes of such a read may differ in helper lanes
+    /// ([`Self::helper_own`]), so every heap index is taken as one that may
+    /// differ between lanes.
+    helper_scalars: bool,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
     /// console lane of this thread, and whether the lane being lowered is the upper one (its
     /// console lane the host lane plus 32).
@@ -348,27 +375,6 @@ struct LaneState {
     clane: Option<V>,
 }
 
-/// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
-
-/// Iterations after which a loop of a program that tests rays against tree
-/// nodes is left, unless [`super::loop_limit`] names a limit for all.
-///
-/// A ray's walk of a well-formed tree visits some hundreds of nodes at
-/// most. The title's shadow-mask rays ran to the compute limit of 4,096: the
-/// trees of moving objects are built by the title's builder, which is off,
-/// so a walk into one follows whatever its memory holds. At 4,096 the
-/// shadow mask took 11.7 ms of the card a frame, at 1,024 2.4 ms (timing
-/// runs of the opening of the gameplay, RTX 5090); a ray stopped either way
-/// leaves the program as killed, as before.
-pub(super) const TRACE_LOOP_LIMIT: u32 = 1 << 10;
-
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -401,82 +407,6 @@ pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
-/// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
-    let n = st.exits.len();
-    let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
-        for b in (0..n).filter(|&b| region[b]) {
-            all[b] = false;
-        }
-    }
-    Some(all)
-}
-
-/// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
-        match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
-            LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
-            }
-            LaneExit::End => {}
-            LaneExit::Indirect => return None,
-        }
-    }
-    // post-dominators (bitsets; a virtual exit after every End)
-    let words = n.div_ceil(64);
-    let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n).map(|b| if succ[b].is_empty() { let mut v = vec![0; words]; v[b / 64] |= 1 << (b % 64); v } else { full.clone() }).collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in (0..n).rev() {
-            if succ[b].is_empty() {
-                continue;
-            }
-            let mut v = full.clone();
-            for &t in &succ[b] {
-                for w in 0..words {
-                    v[w] &= pdom[t][w];
-                }
-            }
-            v[b / 64] |= 1 << (b % 64);
-            if v != pdom[b] {
-                pdom[b] = v;
-                changed = true;
-            }
-        }
-    }
-    let mut regions = Vec::new();
-    for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
-            continue; // a wave-wide or uniform branch: all lanes go the same way
-        }
-        // blocks reachable from the lane branch that do not post-dominate it
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = succ[d].clone();
-        while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
-                continue;
-            }
-            seen[b] = true;
-            stack.extend(succ[b].iter().copied());
-        }
-        regions.push((d, seen));
-    }
-    Some(regions)
-}
-
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
@@ -1427,8 +1357,16 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            passes: HashMap::new(),
+            jump_loops: Vec::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            notes: None,
+            helper_scalars: super::helper_own()
+                && x.native.stage == HwStage::Ps
+                && p.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
@@ -2148,7 +2086,7 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`PIXEL_LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -2158,7 +2096,19 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                if let Some(n) = super::trip::constant_passes(p, &self.rpo, b) {
+                    self.passes.insert(b, n);
+                }
             }
+        }
+        self.find_jump_loops();
+        if notes_on() {
+            // Numbered by their first code byte, which the host logs too.
+            let mut headers: Vec<usize> = self.counters.keys().copied().collect();
+            headers.sort_by_key(|&h| (p.blocks[h].offset, h));
+            let last = super::shader::LOOP_NOTES / super::shader::LOOP_NOTE_DWORDS - 1;
+            let numbered = headers.into_iter().enumerate().map(|(n, h)| (h, (n as u32).min(last)));
+            self.notes = Some(numbered.collect());
         }
         self.cur = self.s.entry;
         // Title memory written by address has no rasterizer-ordered form.
@@ -4400,7 +4350,33 @@ impl<'a> Lower<'a> {
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
+    /// A helper lane of a pixel shader takes its own `x` ([`Self::helper_own`]).
     fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
+        let (first, any) = self.first_lane_of_wave(x, guard);
+        (self.helper_own(x, first), any)
+    }
+
+    /// `first`, a first-lane read of `x`, or in a helper lane of a pixel shader `x` itself.
+    /// The console runs a pixel program's helper lanes as lanes of EXEC (whole-quad mode,
+    /// `s_wqm`), so a waterfall loop serves a helper lane in a pass of its own, with its own
+    /// descriptor. The host's wave operations leave helper lanes out (SM 6.6) and give them
+    /// undefined results: on an RTX 5090 a helper lane whose value no other lane of its wave
+    /// held never met it as the first lane, went round to the iteration limit and left with
+    /// what the loop computes never set (`loop_tests`), and its quad's derivatives read that
+    /// (the character skin and cloth program `94d281151ca58b4f` samples its layers in nine
+    /// such nested loops).
+    fn helper_own(&mut self, x: V, first: V) -> V {
+        if !self.s.pixel || !super::helper_own() {
+            return first;
+        }
+        let c = self.cur;
+        let i1t = self.s.t.i1;
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, i1t, 221, &[]);
+        self.s.m.select(c, helper, x, first)
+    }
+
+    /// [`Self::first_lane`] as the host's wave operations see the wave.
+    fn first_lane_of_wave(&mut self, x: V, guard: Option<V>) -> (V, V) {
         let c = self.cur;
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
@@ -5927,7 +5903,8 @@ impl<'a> Lower<'a> {
             if per_lane {
                 self.s.flags |= flags::WAVE_OPS;
                 let i32t = self.s.t.i32;
-                d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                d = self.helper_own(d, first);
             }
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
@@ -6191,8 +6168,9 @@ impl<'a> Lower<'a> {
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 // A waterfall loop's load at the first lane's offset reads
-                // each lane's own entry (see `resource::Waterfall`).
-                let per_lane = self.x.res.waterfall.loads.contains(load);
+                // each lane's own entry (see `resource::Waterfall`); in a
+                // pixel program a helper lane may have an offset of its own.
+                let per_lane = self.x.res.waterfall.loads.contains(load) || self.helper_scalars;
                 let h = self
                     .s
                     .heap_handle(self.cur, index, sampler, per_lane, props);
@@ -6260,7 +6238,7 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, phi, sampler, self.helper_scalars, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -6278,7 +6256,7 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, index, sampler, self.helper_scalars, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
@@ -10694,7 +10672,10 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let mut abort = self.abort_block();
+                if self.notes.is_some() {
+                    abort = self.note_block(t, true, abort);
+                }
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -10740,25 +10721,66 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
+                let wanted = cond;
+                // A loop that goes round by jumps back alone is left at the
+                // limit where it can leave, so the lane goes on with the
+                // program (its jump back still ends the lane, for a way round
+                // that passes no exit). Taken out of the program there, the
+                // pixels of PS_Textured_Eight's runaway search of its shadow
+                // cascades were discarded: holes in the objects it draws.
+                let leaves = if back(self, taken) || back(self, not_taken) {
+                    None
+                } else {
+                    self.jump_loop_exit(b, taken, not_taken)
+                };
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                } else if let Some((h, stay_taken)) = leaves {
+                    if stay_taken {
+                        let ok = self.limit_test(h, pred::IULT);
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    } else {
+                        let stop = self.limit_test(h, pred::IUGE);
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    }
                 } else {
                     cond
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                let (mut t, mut f) = (self.edge(b, taken), self.edge(b, not_taken));
+                // With loop notes, the exit of a counted back edge passes a
+                // block that counts the lanes leaving at the limit.
+                // (the header, and whether the way that stays in the loop is `taken`)
+                let header = match [taken, not_taken].into_iter().find(|&h| back(self, h)) {
+                    Some(h) => Some((h, h == taken)),
+                    None => leaves,
+                };
+                let noted = match header {
+                    Some((h, true)) if self.notes.is_some() => {
+                        let (x, pred) = self.note_exit(b, not_taken, f, h, wanted, true);
+                        f = x;
+                        Some((not_taken, pred))
+                    }
+                    Some((h, false)) if self.notes.is_some() => {
+                        let (x, pred) = self.note_exit(b, taken, t, h, wanted, false);
+                        t = x;
+                        Some((taken, pred))
+                    }
+                    _ => None,
+                };
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
-                        } else {
-                            via
+                        // From an edge block, or from here (or from the
+                        // block after a note).
+                        let from = match noted {
+                            Some((n, pred)) if n == to => pred,
+                            _ if Some(via) == self.block[to] => self.cur,
+                            _ => via,
                         };
                         self.enter_loop(b, to, from);
                     }
@@ -10779,70 +10801,6 @@ impl<'a> Lower<'a> {
         let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
         Ok(())
-    }
-
-    /// A forward edge into loop header `to` (from DXIL block `via`) starts
-    /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
-            let z = self.s.m.i32(0);
-            incoming.push((z, via));
-        }
-    }
-
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
-        let (phi, _) = self.counters[&to];
-        let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
-        self.s.m.tag(phi, Tag::Counter);
-        self.s.m.tag(next, Tag::Counter);
-        // Per stage unless the switch names one: a loop that never meets its
-        // exit (a count read from a buffer the host has not got yet, say)
-        // runs to the limit in every lane. A million iterations a pixel
-        // hung the GPU for seconds a draw until Windows reset it
-        // (PS_Textured_Eight, 2026-11-24, run 12).
-        // shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
-        // past 256 or a compute loop past 4,096 is cut short. (They were
-        // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
-        // 14-25 frames in, in a minimap or shadow mesh draw; with every
-        // loop cut at 64 it ran 90 frames. Raise them again once shaders
-        // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
-        over
-    }
-
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
-    fn abort_block(&mut self) -> usize {
-        if let Some(a) = self.abort {
-            return a;
-        }
-        let a = self.s.m.new_block();
-        if self.s.pixel {
-            let t = self.s.m.bool(true);
-            self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
-        }
-        self.s.m.terminate(a, Term::Ret);
-        self.abort = Some(a);
-        a
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
@@ -11475,6 +11433,51 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    #[test]
+    fn a_loop_each_lane_leaves_on_its_own_is_no_code_every_lane_runs() {
+        // The waterfall loop in one block, its branch back on the lanes still
+        // waiting: every lane runs its first pass, only those still waiting
+        // the next ones, so two host waves cannot meet there.
+        use crate::resource::tests::cmpx_waterfall;
+        for wave64 in [false, true] {
+            let words = cmpx_waterfall(wave64, true);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, wave64, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            use crate::structure::LaneExit;
+            let back =
+                |b: usize| matches!(st.exits[b], LaneExit::Branch { taken, .. } if taken == b);
+            let looped = (0..p.blocks.len())
+                .find(|&b| back(b))
+                .expect("a block that branches back to itself");
+            assert!(!all[looped], "wave64 {wave64}");
+            // The code before the loop and after it still is.
+            assert!(all[0], "wave64 {wave64}");
+            assert!(all[p.blocks.len() - 1], "wave64 {wave64}");
+        }
+        // A loop that goes round on a scalar count, with a lane branch inside it that does
+        // not leave it: only the branch's own arm is code not every lane runs.
+        let words = [
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0 (byte 4: the loop)
+            0xBE87_3C6A, // s_and_saveexec_b32 s7, vcc_lo
+            0xBF88_0001, // s_cbranch_execz (past the arm)
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1 (byte 16: the arm)
+            0x887E_077E, // s_or_b32 exec_lo, exec_lo, s7 (byte 20)
+            0x8006_8106, // s_add_u32 s6, s6, 1
+            0xBF07_8406, // s_cmp_lg_u32 s6, 4
+            0xBF85_FFF8, // s_cbranch_scc1 (back to byte 4)
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let at = |offset| (0..p.blocks.len()).find(|&b| p.blocks[b].offset == offset).unwrap();
+        assert!(all[at(4)] && all[at(20)] && !all[at(16)]);
     }
 
     #[test]
