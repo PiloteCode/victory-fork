@@ -1135,6 +1135,19 @@ fn base_direct_any_shape() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "2"))
 }
 
+/// `VICTORY_WAVE_BASE_FREE=1`: the wave bases of [`Lower::wave_base`] from the LDS counter
+/// without its reset and without the group's meeting at the entry, where the counter is a
+/// dword of its own (past the program's LDS) and the host group has a power of two of host
+/// waves. Off by default.
+fn base_free_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BASE_FREE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_FREE").is_some_and(|v| v == "1"))
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`exchange2_on`], for its thread only.
@@ -1150,6 +1163,10 @@ thread_local! {
     pub(super) static TEST_BASE_DIRECT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// The wave bases made from thread indices on this thread ([`Lower::wave_base`]).
     pub(super) static TEST_BASES_DIRECT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A test's choice for [`base_free_on`], for its thread only.
+    pub(super) static TEST_BASE_FREE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The wave bases made without the entry's meeting on this thread ([`base_free_on`]).
+    pub(super) static TEST_BASES_FREE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -4374,7 +4391,8 @@ impl<'a> Lower<'a> {
     /// from an LDS counter instead: every thread zeroes it, the group meets, each wave's first
     /// lane adds 32 (64) and the wave takes what it found. Branch-free, in the entry block,
     /// which every thread runs. With [`base_direct_on`], a host group of one dimension takes
-    /// its wave's first thread index instead.
+    /// its wave's first thread index instead; with [`base_free_on`], the counter goes without
+    /// its reset and the meeting.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves?;
         if let Some(v) = self.wave_base {
@@ -4401,6 +4419,39 @@ impl<'a> Lower<'a> {
             self.wave_base = Some(base);
             return Some(base);
         }
+        let own_lds = matches!(self.x.native.io, StageIo::Cs(cs) if slot < cs.lds_bytes() / 4);
+        let waves = self.s.threads.map(|[x, y, z]| (x * y * z).div_ceil(32));
+        if base_free_on()
+            && !own_lds
+            && let Some(n) = waves.filter(|n| n.is_power_of_two())
+        {
+            // Without the reset and the meeting: each wave's first lane adds 1 to the counter,
+            // the other lanes 0, and the wave takes what its first lane found modulo the
+            // group's n host waves. The n adds of 1 find X, X + 1, ..., X + n - 1 in some
+            // order, X whatever the dword held (LDS starts undefined; the dword is ours, past
+            // the program's, and nothing else writes it), and n divides 2^32, so the residues
+            // are 0 .. n - 1 once each: the bases are distinct and the same set as the
+            // counter's from zero gives (in the order the waves came). No wave waits for
+            // another.
+            let lds = self.s.lds();
+            let k = self.s.m.i32(slot);
+            let ptr = self.s.m.element(e, lds, k);
+            let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+            let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+            let add = self.s.m.select(e, first, one, zero);
+            let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+            let found = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+            let mask = self.s.m.i32(n - 1);
+            let r = self.s.m.bin(e, Bin::And, found, mask);
+            let shift = self.s.m.i32(if self.twin.is_some() { 6 } else { 5 });
+            let base = self.s.m.bin(e, Bin::Shl, r, shift);
+            self.s.flags |= flags::WAVE_OPS;
+            #[cfg(test)]
+            TEST_BASES_FREE.set(TEST_BASES_FREE.get() + 1);
+            self.wave_base = Some(base);
+            return Some(base);
+        }
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
@@ -4417,7 +4468,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         // a counter in the program's own LDS (the paired form's, when it has no dword to
         // spare): every wave has its base before any thread runs the program
-        if matches!(self.x.native.io, StageIo::Cs(cs) if slot < cs.lds_bytes() / 4) {
+        if own_lds {
             self.group_sync(e);
         }
         self.wave_base = Some(base);
