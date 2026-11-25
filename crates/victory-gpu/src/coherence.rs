@@ -1526,10 +1526,33 @@ fn forget(at: usize, len: usize) {
     let mut l = lazy_state();
     let keys: Vec<usize> = l.owned.range(first..at.saturating_add(len)).map(|(&k, _)| k).collect();
     for key in keys {
-        l.owned.remove(&key);
+        // (What the addresses show now is read-write, the runtime says.)
+        if let Some(o) = l.owned.remove(&key) {
+            open(o.pages);
+        }
         add(FORGOTTEN, 1);
     }
     OWNED_N.store(l.owned.len(), Relaxed);
+}
+
+/// The tests' landing: title memory `[t0, t1)` (inside one piece) is left
+/// on a "card" that holds `card` there, as [`own`] leaves a piece.
+#[cfg(test)]
+fn own_fake(t0: usize, t1: usize, card: Vec<u8>, flight: u64) -> bool {
+    assert_eq!(card.len(), t1 - t0);
+    install_lazy();
+    let key = t0 / PIECE * PIECE;
+    let pages = pages_over(t0, t1);
+    let mut l = lazy_state();
+    l.ever.insert(key);
+    EVER.store(true, Relaxed);
+    l.owned.insert(key, Owned { copy: None, lo: t0, hi: t1, number: 0, pages, flight, fence: 0, fake: Some(Arc::new(card)) });
+    if !close(pages) {
+        l.owned.remove(&key);
+        return false;
+    }
+    OWNED_N.store(l.owned.len(), Relaxed);
+    true
 }
 
 thread_local! {
@@ -1828,6 +1851,174 @@ fn lazy_line(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The facts a landing looks up, and which of them leaves a piece
+    /// eager: the first that applies, in the order the line names them.
+    #[test]
+    fn a_piece_stays_eager_for_the_first_reason_that_applies() {
+        let ok = Facts {
+            ready: true,
+            card_buffer: true,
+            one_piece: true,
+            declared: 64 << 10,
+            back: false,
+            reservation: Some(false),
+            alone: true,
+            texture: false,
+            fill: false,
+            demoted: false,
+        };
+        assert_eq!(refusal(&ok, 256, true), None);
+        let with = |f: fn(&mut Facts)| {
+            let mut facts = ok;
+            f(&mut facts);
+            refusal(&facts, 256, true)
+        };
+        assert_eq!(with(|f| f.ready = false), Some(EAGER_READY));
+        assert_eq!(with(|f| f.card_buffer = false), Some(EAGER_CLASS));
+        assert_eq!(with(|f| f.one_piece = false), Some(EAGER_CLASS));
+        assert_eq!(with(|f| f.declared = 256), Some(EAGER_SMALL));
+        assert_eq!(with(|f| f.declared = 257), None);
+        assert_eq!(with(|f| f.back = true), Some(EAGER_BACK));
+        assert_eq!(with(|f| f.reservation = None), Some(EAGER_RESERVATION));
+        assert_eq!(with(|f| f.alone = false), Some(EAGER_SHARED));
+        assert_eq!(with(|f| f.texture = true), Some(EAGER_SHARED));
+        assert_eq!(with(|f| f.fill = true), Some(EAGER_FILL));
+        assert_eq!(with(|f| f.demoted = true), Some(EAGER_DEMOTED));
+        // Write-combining memory: lazy unless VICTORY_COPYBACK_LAZY_WC=0.
+        let wc = Facts { reservation: Some(true), ..ok };
+        assert_eq!(refusal(&wc, 256, true), None);
+        assert_eq!(refusal(&wc, 256, false), Some(EAGER_WC));
+        // Not ready comes first, whatever else holds.
+        let none = Facts { ready: false, card_buffer: false, declared: 0, ..ok };
+        assert_eq!(refusal(&none, 256, true), Some(EAGER_READY));
+    }
+
+    /// The pages closed for a piece's bytes, and ranges that meet.
+    #[test]
+    fn closed_pages_cover_the_bytes_and_ranges_meet() {
+        assert_eq!(pages_over(0x1_0010, 0x1_0020), (0x1_0000, 0x1_1000));
+        assert_eq!(pages_over(0x1_0000, 0x1_1000), (0x1_0000, 0x1_1000));
+        assert_eq!(pages_over(0x1_0fff, 0x1_1001), (0x1_0000, 0x1_2000));
+        let ranges = [(0x100, 0x200), (0x400, 0x500)];
+        assert!(touches(&ranges, 0x1ff, 0x300));
+        assert!(!touches(&ranges, 0x200, 0x400));
+        assert!(touches(&ranges, 0x0, 0x1000));
+        assert!(!touches(&[], 0, 10));
+    }
+
+    /// Reservations: write-watched private memory may be closed, a
+    /// placeholder for views may not; write-combining is told apart.
+    #[test]
+    fn only_write_watched_reservations_hold_pieces() {
+        {
+            let mut r = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+            r.insert(0x7_0000_0000, (0x7_1000_0000, true, false));
+            r.insert(0x7_2000_0000, (0x7_3000_0000, true, true));
+            r.insert(0x7_4000_0000, (0x7_5000_0000, false, false));
+        }
+        assert_eq!(reservation(0x7_0000_1000, 0x7_0001_0000), Some(false));
+        assert_eq!(reservation(0x7_2000_1000, 0x7_2001_0000), Some(true));
+        assert_eq!(reservation(0x7_4000_1000, 0x7_4001_0000), None);
+        // Past a reservation's end, or below the first.
+        assert_eq!(reservation(0x7_0fff_ff00, 0x7_1000_0100), None);
+        assert_eq!(reservation(0x6_ffff_0000, 0x6_ffff_1000), None);
+    }
+
+    /// One test for the closed pages (they share the owned pieces): a piece
+    /// left on the "card" is brought back by the first read in place (the
+    /// whole window), a write of the title lands on the card's bytes and
+    /// wins, a kernel read fails until the piece is brought back, a write
+    /// told before it lands brings it back first, a mapping change gives it
+    /// up, and a piece the title keeps touching first stays eager.
+    #[test]
+    fn owned_pieces_through_their_lives() {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // Two windows of our own write-watched memory (one more to align
+        // them), a pattern in it.
+        let len = 2 * WINDOW;
+        // SAFETY: memory of the test's own.
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), len + WINDOW, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(reserved, 0);
+        let base = reserved.next_multiple_of(WINDOW);
+        let title = |at: usize| (at as u32).wrapping_mul(0x9E37_79B1);
+        for at in (0..len).step_by(4) {
+            // SAFETY: inside the allocation.
+            unsafe { ((base + at) as *mut u32).write_volatile(title(at)) };
+        }
+        let gpu = |at: usize| title(at) ^ 0xFFFF_0000;
+        let card = |t0: usize, t1: usize| -> Vec<u8> { (t0..t1).step_by(4).flat_map(|at| gpu(at - base).to_le_bytes()).collect() };
+        // SAFETY: inside the allocation.
+        let read = |at: usize| unsafe { ((base + at) as *const u32).read_volatile() };
+        // Two pieces of the first window and one of the second.
+        let (a, b, c) = (base + PIECE + 0x100, base + 3 * PIECE, base + WINDOW + 2 * PIECE);
+        assert!(own_fake(a, a + 0x2000, card(a, a + 0x2000), 1));
+        assert!(own_fake(b, b + PIECE, card(b, b + PIECE), 1));
+        assert!(own_fake(c, c + 0x1000, card(c, c + 0x1000), 1));
+        assert!(owns(a, 1) && owns(b + 100, 4) && owns(c, 0x1000));
+        assert!(!owns(base, PIECE));
+        // A read in place on another thread faults: the window comes back,
+        // the card's bytes in it, the title's around them.
+        let got = std::thread::spawn(move || {
+            // SAFETY: inside the allocation.
+            unsafe { ((base + PIECE + 0x200) as *const u32).read_volatile() }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got, gpu(PIECE + 0x200));
+        assert!(!owns(a, 1) && !owns(b, PIECE), "the whole window came back");
+        assert!(owns(c, 1), "not the next window");
+        assert_eq!(read(PIECE + 0x100), gpu(PIECE + 0x100));
+        assert_eq!(read(PIECE + 0x2100 - 4), gpu(PIECE + 0x2100 - 4));
+        assert_eq!(read(PIECE + 0x2100), title(PIECE + 0x2100), "past the piece's bytes: the title's");
+        assert_eq!(read(PIECE), title(PIECE));
+        assert_eq!(read(3 * PIECE + 0x8000), gpu(3 * PIECE + 0x8000));
+        // A write of the title: the piece comes back first, the write
+        // lands on top and wins.
+        // SAFETY: inside the allocation.
+        unsafe { ((c + 8) as *mut u32).write_volatile(0x1234_5678) };
+        assert!(!owns(c, 1));
+        assert_eq!(read(c + 8 - base), 0x1234_5678);
+        assert_eq!(read(c + 4 - base), gpu(c + 4 - base));
+        // A kernel read of a closed page fails, and reads once the piece
+        // is brought back (as `read_again` does).
+        assert!(own_fake(c, c + 0x1000, card(c, c + 0x1000), 2));
+        let mut out = [0u8; 16];
+        let mut done = 0;
+        // SAFETY: our own memory, read into a buffer of ours of that size.
+        let mut kernel = || unsafe { ReadProcessMemory(GetCurrentProcess(), (c + 16) as *const _, out.as_mut_ptr().cast(), 16, &mut done) != 0 };
+        assert!(!kernel(), "a kernel read of a closed page");
+        assert!(release(c + 16, 16, BY_KERNEL) && kernel());
+        assert_eq!(u32::from_le_bytes([out[0], out[1], out[2], out[3]]), gpu(c + 16 - base));
+        // A write told before it lands (`crate::watch::writing`) brings it
+        // back first; a second release finds nothing.
+        assert!(own_fake(b, b + PIECE, card(b, b + PIECE), 3));
+        assert!(release(b + 0x10, 0x20, BY_WRITING));
+        assert!(!release(b, PIECE, BY_WRITING));
+        assert_eq!(read(3 * PIECE), gpu(3 * PIECE));
+        // A mapping change gives the piece up, opened, unfetched.
+        for at in (0..PIECE).step_by(4) {
+            // SAFETY: inside the allocation.
+            unsafe { ((b + at) as *mut u32).write_volatile(title(3 * PIECE + at)) };
+        }
+        assert!(own_fake(b, b + PIECE, card(b, b + PIECE), 4));
+        forget(b, PIECE);
+        assert!(!owns(b, PIECE));
+        assert_eq!(read(3 * PIECE + 4), title(3 * PIECE + 4), "given up: nothing fetched");
+        // A piece the title touches first after each ownership stays eager.
+        let key = 0x7_7700_0000;
+        for _ in 1..demote_after() {
+            touched_by_title(key);
+        }
+        assert!(demote_after() == 0 || !lazy_state().demoted.contains(&key));
+        touched_by_title(key);
+        assert!(demote_after() == 0 || lazy_state().demoted.contains(&key));
+        // SAFETY: the test's own reservation.
+        unsafe { VirtualFree(reserved as *mut _, 0, MEM_RELEASE) };
+    }
 
     /// Off keeps only small ranges; otherwise everything is copied back.
     #[test]

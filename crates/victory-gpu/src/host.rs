@@ -10800,7 +10800,7 @@ void main() {
         let mut fetch = None;
         {
             let plan = sent_a.card.as_ref().expect("flight A has a plan for the card's copies");
-            host.relay_card_back(&[(sent_a.number, plan)], &mut fetch, fence_a, sent_a.number);
+            host.relay_card_back(&[(sent_a.number, plan)], &mut fetch, fence_a, sent_a.number, &[]);
         }
         for (copy, ranges) in &sent_a.back {
             copy.copy_back_done(ranges);
@@ -10820,7 +10820,7 @@ void main() {
         wait_for(fence_b);
         {
             let plan = sent_b.card.as_ref().expect("flight B has a plan for the card's copies");
-            host.relay_card_back(&[(sent_b.number, plan)], &mut fetch, fence_b, sent_b.number);
+            host.relay_card_back(&[(sent_b.number, plan)], &mut fetch, fence_b, sent_b.number, &[]);
         }
         for (copy, ranges) in &sent_b.back {
             copy.copy_back_done(ranges);
