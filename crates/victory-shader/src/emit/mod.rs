@@ -94,6 +94,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
+mod link;
 mod lower;
 mod own_bits;
 mod rect;
@@ -115,6 +116,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
+pub use link::{link_mesh, mesh_fits};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
@@ -2346,5 +2348,133 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// A pixel program with TEXCOORD0..2 in rows 0..2 that reads only attribute 2's z
+    /// (`v_interp_mov_f32 v2, p0, attr2.z`), translated with `linked` (`link_mesh`'s pixel
+    /// side).
+    fn linked_pixel(linked: link::Linked) -> Result<HostShader, ShaderError> {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [0xC80A_0A02, e0, e1, S_ENDPGM];
+        let input = |row: u8| PsInput {
+            usage: Usage::Generic,
+            row,
+            mask: 0b1111,
+            attr: row,
+            flat: true,
+            fp16: false,
+            pack2: false,
+            row2: row,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![input(0), input(1), input(2)],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let texcoord = |i: u32| SigElement {
+            index: i,
+            ..element("TEXCOORD", 0, i)
+        };
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let isg1 = container::signature(&[texcoord(0), texcoord(1), texcoord(2)], true);
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage, None)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        link::with_linked(linked, || emit(&c, &native, &p, &st, &io, &res))
+    }
+
+    /// `link_mesh`'s pixel side: the inputs the program never reads leave its signature, the
+    /// one it reads keeps its row and is read as the signature's first element now; leaving
+    /// out an input it reads is refused.
+    #[test]
+    fn a_linked_pixel_program_declares_only_the_inputs_it_reads() {
+        let rows = |s: &HostShader| -> Vec<(u32, Option<u32>)> {
+            let c = Container::parse(&s.dxil).unwrap();
+            let isg1 = signature(c.part(FourCC::ISG1).unwrap().data).unwrap();
+            isg1.iter().map(|e| (e.index, e.row)).collect()
+        };
+        let whole = linked_pixel(link::Linked::default()).unwrap();
+        assert_eq!(rows(&whole), [(0, Some(0)), (1, Some(1)), (2, Some(2))]);
+        let unread = vec![("TEXCOORD".to_owned(), 0), ("texcoord".to_owned(), 1)];
+        let linked = linked_pixel(link::Linked {
+            inputs: unread,
+            outputs: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(rows(&linked), [(2, Some(2))]);
+        // (dxil.dll checks each read against the element its id names)
+        validate(&whole);
+        validate(&linked);
+        let read = linked_pixel(link::Linked {
+            inputs: vec![("TEXCOORD".to_owned(), 2)],
+            outputs: Vec::new(),
+        });
+        assert!(
+            matches!(&read, Err(ShaderError::Unsupported { what, .. }) if *what == "an input left out of a linked pipeline read"),
+            "{:?}",
+            read.err()
+        );
+    }
+
+    /// The other side, for a stage whose outputs a pixel program reads: an output left out is
+    /// neither stored nor declared, the others keep their rows and are stored to their element
+    /// as the signature numbers it now (SV_Position 0, TEXCOORD1 1).
+    #[test]
+    fn a_linked_stage_stores_only_the_outputs_it_keeps() {
+        use crate::native::VsOutput;
+        let words = [
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x7E04_0287, // v_mov_b32 v2, 7
+            0xF800_020F,
+            0x0202_0101, // exp param0, v1, v1, v2, v2
+            0xF800_021F,
+            0x0101_0101, // exp param1, v1, v1, v1, v1
+            0xF800_08CF,
+            0x0101_0101, // exp pos0, v1, v1, v1, v1 done
+            S_ENDPGM,
+        ];
+        let output = |row: u8, param: u8| VsOutput {
+            usage: Usage::Generic,
+            row,
+            param,
+            fp16: false,
+            pack2: false,
+        };
+        let io = StageIo::Vs {
+            inputs: vec![],
+            outputs: vec![output(1, 0), output(2, 1)],
+        };
+        let osg1 = [
+            element("SV_Position", 3, 0),
+            element("TEXCOORD", 0, 1),
+            SigElement {
+                index: 1,
+                ..element("TEXCOORD", 0, 2)
+            },
+        ];
+        let linked = link::Linked {
+            inputs: Vec::new(),
+            outputs: vec![("TEXCOORD".to_owned(), 0)],
+        };
+        let shader = link::with_linked(linked, || translate_with(HwStage::Vs, &words, io, &[], &osg1));
+        let c = Container::parse(&shader.dxil).unwrap();
+        let out = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let rows: Vec<(&str, u32, Option<u32>)> = out.iter().map(|e| (e.name.as_str(), e.index, e.row)).collect();
+        assert_eq!(rows, [("SV_Position", 0, Some(0)), ("TEXCOORD", 1, Some(2))]);
+        validate(&shader);
     }
 }
