@@ -151,7 +151,7 @@ pub(crate) fn off() -> bool {
 /// fetches and merges only.
 pub(crate) fn reads_wait() -> bool {
     static WAIT: OnceLock<bool> = OnceLock::new();
-    *WAIT.get_or_init(|| !off() || crate::switch::on("VICTORY_TEXTURE_BACK"))
+    *WAIT.get_or_init(|| !off() || crate::texback::on())
 }
 
 /// With [`off`], the most bytes of a declared range that is still copied
