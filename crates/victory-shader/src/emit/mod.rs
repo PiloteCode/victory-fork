@@ -828,14 +828,30 @@ fn emit_forms(
         return original;
     }
     let edges = threading::constant_edges(p, st);
-    if edges.is_empty() {
-        return original;
+    let r = if edges.is_empty() {
+        original
+    } else {
+        let q = ir::thread_edges(p, &edges)?;
+        let st = structure::structure(&q)?;
+        let io = io::raise(&q, native)?;
+        let res = resource::track(&q, &native.layout, native.stage, Some(&st))?;
+        emit_program(c, native, &q, &st, &io, &res)
+    };
+    // A mask holding lanes outside EXEC, written behind a per-lane skip and read as data (the
+    // full-resolution adaptive shadow trace): every lane is there for its ballot once the wave
+    // takes that skip together ([`widen`]). Last, and only where the console's waves are the
+    // host's: a console wave64 program on 32-lane waves keeps the forms above (the paired one).
+    match r {
+        Err(ShaderError::Unsupported { what, .. })
+            if what == lower::MASK_ELSEWHERE
+                && native.stage == HwStage::Cs
+                && !(native.wave64 && lower::host_max_wave() == 32)
+                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+        {
+            widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some()).or(r)
+        }
+        r => r,
     }
-    let p = ir::thread_edges(p, &edges)?;
-    let st = structure::structure(&p)?;
-    let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res)
 }
 
 /// `p` translated with the joins of its descriptors chosen by control flow copied for each way

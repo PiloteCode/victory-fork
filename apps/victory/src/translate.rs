@@ -81,6 +81,8 @@ struct Tally {
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
+    /// With `--hashes`: each emitted program's line names its DXIL.
+    hashes: bool,
     lines: Vec<String>,
 }
 
@@ -196,8 +198,17 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
-    for root in &paths {
+    let timed_out = || limit.is_some_and(|n| began.elapsed().as_secs() >= n);
+    let all_found = || !all && lock(&done).len() >= wanted.len();
+    'walk: for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if timed_out() {
+                counts[3].fetch_add(1, Ordering::Relaxed);
+                break 'walk;
+            }
+            if all_found() {
+                break 'walk;
+            }
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -210,14 +221,17 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if timed_out() {
+                                counts[3].fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            if all_found() {
+                                break;
+                            }
                             let Some(bytes) = job.bytes() else {
                                 continue;
                             };
                             let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
-                            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
-                                counts[3].fetch_add(1, Ordering::Relaxed);
-                                break;
-                            }
                             if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
                                 continue;
                             }
@@ -253,6 +267,7 @@ pub fn run(
     validate: bool,
     pipelines: bool,
     list: bool,
+    hashes: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
@@ -260,6 +275,8 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
+    // (the hashes are on the program lines)
+    let list = list || hashes;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
@@ -307,6 +324,7 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
+                            hashes,
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -738,6 +756,15 @@ fn check(
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
+    // `--hashes`: the line names the emitted DXIL, hashed before the
+    // validator signs it (`translate-diff` compares two runs by it).
+    let hash = t
+        .hashes
+        .then(|| blake3::hash(&shader.dxil).to_hex()[..16].to_owned());
+    let label = || match &hash {
+        Some(h) => format!("{} dxil={h}", label()),
+        None => label(),
+    };
     if let (Some(keep), Some(bytes)) = (&checks.keep, &checks.current) {
         lock(keep).push((label(), shader.clone(), bytes.clone()));
     }
@@ -780,7 +807,7 @@ fn check(
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
-            Err(e) => t.fail(format!("pipeline: {e}"), &label),
+            Err(e) => t.fail(format!("pipeline: {e}"), label),
         }
     }
     let Some(v) = checks.validator.as_mut() else {
@@ -1019,7 +1046,7 @@ mod tests {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
+        let err = super::run(vec![missing], false, false, false, false, Some(1)).unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(
