@@ -1309,6 +1309,98 @@ fn a_legacy_square_is_the_consoles() {
     }
 }
 
+/// The legacy multiply's shorter forms (`legacy.rs`): the product alone where every zero
+/// meets a finite value of the right sign (`VICTORY_LEGACY_PLAIN`), and the forms that add
+/// +0 (`VICTORY_LEGACY_ZERO`): `(x + 0) * k`, `(0 - x) * -k` and `x * y + 0`. Each against
+/// the console's results over zeros, infinities, NaNs, denormals, products that underflow and
+/// overflow, in `v_mul_legacy_f32`, `v_mac_legacy_f32` and `v_mad_legacy_f32`, with the
+/// switches on (and checked to change the program) and with both off.
+#[test]
+fn legacy_short_forms_are_the_consoles() {
+    use super::lower::legacy::{TEST_PLAIN, TEST_SHORT, TEST_ZERO};
+    let set = |plain: bool, zero: bool| {
+        TEST_PLAIN.set(Some(plain));
+        TEST_ZERO.set(Some(zero));
+    };
+    let to_f = |u: u32| (u as f32).to_bits();
+    // Constants: inline 0.5, -0.5, 4.0, -4.0; literals 1e-30, -1e-30 (products that
+    // underflow), 2^127 (that overflow), -3.
+    let inline = [(240u16, 0x3F00_0000u32), (241, 0xBF00_0000), (246, 0x4080_0000), (247, 0xC080_0000)];
+    let literal = [0x0DA2_4260u32, 0x8DA2_4260, 0x7F00_0000, 0xC040_0000];
+    let mut constants: Vec<(Vec<u32>, u32)> = inline.iter().map(|&(c, k)| (vec![u32::from(c)], k)).collect();
+    constants.extend(literal.iter().map(|&k| (vec![255, k], k)));
+    let mut probes = Vec::new();
+    for (src, k) in &constants {
+        let k = *k;
+        let lit: Vec<u32> = src.get(1).copied().into_iter().collect();
+        // v_mul_legacy_f32 v5, k, v1
+        let mut body = vec![vop2(0x07, 5, src[0] as u16, 1)];
+        body.extend(&lit);
+        probes.push(probe(body, unary(F32_EDGES), F32, move |i| vec![mul_legacy(k, i[0])]));
+        // v_mov_b32 v5, v3; v_mac_legacy_f32 v5, k, v1
+        let mut body = vec![vop1(0x01, 5, v(3)), vop2(0x06, 5, src[0] as u16, 1)];
+        body.extend(&lit);
+        let abc = triples(F32_EDGES, &[0], F32_THIRD);
+        probes.push(probe(body, abc, F32, move |i| vec![mad_legacy(k, i[0], i[2])]));
+        // v_cvt_f32_u32 v6, v1; v_mul_legacy_f32 v5, k, v6 (a converted integer)
+        let mut body = vec![vop1(0x06, 6, v(1)), vop2(0x07, 5, src[0] as u16, 6)];
+        body.extend(&lit);
+        probes.push(probe(body, unary(U32_EDGES), F32, move |i| vec![mul_legacy(k, to_f(i[0]))]));
+    }
+    // Two converted integers; a converted integer times a clamped value (v_med3_f32 v7, v2,
+    // -2.0, 4.0), and the same in v_mad_legacy_f32 with v3.
+    let mut body = vec![vop1(0x06, 6, v(1)), vop1(0x06, 7, v(2))];
+    body.push(vop2(0x07, 5, v(6), 7));
+    let uu = pairs(U32_EDGES, U32_EDGES);
+    probes.push(probe(body, uu, F32, move |i| vec![mul_legacy(to_f(i[0]), to_f(i[1]))]));
+    let clamp = |b: u32| med3(b, 0xC000_0000, 0x4080_0000);
+    let mut body = vec![vop1(0x06, 6, v(1))];
+    body.extend(vop3(0x157, 7, [v(2), 245, 246], NONE));
+    body.push(vop2(0x07, 5, v(6), 7));
+    let ub: Vec<[u32; 4]> = U32_EDGES.iter().flat_map(|&a| F32_EDGES.iter().map(move |&b| [a, b, 0, OLD])).collect();
+    probes.push(probe(body, ub.clone(), F32, move |i| vec![mul_legacy(to_f(i[0]), clamp(i[1]))]));
+    let mut body = vec![vop1(0x06, 6, v(1))];
+    body.extend(vop3(0x157, 7, [v(2), 245, 246], NONE));
+    body.extend(vop3(0x140, 5, [v(7), v(6), v(3)], NONE));
+    let ubc: Vec<[u32; 4]> = ub.iter().flat_map(|&[a, b, _, d]| F32_THIRD.iter().map(move |&c| [a, b, c, d])).collect();
+    probes.push(probe(body, ubc, tolerant(1, NONE), move |i| vec![mad_legacy(clamp(i[1]), to_f(i[0]), i[2])]));
+    // The reciprocal of a converted integer times 2^32 - 256 (the unsigned division idiom:
+    // positive, never a zero), and a smoothstep: x * x * (4 - 2x) of x = v_med3_f32(v1, 0, 1).
+    let mut body = vec![vop1(0x06, 6, v(1)), vop1(0x2A, 7, v(6)), vop2(0x07, 5, 255, 7), 0x4F7F_FFFE];
+    let recip = move |u: u32| (1.0 / (u as f32)).to_bits();
+    probes.push(probe(body.clone(), unary(U32_EDGES), tolerant(4, NONE), move |i| {
+        vec![mul_legacy(0x4F7F_FFFE, recip(i[0]))]
+    }));
+    body.clear();
+    body.extend(vop3(0x157, 6, [v(1), int(0), 242], NONE));
+    body.push(vop2(0x07, 7, v(6), 6));
+    body.extend(vop3(0x141, 8, [v(6), 245, 246], NONE));
+    body.push(vop2(0x07, 5, v(7), 8));
+    probes.push(probe(body, unary(F32_EDGES), F32, |i| {
+        let x = med3(i[0], 0, 0x3F80_0000);
+        vec![mul_legacy(mul_legacy(x, x), mad(x, 0xC000_0000, 0x4080_0000))]
+    }));
+    // Each probe's program changes with the switches (a short form is taken), and gives the
+    // console's results with them and without.
+    let before = TEST_SHORT.get();
+    set(true, true);
+    for p in &probes {
+        let on = lower_program(&program(&p.body, false)).expect("lowered").dxil;
+        set(false, false);
+        let off = lower_program(&program(&p.body, false)).expect("lowered").dxil;
+        set(true, true);
+        assert_ne!(on, off, "{}: a short form", disassembly(&p.body, false));
+    }
+    assert!(TEST_SHORT.get() > before);
+    for (plain, zero) in [(true, false), (true, true), (false, false)] {
+        set(plain, zero);
+        let failures = check(&probes);
+        TEST_PLAIN.set(None);
+        TEST_ZERO.set(None);
+        assert_clean(failures);
+    }
+}
+
 /// Minimum, maximum, median, and `v_max_f32 x, x clamp` (the title's
 /// saturate) with NaN, -0 and denormals.
 fn min_max_probes() -> Vec<Probe> {
