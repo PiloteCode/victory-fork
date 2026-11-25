@@ -742,6 +742,10 @@ pub(crate) struct HostList {
     /// whether the list leaves it in the indirect argument state where it
     /// stands now (`scratch_read`), rather than in the common state.
     indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
+    /// With `crate::indirect::ring`: the buffer clamped indirect records go
+    /// to, each clamp into room of its own (buffer, bytes, bytes taken),
+    /// taken afresh when the list is reset.
+    indirect_ring: Mutex<Option<(ID3D12Resource, u64, u64)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2896,6 +2900,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                indirect_ring: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4550,6 +4555,9 @@ impl HostList {
         if let Some((_, _, read)) = &mut *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()) {
             *read = false;
         }
+        if let Some((_, _, taken)) = &mut *self.indirect_ring.lock().unwrap_or_else(|e| e.into_inner()) {
+            *taken = 0;
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5161,6 +5169,32 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some((buffer, false))
+    }
+
+    /// With `crate::indirect::ring`: `size` bytes of the list's ring of
+    /// clamped indirect records that nothing recorded so far uses, and
+    /// where they start. A full ring is replaced by one twice as big (the
+    /// old one stays alive until [`HostList::reset`]).
+    pub(crate) fn indirect_ring(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        let size = size.next_multiple_of(256);
+        let mut slot = self.indirect_ring.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap, taken)) = &mut *slot
+            && *taken + size <= *cap
+        {
+            let at = *taken;
+            *taken += size;
+            return Some((buffer.clone(), at));
+        }
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
+        let alloc = prev.saturating_mul(2).max(size).max(256 << 10).next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(alloc)?;
+        name(&buffer, || format!("indirect arguments ring {alloc:#x}"));
+        let old = slot.replace((buffer.clone(), alloc, size));
+        drop(slot);
+        if let Some((old_buf, _, _)) = old {
+            self.keep(&old_buf);
+        }
+        Some((buffer, 0))
     }
 
     /// An indirect execution read its arguments from the scratch buffer,

@@ -249,12 +249,16 @@ pub(crate) fn bound(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, u64)> {
     #[cfg(feature = "diagnostics")]
     list.note_op(|| "clamp (ours) of indirect records".into());
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    if ring() {
+        let (c, budget, (dst, at)) = (clamp()?, list.budget()?, list.indirect_ring(bytes)?);
+        return record_clamp_ring(c, list, &dst, at, budget, src, count, spec, false).then_some((dst, at));
+    }
     let (c, budget, (dst, read)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, count, spec, false).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, count, spec, false).then_some((dst, 0))
 }
 
 /// The state the scratch buffer stands in: indirect arguments where an
@@ -277,12 +281,103 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, u64)> {
     #[cfg(feature = "diagnostics")]
     list.note_op(|| "clamp (ours) of a window of indirect records".into());
     let bytes = validate_layout(spec, src.1, None)?;
+    if ring() {
+        let (c, budget, (dst, at)) = (clamp()?, list.budget()?, list.indirect_ring(bytes)?);
+        return record_clamp_ring(c, list, &dst, at, budget, src, None, spec, true).then_some((dst, at));
+    }
     let (c, budget, (dst, read)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, None, spec, true).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, None, spec, true).then_some((dst, 0))
+}
+
+/// Whether clamped indirect records go each to room of their own in a ring
+/// of the list's ([`HostList::indirect_ring`]), behind one barrier of the
+/// host's enhanced kind that orders the clamp's writes before the indirect
+/// read and nothing else (on by default where the host takes enhanced
+/// barriers; `VICTORY_INDIRECT_RING=0` clamps into the one scratch buffer,
+/// as before).
+///
+/// Into the one scratch buffer every clamp first waited for the last
+/// indirect call to have read it, and the call after it for the clamp:
+/// two changes of state, each a wait for all the card's work before it.
+/// The clamps took 33 ms of the card's ~100 ms a frame (2,500 a frame,
+/// timing run of the opening of the gameplay, RTX 5090). Into room of its
+/// own a clamp overwrites nothing a call still reads, and the barrier
+/// after it names only the compute stage before and the indirect read
+/// after. Measured the same way: the clamps 19 ms, the card's commands
+/// 102 -> 95 ms a frame in all (some of the wait moved to the indirect
+/// calls: the card still switches from drawing to compute and back for
+/// each clamp); frames 179 -> 171 ms (median), 210 -> 189 ms (mean).
+pub(crate) fn ring() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_INDIRECT_RING").is_none_or(|v| v != "0") && enhanced_barriers()
+    })
+}
+
+/// Whether the host takes barriers of the enhanced kind.
+fn enhanced_barriers() -> bool {
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: a plain query into a struct of the size given.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12,
+            (&raw mut options).cast(),
+            size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+        )
+    };
+    let on = asked.is_ok() && options.EnhancedBarriersSupported.as_bool();
+    tracing::info!(on, "indirect records clamped into a ring behind enhanced barriers (VICTORY_INDIRECT_RING)");
+    on
+}
+
+/// [`record_clamp_as`] into `at` of `dst`, a ring nothing recorded after
+/// this reads before this clamp ([`ring`]): no barrier before the clamp,
+/// one after it from the compute stage's writes to the indirect read.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_ring(
+    c: &Clamp,
+    list: &HostList,
+    dst: &ID3D12Resource,
+    at: u64,
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    use windows::core::Interface;
+    let Ok(l7) = list.list.cast::<ID3D12GraphicsCommandList7>() else {
+        return false;
+    };
+    if !record_clamp_into(c, &list.list, dst, at, budget, (src, src_offset), count, spec, ahead) {
+        return false;
+    }
+    let barrier = [D3D12_BUFFER_BARRIER {
+        SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+        SyncAfter: D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+        AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+        AccessAfter: D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+        pResource: std::mem::ManuallyDrop::new(Some(dst.clone())),
+        Offset: 0,
+        Size: u64::MAX,
+    }];
+    let group = D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_BUFFER,
+        NumBarriers: 1,
+        Anonymous: D3D12_BARRIER_GROUP_0 { pBufferBarriers: barrier.as_ptr() },
+    };
+    // SAFETY: an open list; the barrier names a live buffer.
+    unsafe { l7.Barrier(&[group]) };
+    let [b] = barrier;
+    drop(std::mem::ManuallyDrop::into_inner(b.pResource));
+    true
 }
 
 /// [`record_clamp_as`] of records not clamped ahead, into a scratch buffer
@@ -314,50 +409,13 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    let Some(bytes) = validate_layout(
-        (kind, stride, records),
-        src_offset,
-        count.map(|(_, off)| off),
-    ) else {
+    // SAFETY: a live D3D12 buffer resource.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() };
+    let Some((constants, src_gpu, count_gpu)) =
+        clamp_arguments(dst_gpu, budget, (src, src_offset), count, (kind, stride, records), ahead)
+    else {
         return false;
     };
-    // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
-        return false;
-    }
-    let (src_gpu, args_offset) = match src_offset
-        .checked_add(bytes)
-        .filter(|&end| end <= u64::from(u32::MAX))
-    {
-        Some(_) => (src_base, src_offset as u32),
-        None => {
-            let Some(rebased) = src_base.checked_add(src_offset) else {
-                return false;
-            };
-            (rebased, 0)
-        }
-    };
-    let (count_gpu, has_count, count_offset) = match count {
-        Some((buf, off)) => {
-            // SAFETY: a live D3D12 buffer resource.
-            let base = unsafe { buf.GetGPUVirtualAddress() };
-            if !base.is_multiple_of(4) {
-                return false;
-            }
-            match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
-                Some(_) => (base, 1u32, off as u32),
-                None => {
-                    let Some(rebased) = base.checked_add(off) else {
-                        return false;
-                    };
-                    (rebased, 1u32, 0u32)
-                }
-            }
-        }
-        None => (src_gpu, 0u32, 0u32),
-    };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -389,18 +447,102 @@ fn record_clamp_as(
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
-        }
+        dispatch_clamp(c, l, &constants, src_gpu, count_gpu, dst_gpu, budget);
         l.ResourceBarrier(&second[skip..]);
     }
+    true
+}
+
+/// The clamp pass's root constants and its source and count addresses, if
+/// the records can be clamped (4-byte aligned buffers and offsets).
+fn clamp_arguments(
+    dst_gpu: u64,
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+) -> Option<([u32; 6], u64, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    // SAFETY: a live D3D12 buffer resource.
+    let src_base = unsafe { src.GetGPUVirtualAddress() };
+    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (src_gpu, args_offset) = match src_offset.checked_add(bytes).filter(|&end| end <= u64::from(u32::MAX)) {
+        Some(_) => (src_base, src_offset as u32),
+        None => (src_base.checked_add(src_offset)?, 0),
+    };
+    let (count_gpu, has_count, count_offset) = match count {
+        Some((buf, off)) => {
+            // SAFETY: a live D3D12 buffer resource.
+            let base = unsafe { buf.GetGPUVirtualAddress() };
+            if !base.is_multiple_of(4) {
+                return None;
+            }
+            match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
+                Some(_) => (base, 1u32, off as u32),
+                None => (base.checked_add(off)?, 1u32, 0u32),
+            }
+        }
+        None => (src_gpu, 0u32, 0u32),
+    };
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    Some((constants, src_gpu, count_gpu))
+}
+
+/// Records the clamp pass itself (nothing if there are no records).
+///
+/// # Safety
+/// An open list; live buffers behind the addresses.
+unsafe fn dispatch_clamp(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    constants: &[u32; 6],
+    src_gpu: u64,
+    count_gpu: u64,
+    dst_gpu: u64,
+    budget: u64,
+) {
+    let records = constants[2];
+    if records == 0 {
+        return;
+    }
+    // SAFETY: as the caller vouches.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+    }
+}
+
+/// The clamp pass into `at` of `dst`, with no barrier ([`record_clamp_ring`]).
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_into(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    at: u64,
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    // SAFETY: a live D3D12 buffer resource.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let Some((constants, src_gpu, count_gpu)) = clamp_arguments(dst_gpu, budget, src, count, spec, ahead) else {
+        return false;
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    // SAFETY: an open list; live source, count, ring and budget buffers.
+    unsafe { dispatch_clamp(c, l, &constants, src_gpu, count_gpu, dst_gpu, budget) };
     true
 }
 
@@ -1214,9 +1356,9 @@ void main() {
 
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let (b1, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
         done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let (b2, _) = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
         done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
@@ -1226,7 +1368,7 @@ void main() {
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let (b3, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
         done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
@@ -1240,7 +1382,7 @@ void main() {
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let (b4, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
         done(&list, &b4);
         assert_eq!(
             b4.as_raw(),
