@@ -179,6 +179,13 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             ("v_lshl_add_u32", [Wave::Prefix, Wave::Plain, c]) if !wild(*c) => {
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
+            // the prefix in units of a plain size, onto the base: the lens-flare scans reserve
+            // their count times the size, and each lane takes base + below × size
+            ("v_mad_u32_u24" | "v_mad_u32_u16", [Wave::Prefix, Wave::Plain, c] | [Wave::Plain, Wave::Prefix, c])
+                if !wild(*c) =>
+            {
+                if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
+            }
             // the reservation: the first lane adds its wave's total to a shared counter
             (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
                 let want = match op {
