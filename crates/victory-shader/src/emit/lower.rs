@@ -1130,6 +1130,9 @@ pub(super) fn base_direct_on() -> bool {
 /// numbered by their flattened thread index (x fastest, then y, then z), which NVIDIA and AMD
 /// cut into waves as they cut a one-dimension group's (the same promise D3D12 does not
 /// make). Off by default; a measurement of what the entry meeting costs groups of few threads.
+/// Not for NVIDIA: its 8 x 8 groups do not give a wave consecutive thread indices (why
+/// [`Lower::wave_base`] has its counter), so two waves may take one base there;
+/// [`base_free_on`] saves the meeting without that assumption.
 fn base_direct_any_shape() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "2"))
