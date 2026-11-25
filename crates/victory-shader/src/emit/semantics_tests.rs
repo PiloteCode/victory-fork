@@ -1331,7 +1331,9 @@ fn a_legacy_square_is_the_consoles() {
 /// mismatch of the default forms, or WARP's, fails.
 #[test]
 fn legacy_short_forms_are_the_consoles() {
-    use super::lower::legacy::{TEST_PLAIN, TEST_SHORT, TEST_ZERO};
+    use super::lower::legacy::{TEST_LOOPS, TEST_PLAIN, TEST_SHORT, TEST_ZERO};
+    // (VICTORY_LEGACY_LOOPS as by default, whatever the environment says)
+    TEST_LOOPS.set(Some(true));
     let set = |plain: bool, zero: bool| {
         TEST_PLAIN.set(Some(plain));
         TEST_ZERO.set(Some(zero));
@@ -1435,13 +1437,11 @@ fn legacy_short_forms_are_the_consoles() {
         vec![p]
     }));
     {
-        use super::lower::legacy::TEST_LOOPS;
         set(true, false);
         TEST_LOOPS.set(Some(false));
         let without = lower_program(&program(&looped, false)).expect("lowered").dxil;
         TEST_LOOPS.set(Some(true));
         let with = lower_program(&program(&looped, false)).expect("lowered").dxil;
-        TEST_LOOPS.set(None);
         assert_ne!(without, with, "the product carried round the loop is shortened once the join is filled");
     }
     // Each probe's program changes with the switches where a short form applies, and gives
@@ -1484,6 +1484,7 @@ fn legacy_short_forms_are_the_consoles() {
     let failures = check_each(&zero_forms);
     TEST_PLAIN.set(None);
     TEST_ZERO.set(None);
+    TEST_LOOPS.set(None);
     let (card, other): (Vec<_>, Vec<_>) = failures.into_iter().partition(|(_, card)| *card);
     for (f, _) in &card {
         eprintln!("VICTORY_LEGACY_ZERO (off by default), on the card only:\n{f}");
