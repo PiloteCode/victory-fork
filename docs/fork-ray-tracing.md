@@ -3,9 +3,9 @@
 Status, 2026-11-25: **nothing is lit by ray tracing yet.** With
 `VICTORY_BVH_BUILDER=1` the builder now runs its whole first frame in the
 game (some 12,000 dispatches in the user-save scenario), but the title still
-dies one frame later on a CPU read of what the builder produced (run
-rt-trace9: one access violation at title +0xf6349). The builder stays off by
-default.
+dies one frame later, its threads reading pointers of all ones out of pages
+that hold what the builder wrote (run rt-int1, on the integration branch).
+The builder stays off by default.
 
 ## What the title does
 
@@ -98,15 +98,11 @@ shaders and emulates the one instruction.
      shown.* The title streams its pre-built structures into pool pages and
      maps them into its tiled heap. A write through another view than the
      guarded address never reached the host copies, which kept what the pages
-     held before; the builder rehydrated those bytes in place, the copy-back
-     put empty box nodes where the title's CPU read them, and the title's
-     threads died on child pointers of all ones (13 exceptions on several
-     threads in runs rt-trace7 and rt-trace8; none of that kind in rt-trace9,
-     which told every address showing a written page). The integration branch
-     has the same report from upstream (`xmem.rs`, `pages_written`;
-     `watch.rs`, `title_memory_written`, `VICTORY_PAGE_WRITES`) and guards
-     every view of a page together (`VICTORY_VIEW_GUARD`), so a write the
-     title's CPU makes through one view is seen at the others.
+     held before. The integration branch has this report from upstream
+     (`xmem.rs`, `pages_written`; `watch.rs`, `title_memory_written`,
+     `VICTORY_PAGE_WRITES`) and guards every view of a page together
+     (`VICTORY_VIEW_GUARD`), so a write the title's CPU makes through one view
+     is seen at the others.
 7. **Four more sun-shadow trace programs translate.** They take the address
    of their structure out of a descriptor they pick from the view heap; the
    host keeps a table of view addresses by heap slot (`SLOT_VIEW_ADDRESSES`).
@@ -127,10 +123,19 @@ shaders and emulates the one instruction.
 ## Known gaps
 
 - With `VICTORY_BVH_BUILDER=1` the title dies one frame after the builder's
-  first frame (rt-trace9: a read of 0xf at title +0xf6349; the object it came
-  from points at structure data with empty, infinite bounds). Not known yet:
-  whether the builder's output is wrong there or its inputs were stale
-  (rt-trace9 ran before the views of a page were guarded together).
+  first frame: 13 access violations on several threads (title +0x2bd385b,
+  +0x27c195d, +0x4f38ba5, +0x4e51965), reading pointers of all ones or of
+  infinities (runs rt-trace7, rt-trace8, and rt-int1 on the integration
+  branch with the page-write report and the views guarded together; rt-trace9
+  had a single one, at +0xf6349). Each faulting object lies 24 GiB below a
+  tiled-heap range the builder's copy-back had just written in that frame,
+  and holds the same bytes: box nodes with no children and empty, infinite
+  bounds. The title shows those pages to its CPU there; the console's
+  builder would have written real nodes. Not known yet: whether the
+  builder's inputs for those structures were missing or its output is
+  wrong. The structure walk of rt-int1 found 19,638 bad nodes in 283
+  structures, most of them boxes of zeros or of the header stage's empty
+  bounds.
 - The trees are not validated yet: the walk (`VICTORY_BVH_CHECK`) reads title
   memory, which holds only what was put back, and ran only in rt-trace8,
   before the fixes above (602 structures, 24,273 bad nodes, most of them
