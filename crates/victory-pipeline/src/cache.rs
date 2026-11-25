@@ -1,5 +1,7 @@
-use std::io::Write;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -58,27 +60,51 @@ impl Cache {
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
-        let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
         }
-        published?;
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            // Content-addressed: if another worker published the same key
+            // while we were writing (on Windows, renaming over a file held
+            // open by a reader fails with a sharing/access error), use it.
+            if !path.is_file() {
+                return Err(err.into());
+            }
+        }
         Ok(path)
     }
 }
 
-fn tempfile_in(dir: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
+fn tempfile_in(dir: &Path) -> io::Result<(PathBuf, File)> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(".tmp-{}-{n}", std::process::id()))
+    create_tempfile_in(dir, &COUNTER)
+}
+
+fn create_tempfile_in(dir: &Path, counter: &AtomicU64) -> io::Result<(PathBuf, File)> {
+    // An interrupted writer can leave a file behind, and process IDs are
+    // reused. Keep it intact and try a new name rather than failing a miss.
+    for _ in 0..128 {
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(".tmp-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique cache staging file after 128 attempts",
+    ))
 }
 
 #[cfg(test)]
@@ -139,6 +165,65 @@ mod tests {
     }
 
     #[test]
+    fn staging_retries_collisions_without_changing_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        for n in 0..2 {
+            std::fs::write(
+                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
+                b"stale",
+            )
+            .unwrap();
+        }
+
+        let (path, mut file) = create_tempfile_in(dir.path(), &counter).unwrap();
+        file.write_all(b"fresh").unwrap();
+        drop(file);
+        assert_eq!(
+            path.file_name().unwrap(),
+            format!(".tmp-{}-2", std::process::id()).as_str()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        for n in 0..2 {
+            assert_eq!(
+                std::fs::read(dir.path().join(format!(".tmp-{}-{n}", std::process::id()))).unwrap(),
+                b"stale"
+            );
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn staging_collision_retries_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        for n in 0..128 {
+            std::fs::write(
+                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
+                b"stale",
+            )
+            .unwrap();
+        }
+
+        let error = create_tempfile_in(dir.path(), &counter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(counter.load(Ordering::Relaxed), 128);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 128);
+    }
+
+    #[test]
+    fn staging_does_not_retry_other_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        let missing = dir.path().join("missing");
+
+        let error = create_tempfile_in(&missing, &counter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert!(!missing.exists());
+    }
+
+    #[test]
     fn version_bump_invalidates() {
         let v1 = Upper {
             version: 1,
@@ -155,5 +240,105 @@ mod tests {
     fn refuses_cache_inside_repo() {
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
+    }
+
+    #[test]
+    fn concurrent_publication_reuses_existing_entry_and_removes_staging() {
+        use std::sync::Mutex;
+
+        /// Simulates a second worker publishing the target file while our
+        /// `convert` is in flight, and (on Windows) holding it open without
+        /// delete-share so `rename` fails with a sharing violation.
+        struct Racing {
+            target: PathBuf,
+            held: Mutex<Option<std::fs::File>>,
+        }
+
+        impl Converter for Racing {
+            fn id(&self) -> &'static str {
+                "test.racing"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                let bytes = input.to_ascii_uppercase();
+                std::fs::create_dir_all(self.target.parent().unwrap())?;
+                std::fs::write(&self.target, &bytes)?;
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    // FILE_SHARE_READ (1) without FILE_SHARE_DELETE forces
+                    // `std::fs::rename` over `target` to fail on Windows.
+                    let reader = std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(&self.target)?;
+                    *self.held.lock().unwrap() = Some(reader);
+                }
+                Ok(bytes)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let probe = Racing {
+            target: PathBuf::new(),
+            held: Mutex::new(None),
+        };
+        let target = cache.path_for(&CacheKey::new(&probe, b"race"));
+        let conv = Racing {
+            target: target.clone(),
+            held: Mutex::new(None),
+        };
+
+        let got = cache.get_or_convert(&conv, b"race").unwrap();
+        drop(conv.held.lock().unwrap().take());
+        assert_eq!(got, target);
+        assert_eq!(std::fs::read(&got).unwrap(), b"RACE");
+        assert_eq!(
+            std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+            1,
+            "staging file should be removed"
+        );
+    }
+
+    #[test]
+    fn concurrent_threads_converting_same_key_all_succeed() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::open(tmp.path().join("cache")).unwrap());
+        let conv = Arc::new(Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        });
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let cache = cache.clone();
+                let conv = conv.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let path = cache.get_or_convert(conv.as_ref(), b"shared").unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), b"SHARED");
+                    path
+                })
+            })
+            .collect();
+
+        let paths: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for p in &paths[1..] {
+            assert_eq!(p, &paths[0]);
+        }
+        assert_eq!(
+            std::fs::read_dir(paths[0].parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
     }
 }

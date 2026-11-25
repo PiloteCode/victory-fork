@@ -153,6 +153,20 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if at.is_null() {
+        let error = std::io::Error::last_os_error();
+        if kind & MEM_COMMIT != 0 {
+            commit_refused(size, "virtual memory", error);
+        } else {
+            tracing::warn!(
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                %error,
+                "XMemVirtualAlloc refused"
+            );
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -296,6 +310,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
+        tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
     // SAFETY: the block holds the alignment (at least the header) and then
@@ -618,6 +633,9 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 /// not by whole pages: the title packs several small textures into one
 /// page and fills each with a request of its own.
 pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
     let Some(end) = offset.checked_add(len) else {
         return Vec::new();
     };
@@ -642,7 +660,9 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     let mut runs: Vec<(usize, usize)> = Vec::new();
     for (at, bytes) in pieces {
         match runs.last_mut() {
-            Some((start, n)) if *start + *n == at => *n += bytes,
+            Some((start, n)) if at <= start.saturating_add(*n) => {
+                *n = start.saturating_add(*n).max(at.saturating_add(bytes)) - *start;
+            }
             _ => runs.push((at, bytes)),
         }
     }
@@ -830,7 +850,14 @@ fn commit(base: usize, len: usize) -> bool {
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
     }
-    let error = std::io::Error::last_os_error();
+    commit_refused(len, "physical pages", std::io::Error::last_os_error());
+    false
+}
+
+/// Reports memory the host would not give: at the Windows commit limit to
+/// `crashes.log`, since the title usually faults soon after on the null it
+/// gets; otherwise as a warning.
+fn commit_refused(len: usize, what: &str, error: std::io::Error) {
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
         let mut info = PERFORMANCE_INFORMATION {
             cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
@@ -838,20 +865,25 @@ fn commit(base: usize, len: usize) -> bool {
         };
         // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
         let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
-        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
+        victory_loader::log_crash(&commit_limit_message(
+            len,
+            what,
+            &error,
+            queried.then_some(&info),
+        ));
     } else {
-        tracing::warn!(len, %error, "committing physical pages failed");
+        tracing::warn!(len, %error, "committing {what} failed");
     }
-    false
 }
 
 fn commit_limit_message(
     len: usize,
+    what: &str,
     error: &std::io::Error,
     info: Option<&PERFORMANCE_INFORMATION>,
 ) -> String {
     let mut message = format!(
-        "VIctory: Windows commit limit reached while committing {len} bytes of physical pages: {error}.\n"
+        "VIctory: Windows commit limit reached while committing {len} bytes of {what}: {error}.\n"
     );
     if let Some(info) = info {
         use std::fmt::Write;
@@ -1166,10 +1198,11 @@ mod tests {
             PageSize: 4096,
             ..Default::default()
         };
-        let report = commit_limit_message(4 * MIB, &error, Some(&info));
-        assert!(report.contains("4194304 bytes"));
+        let report = commit_limit_message(4 * MIB, "physical pages", &error, Some(&info));
+        assert!(report.contains("4194304 bytes of physical pages"));
         assert!(report.contains("2 MiB of 3 MiB in use"));
-        let fallback = commit_limit_message(4 * MIB, &error, None);
+        let fallback = commit_limit_message(4 * MIB, "virtual memory", &error, None);
+        assert!(fallback.contains("4194304 bytes of virtual memory"));
         for report in [&report, &fallback] {
             assert!(report.contains("os error 1455"));
             assert!(report.contains("Windows paging file size"));
@@ -1578,5 +1611,38 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn shown_at_handles_empty_len_and_duplicate_or_overlapping_pages() {
+        let pages = allocate(1);
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!at.is_null());
+        // Map the same physical page at two adjacent virtual pages.
+        let dup = [pages[0], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(at, 2, dup.as_ptr()), at);
+        let base = at as usize;
+
+        // Zero-length requests never emit a spurious empty run, even unaligned.
+        assert!(shown_at(&dup, 0, 0).is_empty());
+        assert!(shown_at(&dup, 0x4000, 0).is_empty());
+
+        // Duplicate physical pages in `pages` coalesce into one clean run.
+        assert_eq!(shown_at(&dup, 0, 2 * PAGE), vec![(base, 2 * PAGE)]);
+
+        // Partial overlapping slices on the same physical page coalesce cleanly.
+        assert_eq!(
+            shown_at(&dup, 0x1000, PAGE + 0x2000),
+            vec![(base, 2 * PAGE)]
+        );
+
+        assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 }

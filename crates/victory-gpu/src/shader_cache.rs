@@ -82,10 +82,19 @@ fn build() -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Read the same adapter facts as the title before building warm-up keys.
+pub fn prepare_warm() -> Result<(), String> {
+    if crate::host::host().is_none() {
+        return Err("shader cache warm-up could not initialize the host D3D12 adapter".into());
+    }
+    crate::descriptor::host::probe_view_limit();
+    Ok(())
+}
+
 /// The offline warm-up (`victory translate --warm`): `container` is
 /// translated into the cache unless it is there already. `Ok(true)`: it
 /// was translated now. Needs [`use_shader_cache`] and the same host facts
-/// the run will have (`victory_shader::emit::translation_fingerprint`).
+/// the run will have ([`prepare_warm`]).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
     let ran = AtomicBool::new(false);

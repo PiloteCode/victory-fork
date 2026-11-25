@@ -36,6 +36,18 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// Initialize the adapter facts used by the offline shader cache.
+pub fn prepare_shader_warm() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prepare_warm()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("no shader cache on this host".into())
+    }
+}
+
 /// The offline warm-up: see `victory_gpu::shader_cache::warm`.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]

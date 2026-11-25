@@ -83,8 +83,15 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own).
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`victory run title.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -412,6 +419,21 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     )
 }
 
+fn volume_root(host: &mut Vec<u16>) {
+    let prefix = if host.starts_with(&VERBATIM) {
+        VERBATIM.len()
+    } else {
+        0
+    };
+    if let [_, colon, sep, ..] = host[prefix..]
+        && colon == u16::from(b':')
+        && SEPARATORS.contains(&sep)
+    {
+        host.truncate(prefix + 3);
+        host.push(0);
+    }
+}
+
 /// Wants a volume root: a virtual drive answers for the host volume its
 /// folder is on.
 pub extern "system" fn GetDiskFreeSpaceW(
@@ -422,12 +444,8 @@ pub extern "system" fn GetDiskFreeSpaceW(
     clusters: *mut u32,
 ) -> i32 {
     let mut p = wide(root);
-    if let Some(host) = &mut p.1
-        && let [letter, colon, sep, ..] = host[..]
-        && colon == u16::from(b':')
-        && SEPARATORS.contains(&sep)
-    {
-        *host = vec![letter, colon, sep, 0];
+    if let Some(host) = &mut p.1 {
+        volume_root(host);
     }
     host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)(
         p.ptr(),
@@ -867,6 +885,17 @@ mod tests {
         );
     }
 
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
+    }
+
     #[test]
     fn long_title_paths_work_on_the_host() {
         let dir = tempfile::tempdir().unwrap();
@@ -1000,5 +1029,49 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn disk_free_space_truncates_to_volume_root() {
+        let mut plain = w(r"C:\dir\sub");
+        volume_root(&mut plain);
+        assert_eq!(plain, w(r"C:\"));
+
+        let mut verbatim = w(r"\\?\C:\dir\sub");
+        volume_root(&mut verbatim);
+        assert_eq!(verbatim, w(r"\\?\C:\"));
+
+        let mut unc = w(r"\\?\UNC\server\share\dir");
+        volume_root(&mut unc);
+        assert_eq!(unc, w(r"\\?\UNC\server\share\dir"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let (mut spc, mut bps, mut free, mut total) = (0, 0, 0, 0);
+        assert_ne!(
+            GetDiskFreeSpaceW(
+                w(&format!(r"{letter}:\")).as_ptr(),
+                &mut spc,
+                &mut bps,
+                &mut free,
+                &mut total,
+            ),
+            0
+        );
+        assert_ne!(spc * bps, 0);
+        assert_ne!(total, 0);
+
+        let (mut v_spc, mut v_bps, mut v_free, mut v_total) = (0, 0, 0, 0);
+        assert_ne!(
+            GetDiskFreeSpaceW(
+                w(&format!(r"\\?\{letter}:\")).as_ptr(),
+                &mut v_spc,
+                &mut v_bps,
+                &mut v_free,
+                &mut v_total,
+            ),
+            0
+        );
+        assert_eq!((v_spc, v_bps, v_total), (spc, bps, total));
     }
 }
