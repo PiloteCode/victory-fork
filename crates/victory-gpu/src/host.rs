@@ -303,13 +303,28 @@ pub(crate) fn removal_context() -> String {
     let now = now_us();
     let ms = |at: u64| now.saturating_sub(at) as f64 / 1000.0;
     let phase = match SUBMITTING[0].load(Ordering::Relaxed) {
-        0 => "between submissions (nothing of ours was running on the card)",
-        1 => "preparing a submission (nothing of ours was running on the card)",
+        0 => "between submissions",
+        1 => "preparing a submission",
         2 => "waiting for the card to run a submission",
-        _ => "copying back what a submission wrote (nothing of ours was running on the card)",
+        _ => "copying back what a submission wrote",
+    };
+    // Whatever the submitting thread does, flights sent ahead may be on the
+    // card ("nothing of ours was running on the card" was said of every
+    // phase but the wait, and misread when the three losses of 2026-11-25
+    // came with the thread preparing).
+    let flights = match LINE.try_lock() {
+        Ok(line) => {
+            let flights = line.line.iter().filter(|l| matches!(l, Late::Run(_))).count();
+            format!(
+                "flights sent ahead not landed: {flights} ({} lists), {} bottom-of-pipe writes of flights being landed",
+                line.lists,
+                line.in_hand.len()
+            )
+        }
+        Err(_) => "the line of flights sent ahead was held by another thread".to_owned(),
     };
     let mut text = format!(
-        "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {}",
+        "the submitting thread was {phase}, of {} lists, for {:.1} ms; {flights}; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {} (started and not finished: the one being prepared, if counted, and those on the card)",
         SUBMITTING[1].load(Ordering::Relaxed),
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
         crate::pipeline::library_removal_note(),
@@ -334,6 +349,13 @@ pub(crate) fn log_removal_context() {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
+    // Whoever finds the device gone first: every list the card had not
+    // finished, on every queue (a failed send ahead named none).
+    if dred_on()
+        && let Some(host) = host()
+    {
+        tracing::error!("device-removed data, all queues{}", host.removal_data(&[]));
+    }
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -638,6 +660,7 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
+        name(&queue, || "host queue".into());
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -804,8 +827,9 @@ pub(crate) struct HostList {
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
+    /// Shared with [`NOTED`], where the report of a removal finds them.
     #[cfg(feature = "diagnostics")]
-    notes: Mutex<Vec<Note>>,
+    notes: std::sync::Arc<Mutex<Vec<Note>>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -833,6 +857,17 @@ const STAMPS: u32 = 4096;
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
+
+/// The notes of every host list made, by the raw pointer of its D3D12 list
+/// (diagnostics, with device-removed data on): the report of a removal
+/// names the commands of every list the card had not finished, on every
+/// queue, whichever thread finds the device gone first. (A submission sent
+/// ahead found the three losses of 2026-11-25 first, and the failure of
+/// one names no breadcrumbs, with device-removed data on or not.)
+#[cfg(feature = "diagnostics")]
+type NotedLists = std::collections::HashMap<usize, std::sync::Weak<Mutex<Vec<Note>>>>;
+#[cfg(feature = "diagnostics")]
+static NOTED: Mutex<Option<NotedLists>> = Mutex::new(None);
 
 type States = std::collections::HashMap<
     usize,
@@ -3292,8 +3327,9 @@ impl Host {
         list
     }
 
-    /// An allocator and a closed list for a prelude.
-    fn make_prelude(&self) -> Option<Prelude> {
+    /// An allocator and a closed list for a prelude, or for other work of
+    /// ours: `what`, its name in device-removed data.
+    fn make_prelude(&self, what: &str) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
@@ -3303,6 +3339,7 @@ impl Host {
                     self.device
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
                 list.Close()?;
+                name(&list, || what.to_owned());
                 Ok((allocator, list))
             })()
         };
@@ -3330,7 +3367,20 @@ impl Host {
             )?;
             let prelude = OnceLock::new();
             if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+                let _ = prelude.set(self.make_prelude("prelude"));
+            }
+            #[cfg(feature = "diagnostics")]
+            let notes = std::sync::Arc::new(Mutex::new(Vec::new()));
+            #[cfg(feature = "diagnostics")]
+            if dred_on() {
+                static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = MADE.fetch_add(1, Ordering::Relaxed);
+                name(&list, || format!("host list {n}"));
+                NOTED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(std::collections::HashMap::new)
+                    .insert(list.as_raw() as usize, std::sync::Arc::downgrade(&notes));
             }
             Ok(HostList {
                 allocator,
@@ -3346,7 +3396,7 @@ impl Host {
                 indirect_ring: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
-                notes: Mutex::default(),
+                notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
@@ -3434,7 +3484,7 @@ impl Host {
             )?;
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
-        let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
+        let list = |what| self.make_prelude(what).ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
@@ -3454,9 +3504,9 @@ impl Host {
                 ..Default::default()
             })?;
             Ok(CardWork {
-                sync: vec![list()?],
-                check: vec![list()?],
-                fetch: list()?,
+                sync: vec![list("card copies sent up")?],
+                check: vec![list("card compare")?],
+                fetch: list("card fetch")?,
                 root,
                 pso,
                 differs: (differs, data as usize, RESULTS),
@@ -3607,7 +3657,7 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         if !dirty.is_empty() {
-            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
+            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude("card copies sent up")) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
@@ -3716,7 +3766,7 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+            let Some(check) = work.check.pop().or_else(|| self.make_prelude("card compare")) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
@@ -3844,9 +3894,11 @@ impl Host {
                 let list: ID3D12GraphicsCommandList =
                     self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
                 list.Close().ok()?;
+                name(&queue, || "relay copy queue".into());
+                name(&list, || "relay fetch (copy)".into());
                 ((allocator, list), Some(queue))
             } else {
-                (self.make_prelude()?, None)
+                (self.make_prelude("relay fetch")?, None)
             };
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
@@ -5076,6 +5128,12 @@ impl Host {
                     return text;
                 }
             };
+            // The queue and list a node is of, by the names we give them
+            // (`name`: only with device-removed data on).
+            let named = |p: &D3D12_AUTO_BREADCRUMB_NODE| {
+                let text = |w: PCWSTR| if w.is_null() { "unnamed".to_owned() } else { w.to_string().unwrap_or_default() };
+                format!("{} / {}", text(p.pCommandQueueDebugNameW), text(p.pCommandListDebugNameW))
+            };
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
@@ -5083,7 +5141,7 @@ impl Host {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
                 let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                progress.push(format!("{done}/{} {index:?} ({})", p.BreadcrumbCount, named(p)));
                 node = p.pNext;
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
@@ -5094,15 +5152,23 @@ impl Host {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
                     text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
+                        "; a list ({}) stopped at command {done} of {} (op {})",
+                        named(p),
+                        p.BreadcrumbCount,
+                        history[done as usize].0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
-                    // The k-th marker command is the k-th note.
+                    // The k-th marker command is the k-th note: the list's
+                    // own, or found by its D3D12 list among all made.
                     #[cfg(feature = "diagnostics")]
-                    let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
-                        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+                    let notes = run.map(|r| r.notes.clone()).or_else(|| {
+                        let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+                        list.and_then(|l| noted.as_ref()?.get(&(l as usize))?.upgrade())
+                    });
+                    #[cfg(feature = "diagnostics")]
+                    let markers: Vec<(u32, String)> = notes.map_or_else(Vec::new, |notes| {
+                        let notes = notes.lock().unwrap_or_else(|e| e.into_inner());
                         history
                             .iter()
                             .enumerate()
@@ -5643,7 +5709,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host().and_then(|h| h.make_prelude("prelude")))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
