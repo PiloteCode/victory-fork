@@ -2225,6 +2225,12 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Since the last frame-rate line, with [`relay`]: flights landed, the
+/// microseconds from their joining the line to the end of their merges (the
+/// card's queue ahead of them, their run, the landing's wait and merges),
+/// and the longest of them.
+static FLIGHT_AIR: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Since the last frame-rate line, of the relay's landing (diagnostics):
 /// microseconds in copies in the card's memory (fetch and merge), in the
 /// CPU side's copies (compare and merge), closing the flights' ranges, and
@@ -2431,6 +2437,8 @@ struct Flight {
     number: u64,
     /// The value signalled on the host's fence behind it.
     fence: u64,
+    /// When it joined the line ([`now_us`]).
+    sent_us: u64,
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
     card: Option<CardPlan>,
@@ -3128,6 +3136,13 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+        let [landed, us, longest] = [0, 1, 2].map(|i| FLIGHT_AIR[i].swap(0, Ordering::Relaxed) as f64);
+        tracing::info!(
+            "flights from joining the line to landed: {:.1} ms on average, the longest {:.1} ms ({:.1} landed a frame)",
+            us / 1000.0 / landed.max(1.0),
+            longest / 1000.0,
+            landed / frames
         );
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -4496,9 +4511,14 @@ impl Host {
         let mut rest = std::time::Instant::now();
         let mut last = 0;
         let mut landed = Vec::new();
+        let now = now_us();
         for item in items {
             match item {
                 Late::Run(flight) => {
+                    let air = now.saturating_sub(flight.sent_us);
+                    FLIGHT_AIR[0].fetch_add(1, Ordering::Relaxed);
+                    FLIGHT_AIR[1].fetch_add(air, Ordering::Relaxed);
+                    FLIGHT_AIR[2].fetch_max(air, Ordering::Relaxed);
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
@@ -4726,6 +4746,7 @@ impl Host {
             items.push(Late::Run(Flight {
                 number: sent.number,
                 fence: *target,
+                sent_us: now_us(),
                 lists,
                 order,
                 card: sent.card,
@@ -4770,6 +4791,7 @@ impl Host {
             items.push(Late::Run(Flight {
                 number,
                 fence: *target,
+                sent_us: now_us(),
                 lists: Vec::new(),
                 order: Vec::new(),
                 card: sent.card,
@@ -6416,7 +6438,13 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide_textures() {
+                            // With the batch's other refreshes, before the
+                            // next step that writes title memory.
+                            batch.staged.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -6462,6 +6490,28 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`wide_textures`]: the staging buffers to refresh at the next
+    /// flush, each once.
+    staged: Vec<std::sync::Arc<crate::texture::Staging>>,
+}
+
+/// Whether a submission's texture refreshes (staging buffers of textures
+/// its lists read through tables) run several at a time with its buffer
+/// refreshes, at the same points (`VICTORY_WIDE_TEXTURES=1`; off by
+/// default), and not one after the other where each list asks.
+///
+/// They were all on the submitting thread: in the opening cutscene 70 to
+/// 130 ms a frame (220 to 420 MB read, hashed and detiled), with the card
+/// standing idle behind that thread more than 150 ms a frame. A staging
+/// buffer's refresh reads its texture's memory and writes its own buffer,
+/// nothing of another's (texture refreshes already run on the threads that
+/// record lists too, under each staging buffer's own lock). They are done
+/// before the next step that writes title memory, as the buffer refreshes
+/// are, so each still takes the memory as it is at its place among the
+/// submission's steps; the card reads them only when the lists run.
+fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
 }
 
 impl Batch {
@@ -6556,6 +6606,28 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        self.refresh_textures();
+    }
+
+    /// The staging buffers due ([`wide_textures`]), several at a time. The
+    /// time counted is the time it took, not the threads' sum.
+    fn refresh_textures(&mut self) {
+        let staged = std::mem::take(&mut self.staged);
+        if staged.len() < 2 {
+            for staging in staged {
+                staging.refresh();
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Ordering::Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = staged
+            .into_iter()
+            .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }
 }
 
@@ -6977,6 +7049,15 @@ impl Meter {
             crate::indirect::BUDGET
         );
         {
+            #[cfg(feature = "diagnostics")]
+            {
+                let [made, made_us] = [0, 1].map(|i| crate::resource::TEXTURES_MADE[i].swap(0, Ordering::Relaxed) as f64);
+                tracing::info!(
+                    "host textures made per frame: {:.1}, the host's calls for them {:.1} ms (all threads)",
+                    made / frames,
+                    made_us / 1e3 / frames
+                );
+            }
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
                 "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
@@ -6988,6 +7069,7 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::fence::event_waits_line(frames);
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
