@@ -148,8 +148,19 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Clamps of indirect records (no window hit) by where the records
+    /// come from: no shader the list recorded before the command may write
+    /// them (as declared: the card had them when the list began), or one
+    /// may; draws and mesh dispatches, then compute dispatches.
+    ClampFromBefore,
+    ClampWrittenInList,
+    ClampDispatchFromBefore,
+    ClampDispatchWrittenInList,
+    /// Clamps recorded into lists' preludes (`crate::indirect::early`).
+    IndirectEarly,
 }
-const COUNTERS: usize = 80;
+/// One past the last counter (it was a number kept by hand).
+const COUNTERS: usize = C::IndirectEarly as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1314,6 +1325,17 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectNotWindowedCount as usize],
         c[C::IndirectNotWindowedMany as usize],
         c[C::IndirectNotWindowedStores as usize],
+    );
+    tracing::info!(
+        "  indirect clamps per frame by their records: draws {:.0} with records no shader of the list wrote before \
+         them, {:.0} with records it may have written; dispatches {:.0} and {:.0}; {:.0} clamped in lists' \
+         preludes (VICTORY_INDIRECT_EARLY=0 turns that off: now {})",
+        c[C::ClampFromBefore as usize],
+        c[C::ClampWrittenInList as usize],
+        c[C::ClampDispatchFromBefore as usize],
+        c[C::ClampDispatchWrittenInList as usize],
+        c[C::IndirectEarly as usize],
+        if crate::indirect::early() { "on" } else { "off" },
     );
     tracing::info!("  changes of state of title textures before their use, per frame: {:.0}", c[C::StateChanges as usize]);
     // What is compared after submissions, largest first, and how much of

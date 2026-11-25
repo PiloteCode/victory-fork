@@ -991,6 +991,11 @@ fn lazy_prelude() -> bool {
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
 
+/// Of [`STAMPS`], those of the list's own commands; the two after them
+/// time its prelude when the prelude runs clamps of ours.
+#[cfg(feature = "diagnostics")]
+const LIST_STAMPS: u32 = STAMPS - 2;
+
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
@@ -2112,6 +2117,16 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Clamps of indirect records for the list's prelude
+    /// (`crate::indirect::early`), and the rings they write.
+    early: Vec<crate::indirect::Early>,
+    early_rings: Vec<ID3D12Resource>,
+    /// The ranges of title memory the list's shaders may write as declared
+    /// so far (`Step::GpuWrite`, whatever host copy: copies of the same
+    /// bytes count alike), each once (the world's passes declare the same
+    /// ranges dozens of times).
+    written: Vec<(usize, usize)>,
+    written_once: std::collections::HashSet<(usize, usize)>,
 }
 
 impl Deferred {
@@ -5601,26 +5616,35 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let (Some((_, back)), count) = (self.stamps(), notes.len().min(LIST_STAMPS as usize - 1)) else {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        let range = D3D12_RANGE { Begin: 0, End: STAMPS as usize * 8 };
         // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
+        let (stamps, early): (Vec<u64>, [u64; 2]) = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
                 return Vec::new();
             }
             let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            let e = std::slice::from_raw_parts(data.cast::<u64>().add(LIST_STAMPS as usize), 2);
+            let e = [e[0], e[1]];
             back.Unmap(0, None);
-            s
+            (s, e)
         };
+        let ms = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64;
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (ms(ticks), notes[i].0.chars().take(300).collect())
             })
             .collect();
+        // The prelude, when it ran clamps of ours (`crate::indirect::early`),
+        // as one command.
+        let clamps = self.deferred().early.len();
+        if clamps > 0 {
+            times.push((ms(early[1].saturating_sub(early[0])), format!("prelude (ours): {clamps} clamps")));
+        }
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
@@ -5644,7 +5668,7 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(LIST_STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
@@ -5987,7 +6011,11 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        // The clamps of indirect records the list has not written
+        // (`crate::indirect::early`), at every submission of the list.
+        let deferred = self.deferred();
+        let ours = !deferred.early.is_empty();
+        if barriers.is_empty() && syncs.is_empty() && !ours {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5997,11 +6025,19 @@ impl HostList {
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        // Diagnostics: the timing run times the prelude, with its clamps.
+        #[cfg(feature = "diagnostics")]
+        let stamps = self.stamps().filter(|_| ours);
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures are live; the clamps' buffers are kept by the
+        // list.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                #[cfg(feature = "diagnostics")]
+                if let Some((heap, _)) = stamps {
+                    list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, LIST_STAMPS);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -6011,9 +6047,18 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                if !deferred.early.is_empty() {
+                    crate::indirect::record_early(list, &deferred.early, &deferred.early_rings);
+                }
+                #[cfg(feature = "diagnostics")]
+                if let Some((heap, back)) = stamps {
+                    list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, LIST_STAMPS + 1);
+                    list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, LIST_STAMPS, 2, back, u64::from(LIST_STAMPS) * 8);
+                }
                 list.Close()
             })
         };
+        drop(deferred);
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
@@ -6045,7 +6090,7 @@ impl HostList {
         {
             let started = std::time::Instant::now();
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+            if let Some((heap, _)) = self.stamps() && at < LIST_STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
@@ -6222,9 +6267,36 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let range = (address, address.saturating_add(len));
+        if deferred.written_once.insert(range) {
+            deferred.written.push(range);
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// Whether the list's shaders recorded so far may write a byte of
+    /// `[from, to)` of title memory, as they declare their writes
+    /// ([`HostList::defer_gpu_write`]).
+    pub(crate) fn writes_declared(&self, (from, to): (usize, usize)) -> bool {
+        self.deferred().written.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    /// A clamp of indirect records into `ring` for the list's prelude
+    /// (`crate::indirect::early`): recorded there at each submission of
+    /// the list until it is reset.
+    pub(crate) fn early_clamp(&self, clamp: crate::indirect::Early, ring: &ID3D12Resource) {
+        let mut deferred = self.deferred();
+        deferred.early.push(clamp);
+        if !deferred.early_rings.iter().any(|r| r.as_raw() == ring.as_raw()) {
+            deferred.early_rings.push(ring.clone());
+        }
+    }
+
+    /// The clamps noted for the list's prelude (the tests).
+    #[cfg(test)]
+    pub(crate) fn deferred_early(&self) -> usize {
+        self.deferred().early.len()
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
