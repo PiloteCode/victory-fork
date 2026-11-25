@@ -79,10 +79,48 @@ What did it, on top of the list below:
   0 here, but the card got busier, so no gain is claimed yet). The frame is
   still 250 to 380 ms: the card is the limit now, most of it the
   per-record clamp before each of some 6,700 indirect draws a frame.
-- Tried and NOT in this tree: pull request #220 (cheaper indirect draws)
-  with `VICTORY_INDIRECT_WINDOW=1` cut the card's time from about 100-150
-  to 35-80 ms a frame here, and lost the device twice (once with a page
-  fault on the card after 160 s). Do not turn windows on with it yet.
+- Pull request #220 (cheaper indirect draws) is IN this tree now, its
+  windows off by default (`VICTORY_INDIRECT_WINDOW=1`). History, so nobody
+  repeats it: with windows on it lost the device three times here. Its own
+  checker (`VICTORY_INDIRECT_WINDOW_CHECK=1`) then showed one list drawing
+  90 records of 2^24 vertices from a window, where the per-draw path lets
+  eight through; a record of 2^23 vertices an instance or more now runs
+  empty. Since that fix: five runs with windows on, no device loss, the
+  card's time per frame roughly halved. One loss after the fix had the
+  in-flight fetch (#648) on as well; do not combine the two. The in-flight
+  fetch itself measured slower here in two runs and stays off. (In this
+  fork windows have been on by default since its second pass, below; they
+  stay on with the fix: see "Upstream's second night, merged".)
+- Frame rate, second night (an RTX 4070; the first room went from about
+  3.5-4 to 6-7 frames a second with ALL of the switches below; the
+  defaults are unchanged and give about 4.5-5):
+  - `VICTORY_ASYNC_SUBMIT=1`: submissions are prepared and sent by a
+    thread of the layer, not by the title's render thread, which a
+    profile showed inside the submit path for 257 of 292 ms a frame.
+  - `VICTORY_QUEUE2=1`: fetches of what shaders wrote go to a copy queue
+    (brought back, with the fix for a piece fetched beside a later
+    flight); the copy-back thread's wait fell from about 125 to 7 ms a
+    frame. (On by default in this fork, in place of its own copy queue.)
+  - `VICTORY_INDIRECT_WINDOW=1`: see above.
+  - `VICTORY_TEXTURE_NO_WAIT=1`: a texture refresh no longer waits while
+    the title remaps memory; the loading phase had 5 readings over a
+    second where it had 18.
+  - `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096`: title bytes put in
+    under flights' shader writes are joined over small gaps (NOT exact:
+    read the comment at `merge_gap` before using it).
+  - On by default: fills of upload memory and read-only buffer copies no
+    longer wait for flights and are checked against what the flights then
+    wrote (`VICTORY_FILL_WAIT=1` waits as before; no mismatch in any run
+    so far); up to 512 idle host lists and texture staging buffers are
+    reused instead of made and freed every frame (the staging buffers by
+    this fork's own pool, which was there first).
+  - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
+    the layer; it is how the above was found.
+  Still open: the frame rate dips (5-second readings of 300-500 ms among
+  150-215); in some of them texture uploads are 3-5 times the usual, in
+  others nothing logged stands out. Not shader compiles (checked: 4-9
+  first uses and no waiting in those readings). A per-frame logger is the
+  next step.
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).
@@ -205,6 +243,37 @@ writes are copied into upload memory on the CPU (they are not on the
 256-byte line a host constant view needs). The paired form makes 36 compute
 programs exact at about 2.9 times their DXIL size (a thread runs two console
 lanes, at half the threads): not timed in a run yet.
+
+### Upstream's second night, merged (f85101b)
+
+Where upstream and this fork had each done the same thing, one was kept:
+
+| Both had | Kept | Why |
+|----------|------|-----|
+| Fetches of what shaders wrote on a copy queue (ours: `VICTORY_RELAY_COPY_QUEUE`, on; upstream: `VICTORY_QUEUE2` bit 1, off) | upstream's lane, on by default here | ours had the hole upstream fixed: a piece fetched while a later flight writes it comes down half written, and when that flight leaves it as it was, nothing fetches it again. Upstream's WARP test fails on our fetch as it stood (title memory keeps the half-way value) and passes on the merge. On by default as ours was (ours took the gameplay frame from 213 to 170 ms when it went in, 5afe21a); `VICTORY_QUEUE2=0` fetches on the direct queue, and so does `VICTORY_RELAY_COPY_QUEUE=0` with `VICTORY_QUEUE2` unset |
+| Indirect records left readable between draws (ours: noted after each draw; upstream: tracked at the clamp) | upstream's tracking | the same barriers; nothing depends on each draw reporting back |
+| Cheaper indirect clamps (ours: a ring behind one enhanced barrier; upstream: one budget charge per group, the budget in the card's memory) | both: the ring stays the default, upstream's clamp program and budget serve both paths (the program also runs this fork's split dispatches, and counts compute records per group) | they cut different costs |
+| Windows of indirect records (ours: on by default; upstream: off, three device losses with them on, then a fix) | on, with upstream's fix: a draw record of 2^23 vertices an instance or more runs empty | measured in the second pass; `VICTORY_INDIRECT_WINDOW_CHECK=1` now works with the ring too |
+| Spare texture staging buffers (ours: classes of an eighth, 1 GiB; upstream: powers of two up to 8 MiB, 256 MB) | ours (`VICTORY_STAGING_POOL=0` turns it off as well) | measured first here, wastes less, pools every size |
+
+Upstream's alone, as it shipped them: the submit thread
+(`VICTORY_ASYNC_SUBMIT=1`, off; with it a page remap first sends what the
+queues hold and may run, so that it is prepared from title memory as it
+stood), fills of upload memory and read-only buffer copies that no longer
+wait for flights (on; the first fill that read bytes a flight then changed
+turns the waits back on, and says so in the log; `VICTORY_FILL_WAIT=1`
+waits from the start), 512 idle host lists,
+`VICTORY_MERGE_GAP`/`VICTORY_MERGE_RUNS`, `VICTORY_PROFILE` (diagnostics).
+
+Not timed in a game run on this machine yet (the runs go through the
+general test of the merged build). Checked on the software adapter
+(`VICTORY_D3D12_WARP=1`, diagnostics): upstream's test of the fetch beside
+a later flight fails on this fork's fetch as it stood and passes on the
+merge (and fails again with `VICTORY_QUEUE2_REFETCH=0`); the end-to-end
+test of the copies in the card's memory gives the same title memory with
+`VICTORY_QUEUE2` at 0, 1 (the default) and 3; the indirect tests, the
+window check and the draws with no barrier of their own included, run on
+both the ring and the scratch buffer.
 
 To run it: `Lancer GTA6 (VIctory).bat` next to the game's files builds the
 release and starts the title.

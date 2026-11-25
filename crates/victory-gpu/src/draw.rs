@@ -148,7 +148,7 @@ const WINDOW_MOST: u64 = 64;
 /// It was off by default, and saved nothing measurable then: after each
 /// draw the scratch buffer went back to the common state, a change of
 /// state per draw as costly as the bounding pass it saved. With the buffer
-/// left read between draws (`HostList::scratch_read`), two pairs of runs on
+/// left read between draws (`HostList::indirect_readable`), two pairs of runs on
 /// an RTX 5090 (2026-11-25, the opening of the gameplay) gave the card
 /// 95 and 103 ms a frame with windows against 131 and 129 without, frames
 /// of 221 and 218 ms against 240 and 238.
@@ -165,7 +165,9 @@ const WINDOW_MOST: u64 = 64;
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
-/// their record there with no pass of ours, until one of these: a compute
+/// their record there with no pass of ours and no barrier (the scratch
+/// buffer stays readable as arguments until the next clamp), until one of
+/// these: a compute
 /// dispatch, a direct draw, an indirect call with a count buffer or more
 /// than one record, a draw whose shaders can store to buffers, a record
 /// outside the window, another host list.
@@ -179,10 +181,18 @@ const WINDOW_MOST: u64 = 64;
 /// never opened: run 87, with the switch, still clamped 5,068 records a
 /// frame one at a time.
 ///
-/// What it costs the guard against garbage records: nothing against a
-/// hang (every record is bounded as before and charged to the list's
-/// budget as before), but the budget is charged when a window is clamped,
-/// so also for records of the window's tail that are never drawn. Those
+/// What it costs the guard against garbage records: every record is
+/// bounded as before, but charged to the list's budget once, when its
+/// window is clamped, however often the title draws it from there. Upstream
+/// (f85101b, where windows are off by default) lost the device three times
+/// with them on; its window check then found one list drawing 90 records of
+/// 2^24 vertices from a window, where the clamp of each draw lets eight run
+/// on the list's budget. A draw record of 2^23 vertices an instance or more
+/// now runs empty in every clamp (`MOST_DRAW` in `crate::indirect`), and
+/// `VICTORY_INDIRECT_WINDOW_CHECK=1` clamps each draw served from a window
+/// again and compares. The budget is charged when a window
+/// is clamped, so also for records of the window's tail that are never
+/// drawn. Those
 /// hold garbage in this title (slots of all ones: run 93 spent lists'
 /// budgets on them and emptied the draws after), so in a window a record
 /// that asks for more than can run is left empty and charges nothing
@@ -3252,7 +3262,7 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base)));
+            .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base), w.step));
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -3278,7 +3288,23 @@ impl State {
             }
         }
         let (bounded, at) = match hit {
-            Some(hit) => hit,
+            Some((scratch, at, step)) => {
+                // Diagnostics of windows: the record clamped again and
+                // compared (`crate::indirect::window_check`).
+                if crate::indirect::window_check()
+                    && crate::indirect::check_hit(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step),
+                        &scratch,
+                        at,
+                    )
+                {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                (scratch, at)
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -3385,7 +3411,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -3406,7 +3431,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         if builder_dry() && crate::pipeline::is_builder(self.pipeline as This) {
-            crate::indirect::done(list, &bounded);
+            // (The list knows where the clamp left the records: nothing to
+            // give back when they are not read.)
             return true;
         }
         if kind == MESH {
@@ -3440,7 +3466,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        // The scratch buffer stays readable as arguments: the next draw of
+        // the window reads it with no barrier, and the next clamp moves it
+        // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
