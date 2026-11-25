@@ -39,7 +39,8 @@
 //! again, the merges' reads, other code of this executable, the runtime's
 //! included) are counted and do not end the watch: the guard is put back
 //! after them (in place: when the copy is done, [`after_own_copy`]; through
-//! the kernel, whose read fails once on a guard: [`read_again`]). The
+//! the kernel, whose read fails on a guard and leaves it: [`read_again`]
+//! takes it off in place and reads again). The
 //! guards' changes of protection keep the page's guard
 //! ([`protection_set`]), and every change of ours is made under the guards'
 //! lock (`crate::watch::hold_guards`). The answer is in the per-second line
@@ -49,8 +50,10 @@
 //! What it costs and risks, with the switch on only: a fault and a change
 //! of protection per own read of a watched page (some microseconds, at most
 //! [`MOST_ARMED`] pages); a system call of the title that reads or writes a
-//! watched page fails once (the kernel's access takes the guard and fails),
-//! as one that writes into a guarded block does today.
+//! watched page fails (the kernel leaves the guard) until the page is let go
+//! (its next touch in place, [`expiry_ms`] at most), as one that writes into
+//! a guarded block does today. The runtime's own reads and writes into title
+//! memory take the guards off first (`crate::watch::writing`).
 //!
 //! `VICTORY_COPYBACK=off` ([`off`]) is a MEASUREMENT mode, never a default:
 //! what shaders write is not copied back into title memory at all, but for
@@ -62,8 +65,9 @@
 //! [`reads_wait`]). Copies in the card's memory are neither hashed nor
 //! compared nor fetched for the ranges left out. Fences, labels and
 //! bottom-of-pipe writes, the title's read-backs (texture backs among
-//! them), presents and the flights' landing are as before. It shows the ceiling of stages 3 and 4, and what
-//! breaks when the CPU never sees the card's results; expect wrong pictures
+//! them), presents and the flights' landing are as before. It shows the
+//! ceiling of stages 3 and 4, and what breaks when the CPU never sees the
+//! card's results; expect wrong pictures
 //! where the title's CPU writes a 64 KiB piece the card also wrote (the next
 //! upload sends the title's stale bytes over the card's).
 //! `VICTORY_COPYBACK=lazy` and `=predict` are not in this build yet: they
