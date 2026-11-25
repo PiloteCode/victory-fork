@@ -3215,13 +3215,22 @@ impl<'a> Lower<'a> {
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
-        // host waves know every lane runs that block, and in the paired form, whose host wave
-        // runs every block with all its lanes.
+        // host waves know every lane runs that block, in the paired form, whose host wave
+        // runs every block with all its lanes, and where the console's waves are the host's,
+        // in a block every lane runs.
         let made = self.def_block.get(&lo).copied();
+        let native = self.mask_data == MaskData::Console
+            && self.exchange.is_none()
+            && self.twin.is_none()
+            && !self.local;
+        let every = |b: usize, st: &Structured| {
+            all_lane_blocks(st).is_some_and(|all| all.get(b).copied().unwrap_or(false))
+        };
         let whole = self.twin.is_some()
-            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b))
+            || native && made.is_none_or(|b| every(b, self.x.st));
         if !self.x.st.active.contains(&lo) && !whole {
-            if self.exchange.is_some() && !self.local {
+            if (self.exchange.is_some() || native) && !self.local {
                 need(made.unwrap_or(0));
             }
             return Err(MASK_ELSEWHERE);
@@ -11861,5 +11870,19 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn native_wave32_complement_mask_in_all_lanes_block_lowers() {
+        // A complement of EXEC holds lanes outside EXEC, but in an all-lanes
+        // block of a native wave32 compute shader every lane runs the ballot.
+        let words = [
+            0x8802_C17E, // s_xor_b32 s2, exec_lo, -1
+            0x7E02_0202, // v_mov_b32 v1, s2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        lower_wave(&words, Vec::new(), Vec::new(), false).unwrap();
     }
 }
