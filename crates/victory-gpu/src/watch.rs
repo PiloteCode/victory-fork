@@ -759,6 +759,10 @@ fn set_protection(from: usize, to: usize, protect: u32, kind: usize) -> bool {
     }
     #[cfg(not(feature = "diagnostics"))]
     let _ = kind;
+    if ok {
+        // The copy-back measurement keeps its guards over ours (coh-lazy).
+        crate::coherence::protection_set(from * BLOCK, to * BLOCK, protect);
+    }
     ok
 }
 
@@ -1014,6 +1018,15 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     return track::locked(&GUARDS);
     #[cfg(not(feature = "diagnostics"))]
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs `f` with the guards' lock held: no protection of the guards changes
+/// meanwhile. For `crate::coherence`, whose one-shot guards on single pages
+/// must not race a change of the blocks around them (its
+/// `protection_set` is told of every such change, under this lock).
+pub(crate) fn hold_guards<R>(f: impl FnOnce() -> R) -> R {
+    let _g = guards();
+    f()
 }
 
 /// `[first, last)` added to `ranges` (in order, joined). For ranges seen
@@ -1832,6 +1845,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize, cause: usize) -> bool {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory. Upstream c75fdba's busy window, on these guards.
 pub fn writing(at: usize, len: usize) -> Writing {
+    // The one-shot guards of `crate::coherence` there come off first: the
+    // kernel's write would fail on one.
+    crate::coherence::written_over(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let end = at.saturating_add(len);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
@@ -1922,6 +1938,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         return;
     }
     crate::uheap::page_written(at, len);
+    crate::coherence::written_over(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -2219,6 +2236,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     #[cfg(feature = "diagnostics")]
     remap_hook_part(3, &mut part);
+    crate::coherence::remapped(at, len);
     remapped_guards(at, len);
     #[cfg(feature = "diagnostics")]
     {
@@ -2405,6 +2423,7 @@ fn reopen_unknown(at: usize) -> bool {
     // SAFETY: a block of a title view; only its protection changes.
     let opened = unsafe { VirtualProtect(block as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
     if opened {
+        crate::coherence::protection_set(block, block + BLOCK, PAGE_READWRITE);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block no guard knew was opened"));
     }

@@ -219,7 +219,31 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         COUNT[2].fetch_add(1, Relaxed);
         note_fault(from as usize, len);
     }
+    // The watched pages the copy read get their guards back
+    // (`crate::coherence`, `VICTORY_COPYBACK_STATS=1`).
+    crate::coherence::after_own_copy();
     whole
+}
+
+/// Reads the byte at `at` in place, through [`guarded`]: false if its page
+/// is not there. For `crate::coherence`, which takes its one-shot guards
+/// off this way (the fault lets the guard go; no change of protection).
+pub(crate) fn touch(at: usize) -> bool {
+    let mut byte = 0u8;
+    guarded(&mut byte, at as *const u8, 1)
+}
+
+/// The address of the instruction that copies in place: a fault there is
+/// one of our copies'.
+pub(crate) fn copy_instruction() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        (&raw const victory_copy_guarded_at) as usize
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
 }
 
 /// With the frame line: what [`copy`] did per frame over `frames`.

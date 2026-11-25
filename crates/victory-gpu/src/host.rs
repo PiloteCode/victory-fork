@@ -3027,8 +3027,14 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
+    // `VICTORY_COPYBACK=off` (a measurement mode): what the flights write
+    // never comes back, so reads of it do not wait for them.
+    let wait = crate::coherence::reads_wait();
     for list in runs {
         for step in &list.deferred().copies {
+            if !wait && matches!(step, Step::Copy(..) | Step::Fill(..) | Step::Texture(_)) {
+                continue;
+            }
             match step {
                 &Step::Copy(dst, src, len) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
@@ -4195,7 +4201,8 @@ fn relay_hand_back(back: &[Declared]) {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
-        join_ranges(&mut spans, declared.iter().copied());
+        // (`VICTORY_COPYBACK=off`: only small ranges.)
+        join_ranges(&mut spans, declared.iter().copied().filter(|&(a, b)| crate::coherence::copied_back(a, b)));
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
@@ -4543,7 +4550,9 @@ fn hand_back(back: &[Declared]) {
             if shadow.carded() {
                 continue;
             }
-            let mut sorted = declared.clone();
+            // (`VICTORY_COPYBACK=off`: only small ranges.)
+            let mut sorted: Vec<(usize, usize)> =
+                declared.iter().copied().filter(|&(a, b)| crate::coherence::copied_back(a, b)).collect();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
             for (from, to) in sorted {
@@ -4581,8 +4590,10 @@ fn hand_back(back: &[Declared]) {
         // every one whole was gigabytes a frame (0.3-0.5 s) for the few
         // MB shaders wrote. Only ranges that overlap or touch are
         // joined: what lies between two was not given to shaders (the
-        // snapshot does not hold it).
-        let mut sorted = declared.clone();
+        // snapshot does not hold it). (`VICTORY_COPYBACK=off`: only small
+        // ranges.)
+        let mut sorted: Vec<(usize, usize)> =
+            declared.iter().copied().filter(|&(a, b)| crate::coherence::copied_back(a, b)).collect();
         sorted.sort_unstable();
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for (from, to) in sorted {
@@ -5048,6 +5059,14 @@ impl Host {
             let before = declared.len();
             declared.retain(|(shadow, _)| !crate::census::is_wc(shadow.title_start()));
             crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
+        }
+        // `VICTORY_COPYBACK=off` (a measurement mode): the same for every
+        // declared range but small ones (`crate::coherence::off_keep`).
+        if crate::coherence::off() {
+            for (_, ranges) in declared.iter_mut() {
+                ranges.retain(|&(a, b)| crate::coherence::copied_back(a, b));
+            }
+            declared.retain(|(_, ranges)| !ranges.is_empty());
         }
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
@@ -8870,7 +8889,10 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let mut read = || unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    // A guard of `crate::coherence` (`VICTORY_COPYBACK_STATS=1`) fails the
+    // kernel's read until it is taken off: taken off, and read again.
+    read() || crate::coherence::read_again(src as usize, len, read)
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -8940,6 +8962,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if crate::bvhtrace::armed() {
         crate::bvhtrace::put_back(dst as u64, len as u64);
     }
+    // What becomes of it (`VICTORY_COPYBACK_STATS=1`); the caller's
+    // `Writing` still holds the blocks open.
+    crate::coherence::merged(dst as usize, len);
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -9239,6 +9264,7 @@ impl Meter {
         crate::fence::event_waits_line(frames);
         crate::plaincopy::line(frames);
         crate::uheap::line(frames);
+        crate::coherence::line(frames);
         if let Some(host) = host() {
             host.drain_messages();
         }

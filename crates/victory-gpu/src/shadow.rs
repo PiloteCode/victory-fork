@@ -2577,6 +2577,8 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
+                // (Watched pages there: the card wrote them again first.)
+                crate::coherence::landing(start + at, n);
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
                     continue;
@@ -2668,6 +2670,8 @@ impl Shadow {
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
         title.clear();
         title.resize(n, 0);
+        // (Watched pages there: the card wrote them again first.)
+        crate::coherence::landing(start + at, n);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
         if !crate::host::read_into((start + at) as *const u8, title) {
@@ -3380,6 +3384,8 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
+        // (Watched pages there: the card wrote them again first.)
+        crate::coherence::landing(start + at, n);
         if crate::host::read_into((start + at) as *const u8, title) {
             // The stretch as read: what the card did not change is the
             // title's, and may have been written again since.
@@ -3461,6 +3467,8 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
+        // (Watched pages there: the card wrote them again first.)
+        crate::coherence::landing(start + at, n);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
