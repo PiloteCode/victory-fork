@@ -13,11 +13,18 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+        Self::from_parts(converter.id(), converter.version(), &[input])
+    }
+
+    /// Identifies a conversion without first concatenating its input parts.
+    pub fn from_parts(id: &str, version: u32, input: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new();
-        h.update(converter.id().as_bytes());
+        h.update(id.as_bytes());
         h.update(&[0]);
-        h.update(&converter.version().to_le_bytes());
-        h.update(input);
+        h.update(&version.to_le_bytes());
+        for part in input {
+            h.update(part);
+        }
         CacheKey(h.finalize())
     }
 
@@ -57,11 +64,18 @@ impl Cache {
         let output = converter
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
+        self.store(&key, &output)?;
+        Ok(path)
+    }
+
+    /// Atomically publishes already-converted output, replacing any old entry.
+    pub fn store(&self, key: &CacheKey, output: &[u8]) -> Result<()> {
+        let path = self.path_for(key);
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
         let (tmp, mut file) = tempfile_in(dir)?;
-        let written = file.write_all(&output);
+        let written = file.write_all(output);
         drop(file);
         if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);
@@ -76,7 +90,7 @@ impl Cache {
                 return Err(err.into());
             }
         }
-        Ok(path)
+        Ok(())
     }
 }
 
@@ -234,6 +248,18 @@ mod tests {
             runs: AtomicUsize::new(0),
         };
         assert_ne!(CacheKey::new(&v1, b"x"), CacheKey::new(&v2, b"x"));
+    }
+
+    #[test]
+    fn splitting_the_input_keeps_the_same_key() {
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            CacheKey::from_parts(conv.id(), conv.version(), &[b"ab", b"c"]),
+            CacheKey::new(&conv, b"abc")
+        );
     }
 
     #[test]
