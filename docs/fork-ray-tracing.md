@@ -1,11 +1,14 @@
 # Ray tracing in this fork: what the title does and what has been built
 
 Status, 2026-11-25: **nothing is lit by ray tracing yet.** With
-`VICTORY_BVH_BUILDER=1` the builder now runs its whole first frame in the
-game (some 12,000 dispatches in the user-save scenario), but the title still
-dies one frame later, its threads reading pointers of all ones out of pages
-that hold what the builder wrote (run rt-int1, on the integration branch).
-The builder stays off by default.
+`VICTORY_BVH_BUILDER=1` the builder runs its whole first frame in the game
+(some 12,000 dispatches in the user-save scenario). In run rt-int1 the title
+died one frame later, its threads reading pointers of all ones out of pages
+that held what the builder wrote. The cause is found and fixed: the builder
+dispatches its box rehydration by thread counts, which the layer took for
+group counts, and those stages wrote empty nodes over gigabytes past their
+structures (see "Dispatches by thread counts" below). No run with the fix
+has been made yet. The builder stays off by default.
 
 ## What the title does
 
@@ -103,6 +106,47 @@ shaders and emulates the one instruction.
      `VICTORY_PAGE_WRITES`) and guards every view of a page together
      (`VICTORY_VIEW_GUARD`), so a write the title's CPU makes through one view
      is seen at the others.
+   - *Dispatches by thread counts.* `DispatchX(x, y, z, flags)` passes the
+     console's dispatch initiator bits as its flags. The builder sets
+     `USE_THREAD_DIMENSIONS` (0x20; with 0x8000 for wave32 programs) on four
+     of its dispatch calls: header copies (DecompressHeader), the box
+     rehydration of pre-built structures (Box32Rehydration,
+     Box16Rehydration) and triangle reloads (ReloadTriangles,
+     ReloadProcedurals). Then x, y and z count threads: the last group is cut
+     short, and no thread past the count is launched. The layer took them for
+     group counts. The box stages rebuild one level of a tree a dispatch, in
+     place, one node a thread, group g writing its 64 nodes at g times 8 KiB
+     (4 KiB for 16-bit boxes), and a lane count read off EXEC
+     (`WaveAllBitCount`) places each node's compressed payload. In rt-int1's
+     first frame they ran 272,948 and 47,026 groups where 5,983 and 4,217
+     were wanted, and wrote 2.2 GiB of empty nodes past their levels; where
+     that was put back, it lay over the title's own objects, which share
+     those pages at a CPU view 24 GiB lower. Every crash site of rt-int1
+     (title +0x2bd385b, +0x27c195d, +0x4f38ba5, +0x4e51965) lies in such an
+     overrun. (The copies and reloads check their counts themselves: for
+     them it cost time only, 236,385 groups of ReloadTriangles for 7,410.)
+     `dispatch_x` now makes groups of the program's console size out of the
+     counts. Where a last group is cut short, the pipeline runs in a form of
+     its program translated for that
+     (`victory_shader::emit::translate_thread_limited`, made at its first such
+     dispatch): the host passes the counts (`USER_THREAD_LIMIT`), and the
+     threads past them leave in the entry block, so that wave operations, a
+     ballot of EXEC on entry and the title's barriers count the launched
+     threads only, as the console's partial wave does. The two host waves of
+     a console wave64 program that exchange first tell each other whether
+     they have a launched thread (one with none leaves whole, its exchange
+     dword holding 0). The paired and approximate forms are refused (a host
+     thread holding two console lanes cannot leave for one of them): a
+     builder stage without the form turns the builder off.
+   - *Addresses in the records of upload memory.* LeafRehydration reads its
+     geometry descriptions (48-byte `D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC`
+     records) through a root SRV in list upload memory and loads vertices
+     and indices through the addresses in them, which no root argument
+     names: in rt-int1, 638 of the 2,139 such addresses lay in no copy when
+     the stage ran, and those leaves read zeros. Before a dispatch, the
+     block of upload memory each of the shader's root SRVs points into is
+     looked through (16 KiB at most) for 8-byte title addresses, which are
+     named like the dispatch's own (`memory.rs`).
 7. **Four more sun-shadow trace programs translate.** They take the address
    of their structure out of a descriptor they pick from the view heap; the
    host keeps a table of view addresses by heap slot (`SLOT_VIEW_ADDRESSES`).
@@ -122,26 +166,25 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the title dies one frame after the builder's
-  first frame: 13 access violations on several threads (title +0x2bd385b,
-  +0x27c195d, +0x4f38ba5, +0x4e51965), reading pointers of all ones or of
-  infinities (runs rt-trace7, rt-trace8, and rt-int1 on the integration
-  branch with the page-write report and the views guarded together; rt-trace9
-  had a single one, at +0xf6349). Each faulting object lies 24 GiB below a
-  tiled-heap range the builder's copy-back had just written in that frame,
-  and holds the same bytes: box nodes with no children and empty, infinite
-  bounds. The title shows those pages to its CPU there; the console's
-  builder would have written real nodes. In rt-int1 every such range was the
-  target of the in-place rehydration of a pre-built structure (DecompressHeader,
-  LeafRehydration, Box32Rehydration and Box16Rehydration, source and
-  destination the same address), its windows numbered for title memory by
-  address in that same frame. Not known yet: whether those stages' output is
-  wrong (their wave64 forms agree with each other on synthetic inputs, not
-  yet in place on real ones) or their inputs were.
-- The trees are not valid yet. The walk (`VICTORY_BVH_CHECK`) found 19,638
-  bad nodes in 283 structures in rt-int1, most of them boxes of zeros or of
-  the header stage's empty bounds. It reads title memory, which holds only
-  what was put back: a node in a window no dispatch named reads as it was.
+- No run with the builder on has been made since the fix for dispatches by
+  thread counts (above). Until then (rt-int1 and before): the title died one
+  frame after the builder's first frame, 13 access violations on several
+  threads reading pointers of all ones or of infinities, each faulting
+  object 24 GiB below a tiled-heap range the box rehydration had overrun.
+- The trees are not known to be valid yet. The walk (`VICTORY_BVH_CHECK`,
+  which covers the structures InitHeaders starts: the dynamic ones and the
+  top-level ones) found 19,638 bad nodes in 283 structures in rt-int1, most
+  of them boxes of zeros or of the header stage's empty bounds, among them
+  the top-level structure at 0xd5f205e00 (787 instances), which lies in no
+  overrun: its instances' bounds come from the headers of the structures
+  they name, which the overruns and the leaves' zeros may have spoiled. The
+  walk reads title memory, which holds only what was put back: a node in a
+  window no dispatch named reads as it was.
+- What a stage reaches only through addresses in title memory (not in
+  upload memory), such as the structures a top-level build's instances
+  name, is not made ready unless something else named it; an access that
+  finds no copy reads 0 and is noted for the next frame (`F` lines of the
+  trace), which comes too late for a structure built once.
 - Copy numbers are never given back: the builder named some 1,450 windows in
   six minutes (rt-dry1), and 2,047 numbers run out in a longer session.
 - One shadow-mask trace program (FullAdaptive) stops at a lane mask read as
@@ -150,7 +193,10 @@ shaders and emulates the one instruction.
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
-  through an edge.
+  through an edge; that `USE_THREAD_DIMENSIONS` launches exactly the counted
+  threads, the last group cut short (the flags carry no `PARTIAL_TG_EN`, but
+  the box stages place their payloads by the lanes in EXEC, which only a cut
+  short wave makes right).
 - Cost on the GPU is unmeasured.
 
 ## Where to look
