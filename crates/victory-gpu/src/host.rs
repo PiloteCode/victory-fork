@@ -2025,11 +2025,102 @@ void main(uint3 id : SV_DispatchThreadID) {
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
+        // (`VICTORY_COPYBACK=lazy` decides at the landing which pieces to
+        // fetch: the relay's own fetch.)
         relay()
+            && !crate::coherence::lazy()
             && ["VICTORY_CARD_FETCH_INFLIGHT", "VICTORY_READBACK_DIRECT"]
                 .iter()
                 .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
     })
+}
+
+/// Whether `VICTORY_COPYBACK=lazy` can leave pieces on the card
+/// (`crate::coherence`): flights land on the relay's thread, which fetches
+/// on its copy queue, and a first touch fetches the same way.
+pub(crate) fn lazy_ready() -> bool {
+    relay() && crate::queue2::second().is_some_and(|s| s.fetches())
+}
+
+/// Whether a fill read title memory `[at, at + len)` ahead of flights
+/// lately (`fill_ahead`): a landing's write there is compared with what it
+/// read, so `crate::coherence` leaves nothing there on the card.
+pub(crate) fn fills_read_ahead(at: usize, len: usize) -> bool {
+    fill_ahead::read_lately(at, len)
+}
+
+/// The lazy copy-back's fetch (`crate::coherence`, `VICTORY_COPYBACK=lazy`):
+/// the bytes of `pieces` (copy, offsets `[lo, hi)`, piece number) as the
+/// card's sides hold them now, through the relay's copy queue, behind the
+/// host fence value `behind` (their producers': reached already) and
+/// nothing else; no title list. Returns the bytes, one piece after the
+/// other, and the last send of title bytes the card had finished when the
+/// fetch was sent (the merge's "fetched after", as in
+/// [`Host::relay_card_back`]). `None` without the copy queue's fetches, or
+/// if the card could not be read.
+///
+/// Flights in the air may write the pieces while they come down, as with
+/// the relay's own fetch on the copy queue: they fetch them again at their
+/// landing whatever their compare says ([`BESIDE`]).
+pub(crate) fn lazy_fetch(pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u32)], behind: u64) -> Option<(Vec<u8>, u64)> {
+    /// The memory the pieces come down to: buffer, mapping, bytes.
+    static INTO: Mutex<Option<(ID3D12Resource, usize, u64)>> = Mutex::new(None);
+    let host = host()?;
+    let second = crate::queue2::second().filter(|s| s.fetches())?;
+    let total: u64 = pieces.iter().map(|p| (p.2 - p.1) as u64).sum();
+    if total == 0 {
+        return Some((Vec::new(), second.order_done()));
+    }
+    let mut into = INTO.lock().unwrap_or_else(|e| e.into_inner());
+    if into.as_ref().is_none_or(|b| b.2 < total) {
+        let size = total.next_multiple_of(1 << 20);
+        *into = host.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+    }
+    let (buffer, data, _) = into.clone()?;
+    // SAFETY: a plain event of our own, closed below.
+    let event = unsafe { CreateEventW(None, false, false, None) }.ok()?;
+    // The sends of title bytes the card has finished are in what comes
+    // down (a later one may be too: the merge leaves its bytes out).
+    let after = second.order_done();
+    // SAFETY: an open copy list of the lane's; live buffers (the copies are
+    // held by their owners); the host's fence, signalled up to `behind`.
+    let ran = unsafe {
+        (|| -> windows::core::Result<()> {
+            let copy = second.down.list()?;
+            let mut at = 0u64;
+            for (shadow, lo, hi, _) in pieces {
+                copy.1.CopyBufferRegion(&buffer, at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                at += (*hi - *lo) as u64;
+            }
+            let job = second.down.send(copy, &[(&host.fence, behind)], total)?;
+            second.down.wait(job, event)
+        })()
+    };
+    // SAFETY: the event made above.
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(event);
+    }
+    if ran.is_err() {
+        return None;
+    }
+    if refetch() {
+        // Whatever had started may have been writing these pieces while
+        // they came down: those flights fetch them again at their landing.
+        let (started, landed) = (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire));
+        if started > landed {
+            let mut all = BESIDE.lock().unwrap_or_else(|e| e.into_inner());
+            let noted = all.get_or_insert_with(Default::default);
+            for (shadow, _, _, number) in pieces {
+                let upto = noted.entry((std::sync::Arc::as_ptr(shadow) as usize, *number)).or_insert(0);
+                *upto = (*upto).max(started);
+            }
+            BESIDE_STATS[1].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+        }
+    }
+    // SAFETY: the mapping of the fetched bytes, `total` of them; the copy
+    // into it has run.
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, total as usize) }.to_vec();
+    Some((bytes, after))
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to
@@ -3242,6 +3333,31 @@ mod fill_ahead {
             );
         }
         first
+    }
+
+    /// Whether a fill kept for the check (the last `KEEP` frames) read
+    /// title memory `[at, at + len)`, or fills there wait.
+    pub(super) fn read_lately(at: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = at + len;
+        if ANY_HELD.load(Relaxed)
+            && HELD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|held| (at / PIECE..=(end - 1) / PIECE).any(|piece| held.contains(&piece)))
+        {
+            return true;
+        }
+        let frame = crate::frame::current();
+        let read = READ.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = read.as_ref() else { return false };
+        (at / PIECE..=(end - 1) / PIECE)
+            .filter_map(|piece| map.get(&piece))
+            .flat_map(|p| p.fills.iter())
+            .any(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame)
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -5448,7 +5564,18 @@ impl Host {
     /// of the last flight being landed: a piece an earlier fetch on the
     /// copy queue brought down beside one of these flights is fetched
     /// whatever the compare says ([`BESIDE`]).
-    fn relay_card_back(&self, plans: &[(u64, &CardPlan)], fetch: &mut Option<RelayFetch>, behind: u64, landed: u64) {
+    ///
+    /// With `VICTORY_COPYBACK=lazy` a flagged piece `crate::coherence::take`
+    /// keeps is left on the card, neither fetched nor merged; `backs` is the
+    /// title memory the landing's texture read-backs write (left eager).
+    fn relay_card_back(
+        &self,
+        plans: &[(u64, &CardPlan)],
+        fetch: &mut Option<RelayFetch>,
+        behind: u64,
+        landed: u64,
+        backs: &[(usize, usize)],
+    ) {
         if inflight_fetch() {
             let only: Vec<&CardPlan> = plans.iter().map(|p| p.1).collect();
             let taken = self.relay_card_inflight(&only);
@@ -5475,6 +5602,7 @@ impl Host {
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        let lazy = crate::coherence::lazy();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -5502,6 +5630,12 @@ impl Host {
                 }
                 let fetched = flagged_pieces(&flags);
                 numbers.extend(fetched.iter().copied());
+                let landing = crate::coherence::Landing {
+                    flight: number,
+                    fence: behind,
+                    sent_as: plan.sent_as,
+                    backs,
+                };
                 for r in &plan.ranges {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -5513,6 +5647,11 @@ impl Host {
                             && !crate::census::skip_back(r.shadow.title_start(), (hi - lo) as u64)
                             && seen.insert((copy, lo, hi))
                         {
+                            // `VICTORY_COPYBACK=lazy`: left on the card,
+                            // fetched at the CPU's first touch.
+                            if lazy && crate::coherence::take(&r.shadow, lo, hi, r.span.first + p, r.declared, &landing) {
+                                continue;
+                            }
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
@@ -5523,6 +5662,14 @@ impl Host {
             }
         }
         BESIDE_STATS[0].fetch_add(again, Ordering::Relaxed);
+        if lazy {
+            // A piece fetched now that an earlier landing left on the card
+            // comes back first, so that this fetch, later, merges on top.
+            for (shadow, lo, hi, _) in &pieces {
+                let start = shadow.title_start() as usize;
+                crate::coherence::release(start + lo, hi - lo, crate::coherence::BY_MERGE);
+            }
+        }
         if pieces.is_empty() {
             if inflight_fetch() {
                 // The next merge may be of a flight in the air now, with
@@ -5863,7 +6010,11 @@ impl Host {
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
-                self.relay_card_back(&plans, fetch, behind, landed);
+                let mut backs = Vec::new();
+                if crate::coherence::lazy() {
+                    join_ranges(&mut backs, flights.iter().flat_map(|f| f.texture_back_ranges.iter().copied()));
+                }
+                self.relay_card_back(&plans, fetch, behind, landed, &backs);
                 #[cfg(feature = "diagnostics")]
                 relay_part(0, &mut part);
                 let mut back: Vec<Declared> = Vec::new();
@@ -8828,6 +8979,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
     let mut offset = 0;
+    let mut brought = 0;
     while offset < len {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
@@ -8840,6 +8992,16 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if size != size_of_val(&info) || n == 0 {
             read_pieces(at, to, remaining);
             break;
+        }
+        // Closed by the lazy copy-back (`crate::coherence`), not a hole:
+        // what the card keeps there comes back, and it is looked at again.
+        if info.State == MEM_COMMIT
+            && info.Protect == PAGE_NOACCESS
+            && brought < 4
+            && crate::coherence::release(at as usize, n, crate::coherence::BY_KERNEL)
+        {
+            brought += 1;
+            continue;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
@@ -10483,6 +10645,147 @@ void main() {
         drop(lists);
     }
 
+    /// `VICTORY_COPYBACK=lazy` end to end on the software adapter: a
+    /// shader writes three pieces of a title buffer's copy in the card's
+    /// memory; at the landing they stay on the card, their title memory
+    /// closed; a kernel read, a read in place and a write of the title each
+    /// bring one back with the shader's bytes, and the title's write wins:
+    /// the next submission's shader reads it.
+    ///
+    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_RELAY=2
+    ///  VICTORY_COPYBACK=lazy cargo test -p victory-gpu --features
+    ///  diagnostics warp_lazy -- --nocapture`
+    #[test]
+    fn warp_lazy_copy_back_brings_shader_writes_back_at_first_touch() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        if !crate::coherence::lazy() || !relay() {
+            eprintln!("queue2_tests: lazy skipped, VICTORY_COPYBACK=lazy and VICTORY_RELAY=2 are not both set");
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        // Never on a real card.
+        // SAFETY: a plain query.
+        let software = host
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if !software {
+            eprintln!("queue2_tests: lazy skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
+            return;
+        }
+        const PIECE: usize = 64 << 10;
+        const LEN: usize = 4 << 20;
+        // "Title memory": write-watched, reserved as the runtime reserves
+        // the title's (the lazy copy-back closes only such memory).
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        assert!(!title.is_null());
+        crate::census::title_memory_reserved(title as usize, LEN, 0, 0, 0);
+        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
+        let old = |at: usize| 0x5A00_0000 | (at / 4) as u32;
+        for i in 0..LEN / 4 {
+            // SAFETY: inside the allocation.
+            unsafe { dword(i * 4).write_volatile(old(i * 4)) };
+        }
+        crate::shadow::register(0x53_5353, title as u64, LEN as u64);
+        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        if !shadow.carded() {
+            eprintln!("queue2_tests: lazy skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            return;
+        }
+        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        // A submission whose shader stores `memory[from] + add` at each
+        // `to` of `writes`, the pieces of those declared as shader-written.
+        let submit = |writes: &[(usize, usize, u32)]| {
+            let list = host.new_list().expect("a host list");
+            shadow.refresh(&list, title as u64, LEN as u64);
+            for &(to, _, _) in writes {
+                shadow.gpu_writes(&list, (title as usize + to / PIECE * PIECE) as u64, PIECE as u64);
+            }
+            // SAFETY: an open list; the copy's buffer, with unordered
+            // access; the shader's own root signature.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                for &(to, from, add) in writes {
+                    let constants = [to as u32, from as u32, add, 0];
+                    list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                    list.list.Dispatch(1, 1, 1);
+                }
+            }
+            list.close();
+            host.execute_own(&list);
+            settle_now(WHY_SYNC);
+            list
+        };
+        // Three pieces, each in a 512 KiB window of its own.
+        let to = [30 * PIECE + 128, 33 * PIECE + 136, 41 * PIECE + 144];
+        let from = |k: usize| (1 + k) * PIECE + 4 * k + 64;
+        let titles = |k: usize| 0x0100_0000 + 0x1000 * k as u32 + 7;
+        for k in 0..3 {
+            // SAFETY: inside the allocation.
+            unsafe { dword(from(k)).write_volatile(titles(k)) };
+        }
+        let first = submit(&[(to[0], from(0), 0), (to[1], from(1), 1), (to[2], from(2), 2)]);
+        let at = |k: usize| title as usize + to[k];
+        for k in 0..3 {
+            assert!(crate::coherence::owns(at(k), 4), "piece {k} was not left on the card (see the per-second lazy line's reasons)");
+        }
+        // A kernel read (under the least a copy in place takes) fails on
+        // the closed page, brings the piece back, and reads.
+        let mut out = [0u8; 16];
+        assert!(read_into(at(0) as *const u8, &mut out), "a kernel read of a piece left on the card");
+        assert_eq!(u32::from_le_bytes([out[0], out[1], out[2], out[3]]), titles(0));
+        assert_eq!(u32::from_le_bytes([out[4], out[5], out[6], out[7]]), old(to[0] + 4));
+        assert!(!crate::coherence::owns(at(0), 4));
+        assert!(crate::coherence::owns(at(1), 4) && crate::coherence::owns(at(2), 4), "the other windows stay on the card");
+        // A read in place faults and brings the piece back.
+        // SAFETY: inside the allocation.
+        assert_eq!(unsafe { dword(to[1]).read_volatile() }, titles(1) + 1);
+        assert!(!crate::coherence::owns(at(1), 4));
+        // A write of the title brings the piece back first and wins.
+        // SAFETY: inside the allocation.
+        unsafe { dword(to[2]).write_volatile(0x00C0_FFEE) };
+        assert!(!crate::coherence::owns(at(2), 4));
+        // SAFETY: inside the allocation.
+        assert_eq!(unsafe { dword(to[2]).read_volatile() }, 0x00C0_FFEE);
+        // Nothing else moved.
+        let touched: std::collections::HashSet<usize> = (0..3).flat_map(|k| [from(k), to[k]]).collect();
+        for i in (0..LEN / 4).filter(|i| !touched.contains(&(i * 4))) {
+            // SAFETY: inside the allocation.
+            let got = unsafe { dword(i * 4).read_volatile() };
+            assert_eq!(got, old(i * 4), "dword {i} of title memory changed");
+        }
+        // The title's write went up with the next refresh: a shader reads
+        // it, and its sum comes back at the first touch.
+        let sum = 50 * PIECE + 152;
+        let second = submit(&[(sum, to[2], 1)]);
+        // SAFETY: inside the allocation.
+        assert_eq!(unsafe { dword(sum).read_volatile() }, 0x00C0_FFEF, "the shader read the title's write");
+        drop((first, second));
+    }
+
     /// `memory[to] = first` at once; then `spin` steps, each a store to
     /// `memory[to + 4]`; then `memory[to + 4] = 0` and `memory[to] = last`.
     /// Whatever `spin` is, the bytes it leaves are the same.
@@ -10638,7 +10941,7 @@ void main() {
         let mut fetch = None;
         {
             let plan = sent_a.card.as_ref().expect("flight A has a plan for the card's copies");
-            host.relay_card_back(&[(sent_a.number, plan)], &mut fetch, fence_a, sent_a.number);
+            host.relay_card_back(&[(sent_a.number, plan)], &mut fetch, fence_a, sent_a.number, &[]);
         }
         for (copy, ranges) in &sent_a.back {
             copy.copy_back_done(ranges);
@@ -10658,7 +10961,7 @@ void main() {
         wait_for(fence_b);
         {
             let plan = sent_b.card.as_ref().expect("flight B has a plan for the card's copies");
-            host.relay_card_back(&[(sent_b.number, plan)], &mut fetch, fence_b, sent_b.number);
+            host.relay_card_back(&[(sent_b.number, plan)], &mut fetch, fence_b, sent_b.number, &[]);
         }
         for (copy, ranges) in &sent_b.back {
             copy.copy_back_done(ranges);

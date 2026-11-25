@@ -98,6 +98,15 @@ mod texback;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use census::title_memory_reserved;
+
+/// Before a system call reads title memory `[at, at + len)` (a file write,
+/// a send): what `VICTORY_COPYBACK=lazy` keeps on the card there comes back
+/// first, since the kernel's read of a page kept closed fails instead of
+/// faulting. Nothing without the switch.
+#[cfg(windows)]
+pub fn kernel_will_read(at: usize, len: usize) {
+    coherence::kernel_will_read(at, len);
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

@@ -556,6 +556,23 @@ pub extern "system" fn ReadFile(
     )
 }
 
+/// The kernel reads the title's buffer: what the GPU side keeps on the card
+/// there (`VICTORY_COPYBACK=lazy`, pages closed until first touched) comes
+/// back first, since the kernel's read of a closed page fails rather than
+/// faulting into the GPU side's handler.
+pub extern "system" fn WriteFile(
+    file: *mut c_void,
+    buffer: *const u8,
+    len: u32,
+    written: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    victory_gpu::kernel_will_read(buffer as usize, len as usize);
+    host!("kernel32.dll", "WriteFile": extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32)(
+        file, buffer, len, written, overlapped,
+    )
+}
+
 /// The host CRT reads large requests straight into the caller's buffer
 /// through the kernel, whose write fails on a guarded block instead of
 /// faulting into the guard. So the bytes are read beside, a chunk at a time
@@ -736,6 +753,7 @@ pub(crate) fn module() -> HleModule {
         ],
         exports: vec![
             hle_export!(ReadFile),
+            hle_export!(WriteFile),
             hle_export!(fread),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
