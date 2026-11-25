@@ -5354,6 +5354,10 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                #[cfg(feature = "diagnostics")]
+                if crate::bvhtrace::armed() {
+                    crate::bvhtrace::line(|| format!("B {at:#x}+{:#x} rows {rows} of {row}", (*rows).saturating_sub(1) * pitch + row));
+                }
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
@@ -9650,6 +9654,9 @@ impl HostList {
                     fill_check::copy_runs(dst, src, len);
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
+                    if crate::bvhtrace::armed() {
+                        crate::bvhtrace::line(|| format!("C {dst:#x}+{len:#x} from {src:#x}"));
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -10578,6 +10585,13 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(dst as usize, len, true);
+    if crate::bvhtrace::armed() {
+        crate::bvhtrace::line(|| {
+            // SAFETY: the caller's source holds `len` bytes.
+            let head = unsafe { std::slice::from_raw_parts(src, len.min(32)) };
+            format!("W {:#x}+{len:#x} {}", dst as usize, crate::bvhtrace::hex(head))
+        });
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);

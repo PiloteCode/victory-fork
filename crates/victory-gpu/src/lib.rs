@@ -17,6 +17,7 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod backreads;
+mod bvhtrace;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
