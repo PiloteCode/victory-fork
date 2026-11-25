@@ -2836,6 +2836,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    list.drew();
                     true
                 }
                 Err(_) => false,
@@ -3282,6 +3283,7 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.drew();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3382,6 +3384,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.drew();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3762,6 +3765,7 @@ impl State {
             self.ambient(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.drew();
         }
         true
     }

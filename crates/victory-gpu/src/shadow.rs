@@ -1815,6 +1815,24 @@ fn merge_gap() -> usize {
     *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
 }
 
+thread_local! {
+    /// The title memory [`Shadow::merge_under_writes`] last left to a
+    /// settle on this thread (address, end), until [`take_refused`].
+    static REFUSED: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`Shadow::merge_under_writes`] leaves `[from, to)` to a settle.
+fn refused(from: usize, to: usize) {
+    REFUSED.set(Some((from, to)));
+}
+
+/// What [`Shadow::merge_under_writes`] last left to a settle on this
+/// thread, if anything since the last call: the settle waits for the
+/// flights that may write it (`crate::host`, `VICTORY_WAIT_PRODUCER`).
+pub(crate) fn take_refused() -> Option<(usize, usize)> {
+    REFUSED.take()
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2928,6 +2946,7 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             #[cfg(feature = "diagnostics")]
             self.merge_refused("not write-watched", from, to, 0);
+            refused(from, to);
             return true;
         }
         let base = start / PAGE;
@@ -2942,6 +2961,7 @@ impl Shadow {
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
                 #[cfg(feature = "diagnostics")]
                 self.merge_refused("the journal cannot say", a, e, 0);
+                refused(a, e);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2979,6 +2999,7 @@ impl Shadow {
                     if runs.len() > *runs_left {
                         #[cfg(feature = "diagnostics")]
                         self.merge_refused("more changed runs than may go up one by one", lo, hi, runs.len());
+                        refused(lo, hi);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -2992,6 +3013,7 @@ impl Shadow {
                     let Some(snapshot) = before.as_mut() else {
                         #[cfg(feature = "diagnostics")]
                         self.merge_refused("no snapshot", lo, hi, 0);
+                        refused(lo, hi);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
