@@ -82,6 +82,12 @@
 //!   geometry shader of ours between the translated vertex and pixel
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
+//! * **Geometry shaders** ([`HwStage::Gs`], `gs_6_6`; added 2026-11-25): the
+//!   title's geometry programs, triangles in and triangle strips out, between
+//!   the container's VS program (the other compilation of the ES half the
+//!   console runs before them) and the pixel shader; user data and
+//!   descriptors as above, visible to the geometry stage. Their LDS rings are
+//!   their inputs and outputs ([`crate::geometry`], `rings.rs`).
 
 mod bitcode;
 #[cfg(all(test, windows))]
@@ -91,6 +97,8 @@ mod container;
 mod descriptor_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod geometry_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(test, windows))]
@@ -125,7 +133,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
-pub use link::{link_mesh, mesh_fits};
+pub use link::{link_mesh, link_mesh_alone, mesh_fits};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
@@ -429,12 +437,12 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
@@ -1011,8 +1019,7 @@ fn emit_program(
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
-    let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    let mode = |e: &mut container::SigElement| {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
@@ -1024,6 +1031,12 @@ fn emit_program(
             (0, _) => 1,
             _ => 0,
         };
+    };
+    let interpolated = if pixel { &mut inputs } else { &mut outputs };
+    interpolated.iter_mut().for_each(mode);
+    // A geometry program's inputs are the vertex program's outputs, modes and all.
+    if native.stage == HwStage::Gs {
+        inputs.iter_mut().for_each(mode);
     }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
