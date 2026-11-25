@@ -250,10 +250,21 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<(ID3D12Resource, u64)> {
+    bound_in(list, src, count, spec, ring())
+}
+
+/// [`bound`] into the list's ring ([`ring`]) or its one scratch buffer.
+fn bound_in(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ring: bool,
+) -> Option<(ID3D12Resource, u64)> {
     #[cfg(feature = "diagnostics")]
     list.note_op(|| "clamp (ours) of indirect records".into());
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    if ring() {
+    if ring {
         let (c, budget, (dst, at)) = (clamp()?, list.budget()?, list.indirect_ring(bytes)?);
         return record_clamp_ring(c, list, &dst, at, budget, src, count, spec, false).then_some((dst, at));
     }
@@ -1356,9 +1367,9 @@ void main() {
 
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`.
-        let (b1, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let (b1, _) = bound_in(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), false).unwrap();
         done(&list, &b1);
-        let (b2, _) = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let (b2, _) = bound_in(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), false).unwrap();
         done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
@@ -1368,7 +1379,7 @@ void main() {
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
-        let (b3, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let (b3, _) = bound_in(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), false).unwrap();
         done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
@@ -1382,13 +1393,58 @@ void main() {
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
-        let (b4, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let (b4, _) = bound_in(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), false).unwrap();
         done(&list, &b4);
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
             "grown scratch buffer must persist across reset"
         );
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
+
+    /// Each clamp into the ring takes room of its own, the ring grows when
+    /// full, a list's submission runs (the enhanced barrier included), and
+    /// after its reset the room is taken from the start again.
+    #[test]
+    fn ring_gives_each_clamp_room_of_its_own() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if !enhanced_barriers() {
+            return;
+        }
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src_buf, src_ptr)) = host.shared_buffer(256 << 10) else {
+            return;
+        };
+        let Some((count_buf, count_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: mapped host buffers.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0x7F, 256 << 10);
+            (count_ptr as *mut u32).write_volatile(2);
+        }
+        let (r1, a1) = bound_in(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), true).unwrap();
+        let (r2, a2) = bound_in(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), true).unwrap();
+        assert_eq!(r1.as_raw(), r2.as_raw(), "room in the same ring");
+        assert_eq!(a1, 0);
+        assert!(a2 >= 64 * 16, "the second clamp's room follows the first's");
+        // More than the ring holds: a bigger ring, from its start.
+        let (r3, a3) = bound_in(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 20_000), true).unwrap();
+        assert_ne!(r3.as_raw(), r1.as_raw(), "a full ring is replaced");
+        assert_eq!(a3, 0);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        let (r4, a4) = bound_in(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 64), true).unwrap();
+        assert_eq!(r4.as_raw(), r3.as_raw(), "the ring stays across a reset");
+        assert_eq!(a4, 0, "and its room is taken from the start again");
         list.close();
         host.execute(&[&list]);
         list.reset();
