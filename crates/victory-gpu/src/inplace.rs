@@ -295,6 +295,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    #[cfg(feature = "diagnostics")]
+    let mut part = std::time::Instant::now();
     {
         let mut v = views();
         v.views.insert(at, (len, section, offset));
@@ -306,6 +308,12 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+    // (The runtime's changes of mappings, for the frame line.)
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::watch::remap_hook_part(6, &mut part);
+        crate::watch::REMAP_HOOKS[5].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// For the census (`crate::census`): how many bytes of `[at, at + len)` are
