@@ -213,7 +213,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            remove_tree(&entry.path())?;
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -231,7 +231,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             continue;
         };
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            remove_tree(&dir.join(format!("v{old}")))?;
         }
         return Ok(Some(Version {
             dir: version,
@@ -258,6 +258,51 @@ fn current_named(dir: &Path, name: &str) -> std::io::Result<Option<Version>> {
     }
 }
 
+/// Removes a folder and all it holds; a missing one is no error (fxceless
+/// #995, tunczzz; our commit 3a8c56fe).
+///
+/// Run from a packaged app, the host merges the real `AppData\Local` with
+/// the package's private copy of it, and a folder can exist in both.
+/// `remove_dir_all` opens what is inside without following reparse points,
+/// which such a merged folder needs, and fails with
+/// ERROR_REPARSE_POINT_ENCOUNTERED (4395) however often it is tried: a
+/// staged version was never removed, and the settings were never saved.
+/// Removing entry by entry, by path, works: each pass removes the upper
+/// copy, the lower one shows through, and the next pass removes that.
+fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let mut last = None;
+    for _ in 0..4 {
+        match std::fs::remove_dir_all(dir).or_else(|_| remove_entries(dir)) {
+            Err(e) if gone(&e) => return Ok(()),
+            Err(e) => last = Some(e),
+            Ok(()) => {}
+        }
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if gone(&e) => return Ok(()),
+            _ => {}
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("the folder is still there after removal")))
+}
+
+/// [`remove_tree`] by path, entry by entry; links are removed, never followed.
+fn remove_entries(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            remove_entries(&path)?;
+        } else if kind.is_symlink() {
+            std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path))?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    std::fs::remove_dir(dir)
+}
+
 /// Where a crash test stops the process (test builds only).
 fn step() {
     #[cfg(test)]
@@ -280,7 +325,7 @@ fn commit(
 ) -> std::io::Result<()> {
     let staged = dir.join(format!("v{number}.new"));
     if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
+        remove_tree(&staged)?;
     }
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
@@ -318,7 +363,7 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
             continue;
         }
         if file.ends_with(".gone") {
-            let _ = std::fs::remove_dir_all(&path);
+            let _ = remove_tree(&path);
         } else if file.contains('~') {
             if let Ok(Some(v)) = current(&path) {
                 out.push((v.name, path));
@@ -355,7 +400,7 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
             .collect();
         commit(&dir, 1, name, &display, &sources).ok()?;
     }
-    std::fs::remove_dir_all(old).ok()?;
+    remove_tree(old).ok()?;
     tracing::info!(container = name, "game save moved to the versioned layout");
     Some(dir)
 }
@@ -514,7 +559,7 @@ impl Update {
         }
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
-            let _ = std::fs::remove_dir_all(&old.dir);
+            let _ = remove_tree(&old.dir);
             step();
         }
         S_OK
@@ -531,13 +576,25 @@ fn delete(root: &Path, name: &str) -> HRESULT {
         Err(e) => return io_error(&dir, &e),
     }
     let gone = dir.with_extension("gone");
-    let _ = std::fs::remove_dir_all(&gone);
+    let _ = remove_tree(&gone);
     step();
     if let Err(e) = std::fs::rename(&dir, &gone) {
         return io_error(&dir, &e);
     }
     step();
-    let _ = std::fs::remove_dir_all(&gone);
+    let _ = remove_tree(&gone);
+    // A folder the host merges from two copies (see `remove_tree`) moves
+    // one copy at a time: the lower one shows now and goes the same way.
+    for _ in 0..3 {
+        if !matches!(current_named(&dir, name), Ok(Some(_))) {
+            break;
+        }
+        let _ = remove_tree(&gone);
+        if std::fs::rename(&dir, &gone).is_err() {
+            break;
+        }
+        let _ = remove_tree(&gone);
+    }
     S_OK
 }
 
@@ -1136,6 +1193,22 @@ mod tests {
         assert_eq!(state(root), Some(new));
         assert!(!old_b.exists());
         assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
+    }
+
+    /// `remove_tree` removes a whole tree, entry by entry where it must, and
+    /// a missing tree is no error (fxceless #995).
+    #[test]
+    fn remove_tree_removes_everything_or_nothing_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("v1");
+        std::fs::create_dir_all(tree.join("a").join("b")).unwrap();
+        std::fs::write(tree.join("0"), b"x").unwrap();
+        std::fs::write(tree.join("a").join("b").join("1"), b"y").unwrap();
+        remove_entries(&tree.join("a")).unwrap();
+        assert!(!tree.join("a").exists() && tree.join("0").exists());
+        remove_tree(&tree).unwrap();
+        assert!(!tree.exists());
+        remove_tree(&tree).unwrap();
     }
 
     #[test]
