@@ -690,6 +690,11 @@ while pressed; releasing them restores the controller's stick values:
 
 The letters are the keys at those places on a US keyboard, so on an AZERTY
 keyboard the left stick is Z Q S D and the triggers are W and C.
+`VICTORY_ARROWS_LOOK=1` (off by default) makes the arrows the right stick
+too (to look and turn) and moves the D-pad to the numpad's 8, 2, 4, 6.
+`VICTORY_GHOSTING=0` turns off Windows' "not responding" ghost for the
+process (the window shown is a stand-in that always answers, so it is
+left on by default).
 
 ## Commands
 
