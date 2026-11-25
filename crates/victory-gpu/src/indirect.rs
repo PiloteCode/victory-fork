@@ -1522,6 +1522,104 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The masked pass of copies in the card's memory (`crate::host`'s
+    /// `CARD_MASKED`, `VICTORY_MERGE_MASKED=1`) on the software adapter: two
+    /// stretches of a copy that do not start or end on a dword, the title's
+    /// bytes changed at random in them (masks made as the merge makes them,
+    /// `crate::shadow::mask_into`), the card side's bytes changed elsewhere
+    /// at random as by shaders: after the pass every byte the title changed
+    /// has the title's value, and every other byte, in a dword the title
+    /// changed in part, outside the stretches or where the CPU side holds
+    /// something else, keeps the card's.
+    #[test]
+    fn warp_card_masked_pass_writes_the_titles_bytes_and_no_other() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let masked = compile_cs(&warp.device, crate::masked::CARD_MASKED).expect("the masked pass must compile on WARP");
+        const SIZE: usize = 4 * (64 << 10);
+        let (_card, card_ptr, card_gpu) = warp.shared_buffer(SIZE as u64);
+        let (_cpu, cpu_ptr, cpu_gpu) = warp.shared_buffer(SIZE as u64);
+        let (_masks, masks_ptr, masks_gpu) = warp.shared_buffer(SIZE as u64 / 8);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // What the card side and the CPU side held when the flights began.
+        let held: Vec<u8> = (0..SIZE).map(|_| next() as u8).collect();
+        let mut cpu = held.clone();
+        let mut card = held.clone();
+        // Shaders' writes on the card side, everywhere.
+        for _ in 0..4000 {
+            let at = next() as usize % SIZE;
+            card[at] ^= 1 + (next() % 255) as u8;
+        }
+        // Outside the stretches the CPU side holds other bytes too: the pass
+        // must not take them.
+        for _ in 0..500 {
+            let at = next() as usize % SIZE;
+            cpu[at] ^= 0x81;
+        }
+        // The stretches (copy offsets, bytes): ragged ends, one in the first
+        // 64 KiB, one across the second and third.
+        let stretches = [(4 * 1000 + 3, (64 << 10) - 9), ((64 << 10) + 4321, (96 << 10) + 2)];
+        let mut title = cpu.clone();
+        let cpu_before = cpu.clone();
+        let mut masks: Vec<crate::shadow::Masked> = Vec::new();
+        for &(at, n) in &stretches {
+            // The title changes some bytes, single and in short runs.
+            for _ in 0..3000 {
+                let i = at + next() as usize % n;
+                for k in 0..(1 + next() % 3) as usize {
+                    if i + k < at + n {
+                        title[i + k] ^= 1 + (next() % 255) as u8;
+                    }
+                }
+            }
+            let mask = crate::shadow::mask_into(at, &title[at..at + n], &mut cpu[at..at + n]).expect("changed bytes");
+            assert_eq!(&cpu[at..at + n], &title[at..at + n], "the merge puts the title's bytes into the CPU side");
+            masks.push(mask);
+        }
+        let before = card.clone();
+        // SAFETY: the mappings hold `SIZE` bytes (masks: an eighth); our open
+        // list, the pass's own root signature.
+        unsafe {
+            std::ptr::copy_nonoverlapping(card.as_ptr(), card_ptr, SIZE);
+            std::ptr::copy_nonoverlapping(cpu.as_ptr(), cpu_ptr, SIZE);
+            warp.list.SetComputeRootSignature(&masked.root);
+            warp.list.SetPipelineState(&masked.pso);
+            warp.list.SetComputeRootShaderResourceView(1, cpu_gpu);
+            warp.list.SetComputeRootShaderResourceView(2, masks_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, card_gpu);
+            let mut mask_at = 0usize;
+            for m in &masks {
+                std::ptr::copy_nonoverlapping(m.bits.as_ptr(), masks_ptr.cast::<u32>().add(mask_at), m.bits.len());
+                let constants = [(m.base / 4) as u32, m.dwords as u32, mask_at as u32];
+                warp.list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                warp.list.Dispatch((m.dwords.div_ceil(64)) as u32, 1, 1);
+                mask_at += m.bits.len();
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the submission was waited for; the mapping holds `SIZE`.
+        unsafe { std::ptr::copy_nonoverlapping(card_ptr.cast_const(), card.as_mut_ptr(), SIZE) };
+        let changed = |i: usize| stretches.iter().any(|&(at, n)| (at..at + n).contains(&i)) && title[i] != cpu_before[i];
+        let mut taken = 0;
+        for i in 0..SIZE {
+            let want = if changed(i) {
+                taken += 1;
+                title[i]
+            } else {
+                before[i]
+            };
+            assert_eq!(card[i], want, "byte {i:#x}: the title changed it: {}", changed(i));
+        }
+        assert!(taken > 4000, "the title's bytes were few: {taken}");
+    }
+
     /// Both forms of the card compare on the host GPU flag the same pieces
     /// for the same bytes, and exactly the pieces whose bytes (widened to
     /// 16 at both ends) changed: a copy of 16 pieces that starts 40 bytes

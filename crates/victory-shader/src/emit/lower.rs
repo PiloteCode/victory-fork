@@ -67,6 +67,10 @@ pub(super) mod quad;
 #[path = "valu.rs"]
 mod valu;
 
+/// The legacy multiply's shorter exact forms, a child module so it shares the emitter's state.
+#[path = "legacy.rs"]
+pub(super) mod legacy;
+
 /// 16-bit and packed vector ALU instructions, a child module so it shares the emitter's state.
 #[path = "valu16.rs"]
 mod valu16;
@@ -3969,7 +3973,9 @@ impl<'a> Lower<'a> {
         let op = if max { Bin::And } else { Bin::Or };
         let sign = self.s.m.bin(c, op, ia, ib);
         let signed = self.as_float(sign);
-        self.s.m.select(c, zeros, signed, r)
+        let r = self.s.m.select(c, zeros, signed, r);
+        self.s.m.made(r, super::bitcode::facts::Made::MaxMin(max, a, b));
+        r
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
@@ -4102,7 +4108,9 @@ impl<'a> Lower<'a> {
         let nan_3 = self.is_nan_f32(third);
         let nan_ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
         let nan = self.s.m.bin(c, Bin::Or, nan_ab, nan_3);
-        self.s.m.select(c, nan, least, median)
+        let r = self.s.m.select(c, nan, least, median);
+        self.s.m.made(r, super::bitcode::facts::Made::Med3(a, b, third));
+        r
     }
 
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
@@ -4162,7 +4170,20 @@ impl<'a> Lower<'a> {
 
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
+        let r = self.legacy_mul_form(a, b);
+        self.s.m.made(r, super::bitcode::facts::Made::Legacy(a, b));
+        r
+    }
+
+    fn legacy_mul_form(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        // Shorter forms where what is known of the operands allows (`legacy.rs`).
+        if a != b
+            && !legacy_mul_ieee()
+            && let Some(r) = self.legacy_short(a, b)
+        {
+            return r;
+        }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         // (`VICTORY_LEGACY_MUL=ieee`, a measurement: the host's multiply as it is)
         if legacy_mul_ieee() {

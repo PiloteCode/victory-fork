@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -99,8 +99,232 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// With [`merge_masked`]: the title bytes put into the CPU's side under
+    /// flights' shader writes that go to the card's side by their byte mask,
+    /// not as ranges of `dirty` ([`Shadow::merge_under_writes`]); kept, as
+    /// `sent` keeps ranges, until a fetch sent after them has been merged.
+    /// Its own lock, taken alone or inside the side's.
+    masked: Mutex<Vec<Masked>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+/// Bytes of a copy in the card's memory that the title changed under
+/// flights' shader writes, put into the CPU's side and sent to the card's
+/// side by a byte mask ([`merge_masked`]): a pass of ours on the card writes
+/// those bytes and no other, whatever the shaders wrote beside them.
+#[derive(Clone, Debug)]
+pub(crate) struct Masked {
+    /// The offset in the copy of the first byte the mask covers, a
+    /// multiple of 4.
+    pub(crate) base: usize,
+    /// The dwords the mask covers.
+    pub(crate) dwords: usize,
+    /// A bit per byte from `base` on (bit `k % 32` of word `k / 32`): set
+    /// where the title's byte goes up.
+    pub(crate) bits: Arc<[u32]>,
+    /// The number of the send that took it (`crate::host`'s order of the
+    /// queue, with [`relay`]); 0 until then.
+    sent: u64,
+}
+
+impl Card {
+    /// [`merge_masked`]: a bit per byte of the copy's offsets `[at, at +
+    /// n)`, set where a mask still to go up, or that went up with a send
+    /// after send `after`, holds the title's byte (the card's side is the
+    /// older one there for a fetch sent after `after`). `None` if no such
+    /// mask holds a byte of them.
+    fn hidden(&self, at: usize, n: usize, after: u64) -> Option<Vec<u64>> {
+        let masked = self.masked.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Option<Vec<u64>> = None;
+        for m in masked.iter().filter(|m| (m.sent == 0 || m.sent > after) && m.base < at + n && m.base + 4 * m.dwords > at) {
+            let bits = out.get_or_insert_with(|| vec![0u64; n.div_ceil(64)]);
+            for o in m.base.max(at)..(m.base + 4 * m.dwords).min(at + n) {
+                if m.has(o) {
+                    let k = o - at;
+                    bits[k / 64] |= 1 << (k % 64);
+                }
+            }
+        }
+        out
+    }
+}
+
+impl Masked {
+    /// Whether byte `at` of the copy (offset) goes up by this mask.
+    fn has(&self, at: usize) -> bool {
+        at >= self.base && at < self.base + 4 * self.dwords && {
+            let k = at - self.base;
+            self.bits[k / 32] >> (k % 32) & 1 != 0
+        }
+    }
+}
+
+/// Whether title bytes put into a copy in the card's memory under flights'
+/// shader writes (`Shadow::merge_under_writes`) go to the card's side by a
+/// byte mask when a page holds many changed runs (`VICTORY_MERGE_MASKED=1`;
+/// off by default).
+///
+/// The page is merged as before: the bytes where title memory differs
+/// from the copy's CPU side (what the card's side held before the flights'
+/// shaders ran) are the title's, and go into the CPU side. Each run of them
+/// went up as a copy of its own, at most `VICTORY_MERGE_RUNS` (512) a
+/// submission; the title rewrites hundreds of pages of its pools a frame in
+/// thousands of runs of a few bytes each (3,000 to 15,600 runs in one 64
+/// KiB page, wave 9's save gameplay), so the merge refused and the flights
+/// were settled, one or two full drains a frame, 30 to 45 ms of the
+/// submitting thread standing still. With the switch a page of more than
+/// [`masked_runs`] runs (or past the budget) goes up whole by one pass of
+/// ours on the card, behind the flights in the queue's order: a thread a
+/// dword reads the CPU side's dword and the mask's four bits, and writes
+/// only the bytes the title changed into the card's side (a dword the
+/// title changed in part is read and written back with the card's other
+/// bytes). What the flights' shaders wrote anywhere else stays, byte for
+/// byte, as with the runs.
+///
+/// The copy-back of flights that ran before the pass leaves those bytes
+/// out by the same mask, as it leaves the runs out ([`Shadow::card_merge_relay`]):
+/// there the card's side is the older one. Needs the relay; not with the
+/// lazy copy-back (`VICTORY_COPYBACK=lazy`), whose merge knows ranges only.
+pub(crate) fn merge_masked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_MASKED").is_some_and(|v| v == "1"))
+}
+
+/// The changed runs above which a page goes up by its mask
+/// ([`merge_masked`]; `VICTORY_MERGE_MASKED_RUNS`, 32): fewer go up as
+/// copies of their own, as before.
+fn masked_runs() -> usize {
+    static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RUNS.get_or_init(|| std::env::var("VICTORY_MERGE_MASKED_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(32))
+}
+
+/// Whether the host has the pass that writes masked bytes on the card
+/// (`crate::host`, made with the compare).
+static MASKED_READY: AtomicBool = AtomicBool::new(false);
+
+/// The host made (or could not make) the masked pass.
+pub(crate) fn masked_ready(ready: bool) {
+    MASKED_READY.store(ready, Ordering::Release);
+}
+
+/// [`merge_masked`] in effect: asked, the relay on, the pass made, and not
+/// the lazy copy-back.
+fn masking() -> bool {
+    merge_masked() && relay() && MASKED_READY.load(Ordering::Acquire) && !crate::coherence::lazy()
+}
+
+/// Since the last frame line ([`merge_masked`]): pages that went up by
+/// their mask, the bytes the masks hold, masks sent, and the merges of
+/// fetched pieces that left masked bytes out.
+pub(crate) static MASKED_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The mask of the bytes where `title` differs from `held` (the copy's
+/// offsets `[at, at + title.len())`), and those bytes copied into `held`.
+/// `None` if no byte differs.
+pub(crate) fn mask_into(at: usize, title: &[u8], held: &mut [u8]) -> Option<Masked> {
+    let n = title.len().min(held.len());
+    let base = at & !3;
+    let end = (at + n).next_multiple_of(4);
+    let mut bits = vec![0u32; (end - base).div_ceil(32)];
+    let mut any = false;
+    // Bit `k` of the mask for byte `k` past `base`; eight bytes at a time.
+    let mut set = |k: usize, eight: u64| {
+        let (word, shift) = (k / 32, k % 32);
+        bits[word] |= (eight << shift) as u32;
+        // (Spilled bits are bytes of the stretch: the word is there.)
+        if shift > 24 && eight >> (32 - shift) != 0 {
+            bits[word + 1] |= (eight >> (32 - shift)) as u32;
+        }
+    };
+    let skew = at - base;
+    let mut i = 0;
+    while i + 8 <= n {
+        let a = u64::from_le_bytes(title[i..i + 8].try_into().unwrap_or_default());
+        let b = u64::from_le_bytes(held[i..i + 8].try_into().unwrap_or_default());
+        let mut x = a ^ b;
+        if x != 0 {
+            // The low bit of each byte that differs, then those eight bits
+            // gathered into the top byte (byte j to bit j).
+            x |= x >> 4;
+            x |= x >> 2;
+            x |= x >> 1;
+            let eight = ((x & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56) & 0xff;
+            set(skew + i, eight);
+            any = true;
+        }
+        i += 8;
+    }
+    while i < n {
+        if title[i] != held[i] {
+            set(skew + i, 1);
+            any = true;
+        }
+        i += 1;
+    }
+    // Equal bytes stay equal: the title's bytes, all of them.
+    held[..n].copy_from_slice(&title[..n]);
+    any.then(|| Masked {
+        base,
+        dwords: (end - base) / 4,
+        bits: bits.into(),
+        sent: 0,
+    })
+}
+
+/// The relay's merge with bytes left out ([`merge_piece`]): a byte whose
+/// bit is set in `hidden` (a bit per byte of the stretch, from `first` on)
+/// is left as it is in `held` and `title`.
+fn merge_piece_hidden(now: &[u8], held: &mut [u8], title: &mut [u8], hidden: &[u64], first: usize) -> bool {
+    let mut differs = 0u8;
+    for (i, ((n, h), t)) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()).enumerate() {
+        let k = first + i;
+        if *n == *h || hidden[k / 64] >> (k % 64) & 1 != 0 {
+            continue;
+        }
+        differs |= *n ^ *t;
+        *t = *n;
+        *h = *n;
+    }
+    differs != 0
+}
+
+/// The copies in the card's memory with masks still to go up
+/// ([`merge_masked`]), each with those masks; taken as [`card_dirty`] takes
+/// ranges, in the same hold of the queue's order: with [`relay`] each is
+/// noted with `sent_as` and kept until every fetch still to be merged came
+/// after that send.
+pub(crate) fn card_masked(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<Masked>)> {
+    if !merge_masked() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    for shadow in carded.iter().filter_map(std::sync::Weak::upgrade) {
+        let Some(card) = &shadow.card else {
+            continue;
+        };
+        let mut masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+        if masked.is_empty() {
+            continue;
+        }
+        let due: Vec<Masked> = masked.iter().filter(|m| m.sent == 0).cloned().collect();
+        if relay() {
+            masked.retain(|m| m.sent == 0 || m.sent > fetched);
+            for m in masked.iter_mut().filter(|m| m.sent == 0) {
+                m.sent = sent_as;
+            }
+        } else {
+            masked.clear();
+        }
+        drop(masked);
+        if !due.is_empty() {
+            MASKED_STATS[2].fetch_add(due.len() as u64, Ordering::Relaxed);
+            out.push((shadow, due));
+        }
+    }
+    out
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -3107,18 +3331,41 @@ impl Shadow {
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
-                        #[cfg(feature = "diagnostics")]
-                        self.merge_refused("more changed runs than may go up one by one", lo, hi, runs.len());
-                        refused(lo, hi);
-                        return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    // Many runs, or past the budget: the page goes up by its
+                    // byte mask (`merge_masked`), under the side's lock held
+                    // here, as the runs would.
+                    if masking()
+                        && (runs.len() > masked_runs() || runs.len() > *runs_left)
+                        && let Some(card) = &self.card
+                    {
+                        if let Some(mask) = mask_into(at, title, held) {
+                            MASKED_STATS[0].fetch_add(1, Ordering::Relaxed);
+                            MASKED_STATS[1].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                            MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            let mut masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+                            // A mask of the same bytes not sent yet takes
+                            // these too.
+                            match masked.iter_mut().find(|m| m.sent == 0 && m.base == mask.base && m.dwords == mask.dwords) {
+                                Some(due) => {
+                                    due.bits = due.bits.iter().zip(mask.bits.iter()).map(|(a, b)| a | b).collect();
+                                }
+                                None => masked.push(mask),
+                            }
+                        }
+                    } else {
+                        if runs.len() > *runs_left {
+                            #[cfg(feature = "diagnostics")]
+                            self.merge_refused("more changed runs than may go up one by one", lo, hi, runs.len());
+                            refused(lo, hi);
+                            return true;
+                        }
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -3574,6 +3821,12 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
+        // The same for title bytes that go up by a mask (`merge_masked`),
+        // byte by byte.
+        let hidden = card.hidden(at, n, fetched_after);
+        if hidden.is_some() {
+            MASKED_STATS[3].fetch_add(1, Ordering::Relaxed);
+        }
         title.clear();
         title.resize(n, 0);
         // (Watched pages there: the card wrote them again first.)
@@ -3587,7 +3840,10 @@ impl Shadow {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            changed |= match &hidden {
+                Some(hidden) => merge_piece_hidden(&gpu[a..b], &mut held[a..b], &mut title[a..b], hidden, a),
+                None => merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]),
+            };
         }
         if !mapped || !changed {
             return 0;
@@ -3767,6 +4023,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    masked: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3983,6 +4240,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                masked: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -4262,6 +4520,7 @@ mod card_merge_tests {
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                masked: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });
@@ -4284,6 +4543,153 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    /// `VICTORY_MERGE_MASKED=1`: the title rewrote every eighth byte of a
+    /// 64 KiB page under a flight's shader writes; the merge put those bytes
+    /// into the CPU side and a mask (`mask_into`). The flight's slot, fetched
+    /// before the mask's send, holds the card's older bytes there and a
+    /// shader's write beside them, one in a dword the title changed in part.
+    /// The relay's merge takes the shader's bytes and leaves the title's: while
+    /// the mask is still to go up, and when it went up with a later send than
+    /// the fetch. Fetched after the mask's send, the slot holds the title's
+    /// bytes (the pass wrote them) and nothing is left out. Without the mask
+    /// the older card bytes would be taken for shaders' writes.
+    #[test]
+    fn title_bytes_sent_by_a_mask_survive_a_slot_fetched_before_it() {
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        // Shader bytes: one alone, one in a dword whose byte 0 the title
+        // changed (byte 1 of dword 0x100).
+        let shader_bytes = [0x2345usize, 0x401];
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 13 + 5) as u8).collect();
+        let rewritten = |i: usize| i.is_multiple_of(8);
+        let land = |sent: Option<u64>, fetched_after: u64, slot_has_title: bool| -> Vec<u8> {
+            let mut title = content.clone();
+            for (i, b) in title.iter_mut().enumerate() {
+                if rewritten(i) {
+                    *b ^= 0x5a;
+                }
+            }
+            let mut side = content.clone();
+            let mut mask = super::mask_into(0, &title, &mut side).expect("changed bytes");
+            assert_eq!(side, title, "the merge puts the title's bytes into the CPU side");
+            let mut masked = Vec::new();
+            if let Some(sent) = sent {
+                mask.sent = sent;
+                masked.push(mask);
+            }
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            shadow.card = Some(Card {
+                staging: staging.clone(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                masked: Mutex::new(masked),
+                size: 0,
+            });
+            // The flight's slot: the card's bytes behind its lists.
+            let mut slot = if slot_has_title { title.clone() } else { content.clone() };
+            for &at in &shader_bytes {
+                slot[at] ^= 0xc3;
+            }
+            let written = shadow.card_merge_relay(0, &slot, fetched_after, &mut Vec::new());
+            assert!(written > 0);
+            drop(shadow);
+            title
+        };
+        let check = |title: &[u8], what: &str| {
+            for i in 0..LEN {
+                let want = if shader_bytes.contains(&i) {
+                    content[i] ^ 0xc3
+                } else if rewritten(i) {
+                    content[i] ^ 0x5a
+                } else {
+                    content[i]
+                };
+                assert_eq!(title[i], want, "{what}: byte {i:#x}");
+            }
+        };
+        // Still to go up (0), and sent with send 7, after the fetch's 6.
+        check(&land(Some(0), 6, false), "mask still to go up");
+        check(&land(Some(7), 6, false), "mask sent after the fetch");
+        // Fetched after send 7: the slot has the title's bytes.
+        check(&land(Some(7), 7, true), "mask sent before the fetch");
+        // No mask: the older card bytes win (what the mask is for).
+        let lost = land(None, 6, false);
+        assert_eq!(lost[8], content[8], "without the mask the title's byte is lost");
+    }
+
+    /// `mask_into` marks exactly the bytes that differ, from a dword-aligned
+    /// base, and copies them; `Masked::has` and `Card::hidden` read it back.
+    #[test]
+    fn a_mask_holds_exactly_the_changed_bytes() {
+        let held: Vec<u8> = (0..300).map(|i| (i * 7) as u8).collect();
+        let mut title = held.clone();
+        let changed = [0usize, 1, 2, 3, 5, 63, 64, 65, 200, 298, 299];
+        for &i in &changed {
+            title[i] ^= 0x11;
+        }
+        for at in [0usize, 1, 2, 3, 4, 4097] {
+            let mut side = held.clone();
+            let mask = super::mask_into(at, &title, &mut side).expect("changed bytes");
+            assert_eq!(side, title);
+            assert_eq!(mask.base % 4, 0);
+            assert!(mask.base <= at && mask.base + 4 * mask.dwords >= at + title.len());
+            for o in mask.base..mask.base + 4 * mask.dwords {
+                let want = o >= at && o < at + title.len() && changed.contains(&(o - at));
+                assert_eq!(mask.has(o), want, "at {at}: offset {o}");
+            }
+            let card = Card {
+                staging: match super::card_merge_tests::warp_buffer() {
+                    Some(b) => b,
+                    None => return,
+                },
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                masked: Mutex::new(vec![super::Masked { sent: 3, ..mask.clone() }]),
+                size: 0,
+            };
+            // Sent with send 3: left out for a fetch after send 2, not 3.
+            let hidden = card.hidden(at + 1, 100, 2).expect("hidden bytes");
+            for k in 0..100 {
+                assert_eq!(hidden[k / 64] >> (k % 64) & 1 != 0, changed.contains(&(k + 1)), "at {at}: byte {k}");
+            }
+            assert!(card.hidden(at + 1, 100, 3).is_none());
+            assert!(super::mask_into(at, &title, &mut side).is_none(), "nothing differs any more");
+        }
+        // Random stretches and changes: the mask is the bytes that differ.
+        let mut seed = 0x0123_4567_89AB_CDEFu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let at = next() as usize % 97;
+            let n = 1 + next() as usize % 160;
+            let held: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let mut title = held.clone();
+            for _ in 0..next() % 40 {
+                let i = next() as usize % n;
+                title[i] = next() as u8;
+            }
+            let mut side = held.clone();
+            match super::mask_into(at, &title, &mut side) {
+                None => assert_eq!(title, held),
+                Some(mask) => {
+                    for o in mask.base..mask.base + 4 * mask.dwords {
+                        let want = o >= at && o < at + n && title[o - at] != held[o - at];
+                        assert_eq!(mask.has(o), want, "at {at}, {n} bytes: offset {o}");
+                    }
+                }
+            }
+            assert_eq!(side, title);
+        }
     }
 }
 
