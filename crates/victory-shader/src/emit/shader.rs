@@ -126,6 +126,9 @@ pub const USER_STRUCTURES: u32 = 0x106;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
+    /// `[earlydepthstencil]`: depth and stencil are tested before the
+    /// program runs (no feature bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;

@@ -98,6 +98,8 @@ mod descriptor_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod early_depth_tests;
+#[cfg(all(test, windows))]
 mod geometry_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
