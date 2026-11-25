@@ -2091,8 +2091,18 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            // Of its memory, only the bytes before the next texture placed in
+            // it (`descriptor::host::texture_own_bytes`, fxceless #995): the
+            // title keeps only a texture's small levels and places the next
+            // textures where its large ones would be, so the fingerprint's
+            // middle and end windows saw the neighbours stream in, and it was
+            // uploaded again with their bytes as its own large levels (#995's
+            // runs n7-n14: the most re-uploaded slots 4, 8 and 16 KiB apart,
+            // 344-684 KiB each; the blocks on the near surfaces at the bottom
+            // of the picture).
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                let now = crate::texture::fingerprint(at, len);
+                let own = crate::descriptor::host::texture_own_bytes(at, len);
+                let now = crate::texture::fingerprint(at, own);
                 if now == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     // Past the last of `RECHECK_FRAMES`: every
@@ -2118,7 +2128,7 @@ impl State {
                 if usize::from(looks) >= RECHECK_FRAMES.len() {
                     HEAP_TEXTURES_RECHECKED[2].fetch_add(1, Ordering::Relaxed);
                 }
-                if crate::texture::fingerprint_split(len) && crate::texture::windows_same(now, print) {
+                if crate::texture::fingerprint_split(own) && crate::texture::windows_same(now, print) {
                     HEAP_TEXTURES_RECHECKED[3].fetch_add(1, Ordering::Relaxed);
                 }
                 if n < 200 || n.is_multiple_of(1000) {
@@ -2284,6 +2294,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
+                    let len = crate::descriptor::host::texture_own_bytes(at, len);
                     let print = crate::texture::fingerprint(at, len);
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }

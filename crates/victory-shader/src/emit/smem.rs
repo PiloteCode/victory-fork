@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use super::{
     Address, Attr, Bin, CODE, DRIVER, Fields, Inst, Lower, MEMORY, NULL, Operand, Reg, ResourceType,
-    Site, Source, V, Why, flags, pred,
+    Cast, Site, Source, V, Why, flags, pred,
 };
 
 impl Lower<'_> {
@@ -95,7 +95,11 @@ impl Lower<'_> {
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
-            for k in 0..count {
+            if super::super::lean_math() >= 1 {
+                let b = self.cur;
+                raw = self.raw_dwords(b, h, addr, count).into_iter().map(|x| (x, zero)).collect();
+            }
+            for k in (raw.len() as u32)..count {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
@@ -133,6 +137,13 @@ impl Lower<'_> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            if super::super::lean_math() >= 1 {
+                let dwords = self.raw_dwords(c, h, addr, count);
+                for (k, x) in dwords.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -237,6 +248,40 @@ impl Lower<'_> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// `count` dwords from byte `addr` of raw view `h`, as a scalar buffer
+    /// load reads them: one host load for each four (DXIL's raw loads take
+    /// up to four dwords at a 4-byte alignment), where one per dword was.
+    /// The address is the same in every lane.
+    fn raw_dwords(&mut self, b: usize, h: V, addr: V, count: u32) -> Vec<V> {
+        let mut out = Vec::with_capacity(count as usize);
+        let mut k = 0;
+        while k < count {
+            let n = (count - k).min(4);
+            let a = if k == 0 {
+                addr
+            } else {
+                let off = self.s.m.i32(4 * k);
+                self.s.m.bin(b, Bin::Add, addr, off)
+            };
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let r = self.s.op(
+                b,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            for j in 0..n {
+                let x = self.s.m.extract(b, r, j);
+                out.push(self.s.m.cast(b, Cast::Bitcast, x, self.s.t.i32));
+            }
+            k += n;
+        }
+        out
     }
 
     /// The dword at a computed byte address of a constant buffer.

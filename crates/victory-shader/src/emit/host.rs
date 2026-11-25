@@ -183,15 +183,27 @@ impl Host {
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
-        self.root_signature_with(stages, false)
+        self.root_signature_bounded(stages, false, &[])
+    }
+
+    /// [`Host::root_signature_for`] with `extra` parameters after the root
+    /// views (#995's mesh bench).
+    pub fn root_signature_with(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        extra: &[D3D12_ROOT_PARAMETER1],
+    ) -> Result<ID3D12RootSignature, String> {
+        self.root_signature_bounded(stages, false, extra)
     }
 
     /// [`Host::root_signature_for`]; with `bounded`, each root UAV is a
-    /// table of one view, as the layer binds them.
-    fn root_signature_with(
+    /// table of one view, as the layer binds them; `extra` parameters after
+    /// the root views.
+    fn root_signature_bounded(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
         bounded: bool,
+        extra: &[D3D12_ROOT_PARAMETER1],
     ) -> Result<ID3D12RootSignature, String> {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
@@ -259,6 +271,7 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        params.extend_from_slice(extra);
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -326,7 +339,7 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-        let root = self.root_signature_with(&[(cs, D3D12_SHADER_VISIBILITY_ALL)], true)?;
+        let root = self.root_signature_bounded(&[(cs, D3D12_SHADER_VISIBILITY_ALL)], true, &[])?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
         Ok((root, pso))
     }

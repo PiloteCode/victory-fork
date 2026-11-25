@@ -2,7 +2,7 @@
 //! sources and writes of register halves, the 16-bit float and integer operations, the
 //! normalized 16-bit conversions and the packed (VOP3P) forms.
 
-use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, pred};
+use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Value, Why, pred};
 
 impl Lower<'_> {
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
@@ -584,6 +584,67 @@ impl Lower<'_> {
         };
         self.write(inst, Reg::V(reg), r, guard);
         Ok(())
+    }
+
+    /// Whether no instruction reads the high 16 bits of `v`: each reader takes it as an f16
+    /// low half (`v_cvt_f32_f16` without `op_sel`, a `v_fma_mix*` operand with `op_sel_hi`
+    /// and without `op_sel`), or keeps it as the old low half of `v_fma_mixhi_f16`, or as the
+    /// old high half of `v_fma_mixlo_f16` whose own high half no one reads (`depth` levels
+    /// of those); a join (phi) or any other reader counts as a read.
+    pub(super) fn high_half_unread(&self, v: Value, depth: u32) -> bool {
+        let p = self.x.p;
+        if p.blocks.iter().any(|b| b.phis.iter().any(|ph| ph.args.contains(&v))) {
+            return false;
+        }
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                if !inst.reads.iter().any(|r| r.1 == v) {
+                    continue;
+                }
+                let Fields::Valu(f) = &inst.fields else {
+                    return false;
+                };
+                if f.sdwa.is_some() || f.dpp.is_some() {
+                    return false;
+                }
+                let name = inst.name();
+                let holds = |op: &Operand| matches!(*op, Operand::Vector { reg, .. } if inst.read(Reg::V(reg)) == Some(v));
+                for (k, op) in f.src.iter().enumerate() {
+                    if !holds(op) {
+                        continue;
+                    }
+                    let low = match name {
+                        "v_cvt_f32_f16" => f.opsel & 1 == 0,
+                        "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                            f.opsel_hi >> k & 1 != 0 && f.opsel >> k & 1 == 0
+                        }
+                        _ => false,
+                    };
+                    if !low {
+                        return false;
+                    }
+                }
+                // the destination's register holds it: a half write keeps the other half, and
+                // a write under a guard keeps the whole of it in the lanes outside EXEC
+                if f.dst.as_ref().is_some_and(holds) {
+                    let Some(Operand::Vector { reg, .. }) = f.dst else {
+                        return false;
+                    };
+                    let ok = match name {
+                        "v_fma_mixhi_f16" => true,
+                        "v_fma_mixlo_f16" => {
+                            depth > 0 && inst.write(Reg::V(reg)).is_some_and(|w| self.high_half_unread(w, depth - 1))
+                        }
+                        "v_cvt_f32_f16" | "v_fma_mix_f32" => self.x.st.guards[b][i].is_none(),
+                        _ => false,
+                    };
+                    if !ok {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit

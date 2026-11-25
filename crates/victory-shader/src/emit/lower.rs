@@ -536,10 +536,24 @@ fn need(block: usize) {
 /// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
 /// constants and such values; or loaded from an address made of them. The compiler keeps
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
+/// With [`wave_uniform`] bit 4, an LDS read (`ds_read*`) at an address held alike in every
+/// lane counts too when no LDS write of the program can run while it reads ([`lds_unraced`]):
+/// every lane, in whichever host wave and at whatever time, then reads the same bytes.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+/// With [`wave_uniform`] bit 2, a buffer load counts too where `read_only` says its view is
+/// one nothing in the dispatch writes, its address is held alike (or is the offset alone) and
+/// every lane runs it.
+fn lane_uniform(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    waits: &dyn Fn(usize) -> bool,
+    read_only: &dyn Fn(Site) -> bool,
+) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let own_registers = wave_uniform() & 1 != 0;
+    let lds_reads = wave_uniform() & 4 != 0;
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
         let block = &p.blocks[b];
@@ -551,6 +565,40 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            if let Fields::Ds {
+                addr: Some(Operand::Vector { reg, .. }),
+                gds: false,
+                ..
+            } = inst.fields
+                && lds_reads
+                && name.starts_with("ds_read")
+                && st.guards[b][i].is_none()
+                && inst.read(Reg::V(reg)).is_some_and(|a| same.contains(&a))
+                && lds_unraced(p, (b, i), waits)
+            {
+                same.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
+                continue;
+            }
+            if let Fields::Buffer {
+                addr: Operand::Vector { reg, dwords },
+                offen,
+                idxen,
+                lds: false,
+                tfe: false,
+                ..
+            } = inst.fields
+                && name.contains("_load_")
+                && st.guards[b][i].is_none()
+                && read_only((b, i))
+            {
+                // without `offen` and `idxen` the address register is not read
+                let addressed = !(offen || idxen)
+                    || (reg..reg.saturating_add(dwords)).all(|r| inst.read(Reg::V(r)).is_some_and(|a| same.contains(&a)));
+                if addressed {
+                    same.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
+                }
+                continue;
+            }
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
@@ -566,11 +614,21 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
             if st.guards[b][i].is_some() {
                 continue; // lanes outside EXEC keep another value
             }
+            // `VICTORY_WAVE_UNIFORM` bit 1: an operand is its own registers; of the other VGPRs
+            // the instruction reads, the old values of those it writes (kept in the lanes a
+            // guard masks; unguarded here) do not count. Not for what accumulates into its
+            // destination or reads registers by M0.
+            let own = own_registers && !(name.contains("mac") || name.contains("dot") || name.contains("movrel"));
             let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
+                Operand::Vector { reg, dwords } => {
                     // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                    let end = if own { reg.saturating_add(dwords.max(1)) } else { u8::MAX };
+                    let read: Vec<Value> = inst
+                        .reads
+                        .iter()
+                        .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && (x < end || !own)))
+                        .map(|r| r.1)
+                        .collect();
                     !read.is_empty() && read.iter().all(|x| same.contains(x))
                 }
                 // a scalar is one value; a lane mask is not, unless a compare of such values made it
@@ -578,6 +636,15 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                     inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
                 }
                 _ => true,
+            }) && (!own || {
+                let in_operand = |x: u8| {
+                    ops.iter().any(|op| matches!(*op, Operand::Vector { reg, dwords } if x >= reg && x < reg.saturating_add(dwords.max(1))))
+                };
+                let written = |x: u8| inst.writes.iter().any(|w| w.0 == Reg::V(x));
+                inst.reads.iter().all(|r| match r.0 {
+                    Reg::V(x) if !in_operand(x) => written(x) || same.contains(&r.1),
+                    _ => true,
+                })
             });
             if alike {
                 same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
@@ -585,6 +652,83 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// Whether no LDS write can run while the read at `at` does, in any wave of the group: none
+/// lies in the stretch between group barriers that holds the read. The stretch starts where
+/// the read can be reached from without passing a barrier (going back to the barriers, or the
+/// entry, it comes from); everything those starts reach without passing a barrier is
+/// searched, so a write on another branch of the same stretch counts too. A barrier counts
+/// only where the host waits there for the whole group (`waits`, by block). A write is a
+/// `ds_` instruction other than a read, swizzle or permute, or a buffer or flat load into LDS;
+/// an indirect jump ends the search with a no.
+fn lds_unraced(p: &Program, at: (usize, usize), waits: &dyn Fn(usize) -> bool) -> bool {
+    let writes = |inst: &Inst| match &inst.fields {
+        Fields::Ds { .. } => {
+            let n = inst.name();
+            !(n.starts_with("ds_read") || matches!(n, "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32" | "ds_nop"))
+        }
+        Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => *lds,
+        _ => false,
+    };
+    let barrier = |b: usize, inst: &Inst| inst.name() == "s_barrier" && waits(b);
+    // Back from the read: the points the stretch starts at.
+    let mut starts: Vec<(usize, usize)> = Vec::new();
+    let mut seen = vec![false; p.blocks.len()];
+    let mut back = vec![at];
+    while let Some((b, end)) = back.pop() {
+        let insts = &p.blocks[b].insts;
+        let mut started = false;
+        for j in (0..end.min(insts.len())).rev() {
+            if barrier(b, &insts[j]) {
+                starts.push((b, j + 1));
+                started = true;
+                break;
+            }
+            if writes(&insts[j]) {
+                return false;
+            }
+        }
+        if started {
+            continue;
+        }
+        if b == 0 || p.blocks[b].preds.is_empty() {
+            starts.push((b, 0));
+        }
+        for &q in &p.blocks[b].preds {
+            if !std::mem::replace(&mut seen[q], true) {
+                back.push((q, p.blocks[q].insts.len()));
+            }
+        }
+    }
+    // Forward from the starts to the barriers that end the stretch.
+    let mut seen = vec![false; p.blocks.len()];
+    let mut ahead = starts;
+    while let Some((b, from)) = ahead.pop() {
+        let block = &p.blocks[b];
+        let mut ended = false;
+        for inst in block.insts.iter().skip(from) {
+            if barrier(b, inst) {
+                ended = true;
+                break;
+            }
+            if writes(inst) {
+                return false;
+            }
+        }
+        if ended {
+            continue;
+        }
+        if matches!(block.exit, crate::ir::Exit::Indirect) {
+            return false;
+        }
+        for s in block.exit.successors() {
+            if !std::mem::replace(&mut seen[s], true) {
+                ahead.push((s, 0));
+            }
+        }
+    }
+    true
 }
 
 /// The paired form: scalar values each console lane has its own of in the lowering, a waterfall
@@ -687,6 +831,20 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+                let mut list = Vec::new();
+                for (b, block) in p.blocks.iter().enumerate().take(n) {
+                    if all[b] || find(&mut region, b) != r {
+                        continue;
+                    }
+                    for i in block.insts.iter().filter(|i| matches!(i.fields, Fields::Ds { .. })) {
+                        list.push(format!("{:#x} {}", i.machine.offset, i.name()));
+                    }
+                }
+                eprintln!("WAVE64-LDS-REGION [{}]", list.join(", "));
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -857,6 +1015,33 @@ fn f16_nearest_on() -> bool {
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_WAVE_UNIFORM` (default 0): more values a console wave64 program in two host waves
+/// of 32 finds alike in every lane ([`lane_uniform`]), so that a `v_readfirstlane` of them
+/// takes the host wave's own first lane instead of the lower half's through LDS (two group
+/// barriers each). Bit 1: an operand is judged by its own registers only (not by the old
+/// value of the destination, which the instruction reads for lanes a guard masks). Bit 2:
+/// buffer loads at an address alike in every lane through a view the title declares read-only
+/// (SRV or CBV: nothing in the dispatch writes it, so both halves read the same bytes). Bit 4:
+/// LDS reads at an address alike in every lane where no LDS write can run meanwhile
+/// ([`lds_unraced`]; always on in #995, off here unless asked for, so that the default
+/// translation stays as it was).
+pub(super) fn wave_uniform() -> u8 {
+    #[cfg(test)]
+    if let Some(bits) = TEST_WAVE_UNIFORM.get() {
+        return bits;
+    }
+    static BITS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_UNIFORM").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0) & 7
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wave_uniform`], for its thread only.
+    pub(super) static TEST_WAVE_UNIFORM: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
 }
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
@@ -1345,6 +1530,7 @@ impl<'a> Lower<'a> {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
+                payload: super::shader::mesh_payload(),
             });
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
@@ -1381,7 +1567,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Lower {
+        let mut l = Lower {
             s,
             x,
             bad,
@@ -1445,7 +1631,18 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                    // where the host waits for the whole group at an `s_barrier` (see its lowering)
+                    let waits = |b: usize| {
+                        !no_barrier.contains(&b)
+                            && match super::group_sync() {
+                                0 => false,
+                                1 => !fence_only.contains(&b),
+                                _ => true,
+                            }
+                    };
+                    lane_uniform(p, x.st, all, &waits, &|_| false)
+                }
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -1510,7 +1707,29 @@ impl<'a> Lower<'a> {
             drop_in,
             drop_out,
             emitted: Default::default(),
+        };
+        // `VICTORY_WAVE_UNIFORM` bit 2: again, with buffer loads through read-only views
+        if wave_uniform() & 2 != 0
+            && let Some((_, false, all)) = &l.exchange
+            && !LOCAL_WAVES.get()
+        {
+            let waits = |b: usize| {
+                !l.no_barrier.contains(&b)
+                    && match super::group_sync() {
+                        0 => false,
+                        1 => !l.fence_only.contains(&b),
+                        _ => true,
+                    }
+            };
+            let read_only = |site: Site| {
+                l.descriptors.get(&(site, false)).and_then(|src| l.used_kind(src)).is_some_and(|u| {
+                    matches!(u.kind, ResourceType::Srv | ResourceType::Cbv)
+                })
+            };
+            let uniform = lane_uniform(p, x.st, all, &waits, &read_only);
+            l.uniform = uniform;
         }
+        l
     }
 
     /// Element `id` of the inputs (`input`) or the vertex outputs as the finished signature
@@ -3626,6 +3845,17 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
+        let lean = super::lean_math();
+        if lean >= 1 {
+            // Only two zeros need the fix: none with a constant other than ±0
+            // (NaN and infinity included), and none for a value and itself,
+            // whose host maximum is one of two equal operands. Level 2: the
+            // host's FMax and FMin order the zeros themselves (measured).
+            let nonzero = |l: &Self, v: V| l.s.m.float_bits(v).is_some_and(|k| k & 0x7FFF_FFFF != 0);
+            if a == b || nonzero(self, a) || nonzero(self, b) || lean >= 2 {
+                return r;
+            }
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -3832,6 +4062,35 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
+        if super::lean_math() >= 1 {
+            // The same values for every input, with fewer tests: the result is
+            // +0 exactly when an operand is ±0, so an operand known not to be
+            // one needs no test (a constant other than ±0: NaN and infinity
+            // are not zero either), and an operand known to be one gives +0.
+            // Negations and absolute values are zero when what they take is,
+            // so `x * x`, `-x * x` and `|x| * x` need one test.
+            let zero_bits = |l: &Self, v: V| l.s.m.float_bits(v).map(|k| k & 0x7FFF_FFFF == 0);
+            let (ka, kb) = (zero_bits(self, a), zero_bits(self, b));
+            if ka == Some(true) || kb == Some(true) {
+                return zero;
+            }
+            let (ra, rb) = (self.s.m.zero_root(a), self.s.m.zero_root(b));
+            let tested = match (ka, kb) {
+                (Some(false), Some(false)) => return m,
+                (Some(false), None) => Some(rb),
+                (None, Some(false)) => Some(ra),
+                _ if ra == rb => Some(ra),
+                _ => None,
+            };
+            if let Some(x) = tested {
+                let z = self.s.m.cmp(c, pred::OEQ, x, zero);
+                return self.s.m.select(c, z, zero, m);
+            }
+            let az = self.s.m.cmp(c, pred::OEQ, ra, zero);
+            let bz = self.s.m.cmp(c, pred::OEQ, rb, zero);
+            let z = self.s.m.bin(c, Bin::Or, az, bz);
+            return self.s.m.select(c, z, zero, m);
+        }
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
