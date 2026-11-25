@@ -1931,7 +1931,12 @@ impl HostHeap {
             self.copied_changed(&mut copied, index, record, crate::frame::current())
         };
         if changed {
-            self.mirror(index, handle, false);
+            // The same bytes that were fingerprinted, not a second read of
+            // the guest slot (it may have changed since).
+            match record_words(record) {
+                Some(words) => self.mirror_record(index, handle, false, words),
+                None => self.mirror(index, handle, false),
+            };
         }
         changed
     }
@@ -2058,7 +2063,17 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_record(index, handle, for_draw, record)
+    }
+
+    fn mirror_record(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        [tag, i, generation]: [u32; 3],
+    ) -> Option<View> {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2376,6 +2391,15 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The header [`HostHeap::mirror`] reads from a title slot (tag, index,
+/// generation), taken from a record as it was read: `None` if the record
+/// is shorter than that.
+fn record_words(record: &[u8]) -> Option<[u32; 3]> {
+    let header = record.first_chunk::<12>()?;
+    let word = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
+    Some([word(0), word(4), word(8)])
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -3360,6 +3384,42 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_sampler_uses_the_record_that_was_fingerprinted() {
+        let heap = HostHeap::new(true, 8).expect("D3D12 test sampler heap");
+        let mut a = [0u32; 4];
+        let mut b = [0u32; 4];
+        let mut live = [0u32; 4];
+        let clamp = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        let mut wrap = clamp;
+        wrap[1] = 1;
+        super::super::create_sampler(std::ptr::null(), &clamp, a.as_mut_ptr() as u64);
+        super::super::create_sampler(std::ptr::null(), &wrap, b.as_mut_ptr() as u64);
+        let key = |r: [u32; 4]| u64::from(r[2]) << 32 | u64::from(r[1]);
+        let bytes = |r: [u32; 4]| {
+            let mut out = [0u8; 16];
+            for (dst, word) in out.chunks_exact_mut(4).zip(r) {
+                dst.copy_from_slice(&word.to_le_bytes());
+            }
+            out
+        };
+        assert_ne!(key(a), key(b));
+        let handle = live.as_mut_ptr() as u64;
+        let installed = || heap.made.lock().unwrap()[1];
+        // The sampler record interning is identical to the title's API
+        // writes. Both byte records and the later guest location are valid.
+        live.copy_from_slice(&b);
+        assert!(heap.mirror_copied(1, handle, &bytes(a)));
+        let first = installed();
+        live.copy_from_slice(&a);
+        assert!(!heap.mirror_copied(1, handle, &bytes(a)));
+        assert_eq!((first, installed()), (key(a), key(a)));
+        live.copy_from_slice(&b);
+        assert!(heap.mirror_copied(1, handle, &bytes(b)));
+        assert_eq!(installed(), key(b));
+        assert!(!heap.made(2), "unrelated slot was modified");
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
