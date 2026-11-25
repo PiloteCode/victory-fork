@@ -1,7 +1,8 @@
 //! One-to-one SSA form of a native program (decision 0003, step 1).
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
-//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped.
+//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped, and
+//! conditional branches to the next instruction, which become jumps.
 //! Each register dword is a variable: a read names the [`Value`] it sees, a
 //! write defines a new one, and [`Phi`]s merge values where control flow
 //! joins. Nothing is raised: an instruction keeps its opcode and decoded
@@ -144,6 +145,17 @@ pub fn with_shared_slots<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Whether a conditional branch to the next instruction becomes a jump there (official
+/// VIctory #1282): `VICTORY_BRANCH_FALLTHROUGH=0` keeps it a branch whose two edges reach the
+/// same block, as before. Part of the translation (the shader cache keys on every
+/// `VICTORY_*` switch of this crate).
+fn branch_to_fallthrough_as_jump() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_BRANCH_FALLTHROUGH").map_or(true, |v| v.trim() != "0")
+    })
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
@@ -206,6 +218,16 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             (*to, *from) = (parked[k].1, parked[k].2);
         }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
+        // A conditional branch to the next instruction has no register effects and made the
+        // same edge twice, which gave the join's phi the wrong value: a jump instead
+        // (official VIctory #1282, 1ed26e50; calls also branch, but are no SOPP).
+        if machine.encoding == gfx10::Encoding::Sopp
+            && matches!(flow, Flow::Branch(target) if Some(target) == next)
+            && branch_to_fallthrough_as_jump()
+        {
+            blocks[b].exit = Exit::Jump(fallthrough()?);
+            continue;
+        }
         let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
         if ends {
             blocks[b].exit = match flow {

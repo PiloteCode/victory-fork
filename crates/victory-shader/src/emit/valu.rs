@@ -198,6 +198,9 @@ impl Lower<'_> {
         if let Some(r) = self.valu_f64(inst, name, guard) {
             return r;
         }
+        if let Some(r) = self.valu_official(inst, name, guard) {
+            return r;
+        }
         match name {
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
@@ -760,9 +763,7 @@ impl Lower<'_> {
                     Some(Err(FIRST_HALF)) | None => self.s.m.i32(0),
                     Some(Err(why)) => return Err(why),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.narrow16(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -787,9 +788,7 @@ impl Lower<'_> {
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = self.narrow16(a);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };
@@ -836,6 +835,9 @@ impl Lower<'_> {
                 const UNTRACKED: Why = "a select on an untracked mask";
                 let cond = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
                     Some(m) => self.boolean(m, c)?,
+                    None if self.cndmask_more(v.src.get(2), mask) => {
+                        self.cndmask_cond(v.src.get(2), mask, c)?
+                    }
                     // A mask the code holds as a number (a constant bit
                     // pattern: every other lane, every other pair...):
                     // this lane's bit of it. Exact where host lanes are
@@ -1089,6 +1091,7 @@ impl Lower<'_> {
                 let x = crate::resource::inline(k).ok_or("a special operand")?;
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
+            Operand::Literal(x) if inst.name().ends_with("_i64") => Ok(self.sext64(x)),
             _ => {
                 // Literals and the null register: zero-extended.
                 let x = self.operand(inst, &op)?;
@@ -1579,6 +1582,8 @@ impl Lower<'_> {
                     let lt = self.s.m.cmp(c, pred::OLT, a, b);
                     let gt = self.s.m.cmp(c, pred::OGT, a, b);
                     self.s.m.bin(c, Bin::Or, lt, gt)
+                } else if op == "f" || op == "tru" {
+                    self.s.m.bool(op == "tru")
                 } else {
                     let p = match op {
                         "f" => pred::FALSE,

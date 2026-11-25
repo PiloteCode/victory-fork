@@ -480,6 +480,10 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Lane masks not derived from EXEC or VALU results (constants, opaque values, uniform
+    /// selects), by their low dword's value, for uses such as `v_cndmask_b32` (official
+    /// VIctory #1221, 67c4f531).
+    pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -910,6 +914,10 @@ impl<'a> Lanes<'a> {
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other: (self.other.iter())
+                .filter(|(k, _)| !split.contains(&k.0))
+                .map(|(&(lo, _), &m)| (lo, m))
+                .collect(),
             highs: self
                 .masks
                 .keys()

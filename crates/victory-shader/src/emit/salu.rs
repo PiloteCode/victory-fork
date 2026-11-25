@@ -21,6 +21,9 @@ impl Lower<'_> {
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
+        if let Some(r) = self.sop_official(inst, name, lo, scc) {
+            return r;
+        }
         if matches!(
             name,
             "s_setreg_imm32_b32" | "s_setreg_b32" | "s_swappc_b64" | "s_version"
@@ -66,6 +69,7 @@ impl Lower<'_> {
                     let x = crate::resource::inline(*k).ok_or("a special operand")?;
                     Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
                 }
+                Some(&Operand::Literal(x)) if name.ends_with("_i64") => Ok(l.sext_high(x)),
                 _ => Ok(l.s.m.i32(0)),
             }
         };
@@ -405,7 +409,10 @@ impl Lower<'_> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (
+                    self.s.m.select(c, t, a, b),
+                    super::official::sminmax_scc().then_some(t),
+                )
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;

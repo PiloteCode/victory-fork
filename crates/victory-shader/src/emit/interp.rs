@@ -161,10 +161,7 @@ impl Lower<'_> {
                         None => Ok(None),
                     }
                 };
-                let to_f16 = |l: &mut Self, f: V| {
-                    let i32t = l.s.t.i32;
-                    l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-                };
+                let to_f16 = |l: &mut Self, f: V| l.narrow16(f);
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {
@@ -173,6 +170,9 @@ impl Lower<'_> {
                     self.as_int(f)
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    if self.interp_f16_modified(inst) {
+                        return self.interp_f16_write(inst, f);
+                    }
                     let lo = to_f16(self, f);
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {

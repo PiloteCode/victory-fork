@@ -2,7 +2,7 @@
 //! sources and writes of register halves, the 16-bit float and integer operations, the
 //! normalized 16-bit conversions and the packed (VOP3P) forms.
 
-use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, f16_nearest_on, pred};
+use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, pred};
 
 impl Lower<'_> {
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
@@ -60,7 +60,7 @@ impl Lower<'_> {
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
     /// half, or its high half with op_sel bit 3 (or an SDWA WORD_1 select);
     /// the other half is kept (GFX10).
-    fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
+    pub(super) fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -195,15 +195,8 @@ impl Lower<'_> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            // The console rounds to nearest; the host's conversion may round toward zero
-            // (NVIDIA's does), one step of the last place lower where the two differ.
-            // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
-            // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
-                l.f16_nearest(f)
-            } else {
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            };
+            // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1` (`narrow16`).
+            let h = l.narrow16(f);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -501,7 +494,7 @@ impl Lower<'_> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -533,8 +526,7 @@ impl Lower<'_> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.narrow16(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
