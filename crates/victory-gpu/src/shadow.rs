@@ -228,21 +228,42 @@ pub(crate) fn mask_into(at: usize, title: &[u8], held: &mut [u8]) -> Option<Mask
     let end = (at + n).next_multiple_of(4);
     let mut bits = vec![0u32; (end - base).div_ceil(32)];
     let mut any = false;
-    let mut i = 0;
-    while i < n {
-        // Equal bytes, eight at a time while they last.
-        if i + 8 <= n && title[i..i + 8] == held[i..i + 8] {
-            i += 8;
-            continue;
+    // Bit `k` of the mask for byte `k` past `base`; eight bytes at a time.
+    let mut set = |k: usize, eight: u64| {
+        let (word, shift) = (k / 32, k % 32);
+        bits[word] |= (eight << shift) as u32;
+        // (Spilled bits are bytes of the stretch: the word is there.)
+        if shift > 24 && eight >> (32 - shift) != 0 {
+            bits[word + 1] |= (eight >> (32 - shift)) as u32;
         }
+    };
+    let skew = at - base;
+    let mut i = 0;
+    while i + 8 <= n {
+        let a = u64::from_le_bytes(title[i..i + 8].try_into().unwrap_or_default());
+        let b = u64::from_le_bytes(held[i..i + 8].try_into().unwrap_or_default());
+        let mut x = a ^ b;
+        if x != 0 {
+            // The low bit of each byte that differs, then those eight bits
+            // gathered into the top byte (byte j to bit j).
+            x |= x >> 4;
+            x |= x >> 2;
+            x |= x >> 1;
+            let eight = ((x & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56) & 0xff;
+            set(skew + i, eight);
+            any = true;
+        }
+        i += 8;
+    }
+    while i < n {
         if title[i] != held[i] {
-            let k = at + i - base;
-            bits[k / 32] |= 1 << (k % 32);
-            held[i] = title[i];
+            set(skew + i, 1);
             any = true;
         }
         i += 1;
     }
+    // Equal bytes stay equal: the title's bytes, all of them.
+    held[..n].copy_from_slice(&title[..n]);
     any.then(|| Masked {
         base,
         dwords: (end - base) / 4,
@@ -4639,6 +4660,35 @@ mod card_merge_tests {
             }
             assert!(card.hidden(at + 1, 100, 3).is_none());
             assert!(super::mask_into(at, &title, &mut side).is_none(), "nothing differs any more");
+        }
+        // Random stretches and changes: the mask is the bytes that differ.
+        let mut seed = 0x0123_4567_89AB_CDEFu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let at = next() as usize % 97;
+            let n = 1 + next() as usize % 160;
+            let held: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let mut title = held.clone();
+            for _ in 0..next() % 40 {
+                let i = next() as usize % n;
+                title[i] = next() as u8;
+            }
+            let mut side = held.clone();
+            match super::mask_into(at, &title, &mut side) {
+                None => assert_eq!(title, held),
+                Some(mask) => {
+                    for o in mask.base..mask.base + 4 * mask.dwords {
+                        let want = o >= at && o < at + n && title[o - at] != held[o - at];
+                        assert_eq!(mask.has(o), want, "at {at}, {n} bytes: offset {o}");
+                    }
+                }
+            }
+            assert_eq!(side, title);
         }
     }
 }
