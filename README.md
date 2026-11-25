@@ -190,6 +190,70 @@ writes are copied into upload memory on the CPU (they are not on the
 To run it: `Lancer GTA6 (VIctory).bat` next to the game's files builds the
 release and starts the title.
 
+### Picture checks (2026-11-25, RTX 5090, diagnostics builds)
+
+Captures of the opening cutscene (a new game) and of the save's gameplay,
+before and after the merge of the upstream fork, traced to the passes that
+make them with the frame listings and target dumps:
+
+- **Bright blocks** (white, blue, pink, green 16-pixel tiles, mostly along the
+  bottom of the picture; "NINE MONTHS AGO", the prison yard, the diner): made
+  by the screen-probe indirect light (`indirect_diffuse_lighting`:
+  `CS_FinalGather_*`, then `CS_ScreenProbes_TemporalResolve_*`) and by the
+  per-material `CS_RaytracingResolve` passes, whose half-size output is
+  scrambled into blocks over the whole picture. Both shade what the title's
+  own ray traversal returns, and the structures it traverses are not built:
+  300 to 1,400 builder dispatches a frame are dropped while the builder is
+  off (six listed cutscene frames; 632 in a gameplay frame). Rays
+  that find nothing take the sky's light (`CS_ScreenProbe_RayMiss`), and the
+  probes near the bottom edge, whose screen-space traces leave the picture
+  first, are the brightest. Not a fault of the layer's copies or views: it
+  goes with the builder (see the ray-tracing notes). The white eyes of close
+  faces are probably the same miss light (`ped_standard_eye` has a resolve
+  pass of its own); not traced further.
+- **Hair drawn as fans of strands and a face pulled out of shape** (the
+  long-haired man in the night street shots) and **rooms without some of their
+  walls**: present before the merge, not seen in the same shots after it
+  (one run each; the upstream fork's writes through other views of a page and
+  byte-copied descriptor records).
+- **Black frames**: every presented frame is now probed (diagnostics), so a
+  black frame is told from a fade by the frames around it. In a five-minute
+  cutscene run, three: two cuts through black between loading screens before
+  the world, and one fade of the cutscene (255 down to 79 over five frames,
+  black for two, then the next shot). In the save's gameplay run, two: a cut
+  between loading screens, and the world's very first frame (4,996 draws),
+  black once before the picture comes up over the next frames (2, 46, 169,
+  91, 92...); its listing was not captured, so that one is not traced yet.
+  None in the cutscene went black for a single frame.
+- **Washed-out frames after cuts** (the white "NINE MONTHS AGO" shot): the
+  title's small exposure targets show the scene's luminance jump about fifty
+  times while the exposure-like value stays put (0.054 to 0.063), and the
+  picture settles within about 25 frames: the title's eye adaptation, which
+  at five frames a second has few frames to do it in. Not a fault found in
+  the layer.
+- **Depth bounds**: the upstream fork's test (#82) now also has a GPU test of
+  the mesh path. In eleven listed frames (seven of the opening cutscene, four
+  of the gameplay) the title set the bounds 1,595 times, always to 0 and 1,
+  which pass every depth: the test changes nothing in those scenes.
+- **Views of another shape over a texture the layer writes** ("what the host
+  wrote is not what it shows"): every pair logged in more than fifty runs is a
+  block-compressed streamed texture whose memory begins 16 to 672 KiB before an
+  RGBA8 render target and covers its first part. That is memory the title
+  reuses, not a reinterpretation (which would start at the same address, as
+  the probes' R32_UINT/R9G9B9E5 pairs that are copied do): what the view must
+  show is what the title last wrote there, title memory. Showing the target's
+  texels would decode RGBA8 pixels as BC blocks. Measured in one cutscene run:
+  of 8.3 million reads of placed views, one met a target the layer had written
+  in the same or the frame before; in a gameplay run none, and six of the
+  eight targets met there were never written by the layer at all.
+- **Buffer views**: a raw view that does not start on 16 bytes of its buffer's
+  copy now gets a copy of its own bytes, as views off their elements already
+  did (it was left null: zeros); a view of no elements and a shader's address
+  of a null view read as on the console (zeros, and address 0), and so do the
+  placed unordered texture views left null: every one seen had no memory
+  (address 0). In the runs after these changes no buffer view was left null,
+  and 196 raw views of the gameplay run were made on their own bytes.
+
 ### Known problems
 
 - Everything in shadow is black (see above).
