@@ -6427,7 +6427,13 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide_textures() {
+                            // With the batch's other refreshes, before the
+                            // next step that writes title memory.
+                            batch.staged.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -6473,6 +6479,28 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`wide_textures`]: the staging buffers to refresh at the next
+    /// flush, each once.
+    staged: Vec<std::sync::Arc<crate::texture::Staging>>,
+}
+
+/// Whether a submission's texture refreshes (staging buffers of textures
+/// its lists read through tables) run several at a time with its buffer
+/// refreshes, at the same points (`VICTORY_WIDE_TEXTURES=1`; off by
+/// default), and not one after the other where each list asks.
+///
+/// They were all on the submitting thread: in the opening cutscene 70 to
+/// 130 ms a frame (220 to 420 MB read, hashed and detiled), with the card
+/// standing idle behind that thread more than 150 ms a frame. A staging
+/// buffer's refresh reads its texture's memory and writes its own buffer,
+/// nothing of another's (texture refreshes already run on the threads that
+/// record lists too, under each staging buffer's own lock). They are done
+/// before the next step that writes title memory, as the buffer refreshes
+/// are, so each still takes the memory as it is at its place among the
+/// submission's steps; the card reads them only when the lists run.
+fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
 }
 
 impl Batch {
@@ -6567,6 +6595,28 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        self.refresh_textures();
+    }
+
+    /// The staging buffers due ([`wide_textures`]), several at a time. The
+    /// time counted is the time it took, not the threads' sum.
+    fn refresh_textures(&mut self) {
+        let staged = std::mem::take(&mut self.staged);
+        if staged.len() < 2 {
+            for staging in staged {
+                staging.refresh();
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Ordering::Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = staged
+            .into_iter()
+            .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }
 }
 
