@@ -227,6 +227,10 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// Diagnostics: the last indirect dispatch whose record was clamped
+    /// (host list, copy, stride; the record's offset in the copy).
+    #[cfg(feature = "diagnostics")]
+    dispatch_clamped: Option<((usize, u64, u32), u64)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -3254,15 +3258,31 @@ impl State {
                 let written = list.writes_declared((arguments as usize, (arguments + span) as usize));
                 let early = crate::indirect::early() && counter.is_none() && !written;
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    match (kind == DISPATCH, written) {
-                        (false, false) => crate::copystat::C::ClampFromBefore,
-                        (false, true) => crate::copystat::C::ClampWrittenInList,
-                        (true, false) => crate::copystat::C::ClampDispatchFromBefore,
-                        (true, true) => crate::copystat::C::ClampDispatchWrittenInList,
-                    },
-                    1,
-                );
+                {
+                    crate::copystat::add(
+                        match (kind == DISPATCH, written) {
+                            (false, false) => crate::copystat::C::ClampFromBefore,
+                            (false, true) => crate::copystat::C::ClampWrittenInList,
+                            (true, false) => crate::copystat::C::ClampDispatchFromBefore,
+                            (true, true) => crate::copystat::C::ClampDispatchWrittenInList,
+                        },
+                        1,
+                    );
+                    // A dispatch's record a short step after the last
+                    // dispatch's clamped in this list: what a window of
+                    // dispatch records could have held.
+                    if kind == DISPATCH {
+                        let here = (std::ptr::from_ref(list) as usize, args.id(), stride);
+                        if let Some((at, last)) = self.dispatch_clamped
+                            && at == here
+                            && offset > last
+                            && offset - last <= 256
+                        {
+                            crate::copystat::add(crate::copystat::C::ClampDispatchWalks, 1);
+                        }
+                        self.dispatch_clamped = Some((here, offset));
+                    }
+                }
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
