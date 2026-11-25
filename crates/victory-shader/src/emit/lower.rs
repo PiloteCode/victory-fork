@@ -332,6 +332,9 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+/// A descriptor joined from the ways into a block, where one of them brings what a heap index
+/// cannot stand for (an immediate sampler, say), or comes from later in the program.
+pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -5465,7 +5468,8 @@ impl<'a> Lower<'a> {
     }
 
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
-    /// the code also reads as numbers: the console compiler computes sizes
+    /// the code reads as numbers, besides using the descriptor or (an image's
+    /// size) instead of it: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
     /// buffer's record count) instead of querying them. Those fields are
     /// rebuilt from the host view's dimensions in the GFX10 layout (image
@@ -5530,7 +5534,60 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        // `sized`: no instruction uses the descriptor, the code reads an image's size from it.
+        let (first, used, uav, props, image, sized) = if let Some((at, first)) = use_at {
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = match &ui.fields {
+                // A ray-tracing structure in a buffer of the host: read raw.
+                Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
+                Fields::Image { dim, .. } => {
+                    let kind = match dim {
+                        0 => 1,
+                        1 => 2,
+                        2 => 4,
+                        4 => 6,
+                        5 => 7,
+                        _ => return Err("an image dimension (cube or MSAA)"),
+                    };
+                    ((kind | u, 0x409), Some(kind))
+                }
+                Fields::Buffer { idxen, format, .. } => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if un.starts_with("buffer_load_format")
+                        || un.starts_with("buffer_store_format")
+                    {
+                        (10 | u, 0x409)
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        self.stale.extend(inst.writes.iter().map(|w| w.1));
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    (props, None)
+                }
+                // Read by scalar buffer loads alone: the raw view `smem` reads it through.
+                Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+                    ((11, 0), None)
+                }
+                // A constant buffer: nothing of its descriptor is a number.
+                Fields::Smem { .. } => {
+                    self.stale.extend(inst.writes.iter().map(|w| w.1));
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                _ => return Err("a scalar memory read as data"),
+            };
+            (first, used, uav, props, image, false)
+        } else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5578,58 +5635,27 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
+            // An image's descriptor (eight dwords) that the code reads the size of and
+            // nothing else: `GetDimensions` of a texture the program does not sample (the
+            // title's puddle shaders take the texel size of a heap texture so). No
+            // instruction names the image's kind, so the handle is a 2D texture's, and
+            // only what a 2D view has (width, height, levels) gets a value: depth and
+            // layers (dword 4) stay without one.
+            // shortcut: the view in the heap is taken to be a 2D texture; one of another
+            // kind is queried through a 2D texture's handle.
+            let src = Source::Loaded { load: site, first: 0 };
+            let used = self.used_kind(&src);
+            let view = used.is_none_or(|u| {
+                matches!(u.kind, ResourceType::Srv | ResourceType::Uav) && u.dwords == 8
+            });
+            if count != 8 || !view {
+                return Err("a descriptor read only as data");
+            }
+            let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            (0, used, uav, (2 | u, 0x409), Some(2), true)
         };
         let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            // A ray-tracing structure in a buffer of the host: read raw.
-            Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    self.stale.extend(inst.writes.iter().map(|w| w.1));
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
-            }
-            // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
-            }
-            // A constant buffer: nothing of its descriptor is a number.
-            Fields::Smem { .. } => {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a constant buffer's descriptor read as data");
-            }
-            _ => return Err("a scalar memory read as data"),
-        };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -5678,7 +5704,11 @@ impl<'a> Lower<'a> {
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+                let mut words = vec![(1, d1), (2, d2), (3, d3)];
+                if !sized {
+                    words.push((4, depth));
+                }
+                words
             }
             None => {
                 // A raw view counts bytes; the descriptor's record count is in elements.
@@ -6122,7 +6152,7 @@ impl<'a> Lower<'a> {
         sampler: bool,
         depth: u32,
     ) -> Result<V, Why> {
-        const WHY: Why = "a descriptor chosen by control flow";
+        const WHY: Why = CHOSEN;
         let p = self.x.p;
         let mut incoming = Vec::new();
         for (&q, arg) in p.blocks[block].preds.iter().zip(args) {

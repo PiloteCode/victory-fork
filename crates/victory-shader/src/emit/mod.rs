@@ -83,6 +83,8 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod descriptor_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -479,6 +481,16 @@ pub fn emit(
         }
         other => other,
     };
+    // A descriptor joined from what each way into a block brings, where a way brings what no
+    // heap index stands for (the title's terrain programs pick an immediate sampler that
+    // clamps or wraps by a uniform condition, each arm setting its own constant): once more
+    // with that block copied for each way in ([`split_choices`]).
+    let original = match original {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CHOSEN => {
+            split_choices(c, native, p, res).unwrap_or(original)
+        }
+        other => other,
+    };
     let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
@@ -494,6 +506,55 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// `p` translated with the joins of its descriptors chosen by control flow copied for each way
+/// in ([`ir::split_joins`]), so that each copy holds one descriptor; again while the choice
+/// moves on to a later join (a use further down), a few times at most. `None` unless a form
+/// translates.
+fn split_choices(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    res: &resource::Resources,
+) -> Option<Result<(HostShader, Option<u32>), ShaderError>> {
+    /// The joins where a descriptor is chosen from what a heap index cannot stand for: a way
+    /// in that brings neither a loaded descriptor nor an earlier join's choice.
+    fn joins(res: &resource::Resources) -> Vec<usize> {
+        fn walk(s: &resource::Source, out: &mut Vec<usize>) {
+            use resource::Source;
+            if let Source::Phi { block, args } = s {
+                let other = |a: &Source| !matches!(a, Source::Loaded { .. } | Source::Phi { .. });
+                if args.iter().any(other) && !out.contains(block) {
+                    out.push(*block);
+                }
+                for a in args {
+                    walk(a, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for d in &res.descriptors {
+            walk(&d.source, &mut out);
+        }
+        out
+    }
+    let mut chosen = joins(res);
+    let mut form = ir::split_joins(p, &chosen)?;
+    for _ in 0..4 {
+        let st = structure::structure(&form).ok()?;
+        let io = io::raise(&form, native).ok()?;
+        let res = resource::track(&form, &native.layout, native.stage, Some(&st)).ok()?;
+        match emit_program(c, native, &form, &st, &io, &res) {
+            Err(ShaderError::Unsupported { what, .. }) if what == lower::CHOSEN => {
+                chosen = joins(&res);
+                form = ir::split_joins(&form, &chosen)?;
+            }
+            Ok(done) => return Some(Ok(done)),
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

@@ -580,6 +580,54 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// Each of `joins` copied for every way into it but the first, each copy entered from its own
+/// predecessor and left as the join is: a value the join merged from its ways in is one
+/// value in each copy. Every instruction still runs once on each path. A loop header (a
+/// block with a way in from later in reverse postorder) is left as it is. `None` if nothing
+/// changes.
+pub(crate) fn split_joins(p: &Program, joins: &[usize]) -> Option<Program> {
+    let order = reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        index[b] = n;
+    }
+    let mut blocks = p.blocks.clone();
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    let mut any = false;
+    for &join in joins {
+        let mut preds = p.blocks[join].preds.clone();
+        preds.dedup();
+        if preds.len() < 2 || preds.iter().any(|&q| index[q] >= index[join]) {
+            continue;
+        }
+        for &pred in &preds[1..] {
+            let target = blocks.len();
+            blocks.push(blocks[join].clone());
+            match &mut blocks[pred].exit {
+                Exit::Jump(t) => *t = target,
+                Exit::Branch { taken, not_taken } => {
+                    if *taken == join {
+                        *taken = target;
+                    }
+                    if *not_taken == join {
+                        *not_taken = target;
+                    }
+                }
+                _ => unreachable!("a way into a join"),
+            }
+        }
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
