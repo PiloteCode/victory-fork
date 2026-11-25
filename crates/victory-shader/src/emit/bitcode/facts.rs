@@ -122,6 +122,11 @@ impl Facts {
         self.hi <= 0.0 && !self.pz
     }
 
+    /// Only ever a zero (or a denormal): never NaN, no number but 0 within its bounds.
+    pub fn only_zeros(&self) -> bool {
+        !self.nan && self.lo >= 0.0 && self.hi <= 0.0
+    }
+
     /// Never a zero (nor a denormal).
     pub fn nonzero(&self) -> bool {
         !self.pz && !self.nz
@@ -705,10 +710,18 @@ impl Module {
                 continue;
             };
             let (fa, fb) = (facts(self, a), facts(self, b));
+            let zero = self.f32(0);
+            // An operand that is only ever a zero: +0 for every input, as `0 + 0` (the
+            // product, the other operand's chain with it, left to the dead-code pass: the
+            // product alone would keep it, where the default form's select folds away).
+            if fa.only_zeros() || fb.only_zeros() {
+                self.insts[ri as usize].op = Op::Bin(Bin::Add, zero, zero);
+                n += 1;
+                continue;
+            }
             let Some(form) = choose(&fa, &fb) else {
                 continue;
             };
-            let zero = self.f32(0);
             let (mop, rop) = match form {
                 Form::Plain => (None, Op::Bin(Bin::Mul, a, b)),
                 Form::AddFirst { swap } => {

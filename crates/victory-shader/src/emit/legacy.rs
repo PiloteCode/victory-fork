@@ -41,7 +41,9 @@
 //! once every join is filled, with facts settled over the loops to a fixed point
 //! (`Module::legacy_after_joins`): the forms above, under the same switches, in place of the
 //! select. With it the bounds of sums and products are the f32s at or beyond the exact
-//! bounds, not widened by a factor, so a product of values within [0, 1] stays within it.
+//! bounds, not widened by a factor, so a product of values within [0, 1] stays within it; and
+//! a multiply with an operand only ever a zero is +0 itself (the product alone would keep the
+//! other operand's chain alive where the default form's select folds away).
 //!
 //! Each switch is part of the translation (the shader cache keys on it); with all three off
 //! each program is as before, bit for bit, and with `VICTORY_LEGACY_LOOPS=0` alone as before
@@ -134,6 +136,13 @@ impl Lower<'_> {
             return None;
         }
         let (fa, fb) = (self.s.m.facts(a), self.s.m.facts(b));
+        // (with `VICTORY_LEGACY_LOOPS`: an operand only ever a zero makes +0 of every input;
+        // the product alone would keep the other operand's chain alive)
+        if loops_on() && (fa.only_zeros() || fb.only_zeros()) {
+            #[cfg(test)]
+            TEST_SHORT.set(TEST_SHORT.get() + 1);
+            return Some(self.s.m.f32(0));
+        }
         let form = choose(&fa, &fb, plain, zero)?;
         let c = self.cur;
         let r = match form {

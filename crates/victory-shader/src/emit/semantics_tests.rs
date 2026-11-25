@@ -1405,6 +1405,12 @@ fn legacy_short_forms_are_the_consoles() {
         let x = med3(i[0], 0, 0x3F80_0000);
         vec![mul_legacy(mul_legacy(x, x), mad(x, 0xC000_0000, 0x4080_0000))]
     }));
+    // A value only ever a zero (v_med3_f32 v6, v1, 0, 0) times anything: +0 for every input, a
+    // constant with `VICTORY_LEGACY_LOOPS` (the product alone would keep v2's chain alive; the
+    // clean-up folds the default form's select only for a literal zero).
+    let mut body = vop3(0x157, 6, [v(1), int(0), int(0)], NONE).to_vec();
+    body.push(vop2(0x07, 5, v(6), 2));
+    probes.push(probe(body, pairs(F32_EDGES, F32_EDGES), F32, |i| vec![mul_legacy(med3(i[0], 0, 0), i[1])]));
     // `0 - x` of x = v_med3_f32(v1, 0, 1) times 0.5: by IEEE never -0, so the product alone
     // would do, but the card's driver makes `0 - x` the negation, -0 of +0: the default forms
     // keep the select (`VICTORY_LEGACY_LOOPS`'s facts follow the card); `(x + 0) * 0.5` of
