@@ -169,9 +169,8 @@ struct Checks {
 }
 
 /// `translate --warm <file>`: the containers whose hash the file names are
-/// translated into the run's shader cache, on `jobs` threads; nothing is
-/// made on the GPU. A run of the title then finds them there instead of
-/// translating each at its first use.
+/// translated into the run's shader cache, on `jobs` threads. The adapter
+/// is probed for the cache key without creating shader pipelines.
 pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
@@ -191,6 +190,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     // (what is done stays in the cache; the next warm-up goes on from there).
     let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::prepare_shader_warm().map_err(anyhow::Error::msg)?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
     let threads = jobs.unwrap_or(4).max(1);
