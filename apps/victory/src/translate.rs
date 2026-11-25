@@ -872,8 +872,13 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     let d16_image = insts()
         .filter(|i| matches!(i.fields, Fields::Image { d16: true, .. }))
         .count();
+    // Of those, the loads and stores (no sampler: the ones that can name an integer view).
+    let d16_image_load = insts()
+        .filter(|i| matches!(i.fields, Fields::Image { d16: true, .. }))
+        .filter(|i| i.name().starts_with("image_load") || i.name().starts_with("image_store"))
+        .count();
     line.push_str(&format!(
-        "\tc_d16={d16}\tc_d16_image={d16_image}\thalf_views={}",
+        "\tc_d16={d16}\tc_d16_image={d16_image}\tc_d16_image_load={d16_image_load}\thalf_views={}",
         shader.half_views.len()
     ));
     line.push('\n');
