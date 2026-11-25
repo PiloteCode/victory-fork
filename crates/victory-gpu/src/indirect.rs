@@ -544,6 +544,39 @@ pub(crate) fn early() -> bool {
     *ON.get_or_init(|| ring() && std::env::var_os("VICTORY_INDIRECT_EARLY").is_none_or(|v| v != "0"))
 }
 
+/// Whether the clamps of indirect draws whose records a shader of the list
+/// may have written are hoisted too (`VICTORY_HOIST_CLAMPS=1`; off by
+/// default): the list is cut before such a draw (`crate::list::hoist_cut`),
+/// and in the new part no shader may have written them, so their clamps
+/// and those of the draws after them run in its prelude ([`early`]), one
+/// after another and ahead of the draws, until the list writes again.
+/// Needs [`early`] and lists cut at waits (`crate::queue::cuts`); a cut
+/// waits for nothing and runs in the same submission.
+///
+/// The idea is Belobug's fork's (ccab9730, 918ab038, 76387c2d): there a run
+/// of indirect draws had a dispatch of ours and three barriers between each
+/// two draws, 9,300 a frame and 190 of 225 ms of the card's time on an AMD
+/// card, and cutting the list at a run's first draw, its clamps in a list
+/// of their own before it, took it to 72-80 ms. Here the clamps of records
+/// no shader of the list wrote already run in the preludes, windows clamp a
+/// walk of records at once, and an in-list clamp waits once: what is left
+/// in the lists are the draws whose records the list's own shaders may have
+/// written (228 a frame in the gameplay's timing run, against 788 from
+/// before the list) and the compute dispatches (679), which this leaves
+/// alone (their records are written just before by a pass of the same
+/// list). Each cut costs a part: closing the list, a pooled host list, the
+/// state set again, and the prelude's wait for all earlier work.
+pub(crate) fn hoisting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HOIST_CLAMPS").is_some_and(|v| v == "1") && early() && crate::queue::cuts();
+        if std::env::var_os("VICTORY_HOIST_CLAMPS").is_some() {
+            tracing::info!(on, "indirect draws' clamps hoisted into the prelude of a part cut before them (VICTORY_HOIST_CLAMPS)");
+        }
+        on
+    })
+}
+
 /// A clamp for the list's prelude ([`early`]): the clamp pass's root
 /// constants and its source, count, ring and budget addresses.
 pub(crate) struct Early {

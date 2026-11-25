@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its output gets the constant indirect light ([`crate::ambient`],
+    /// off unless `VICTORY_AMBIENT` asks).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Its range of the loop notes (`crate::loop_notes`), given out on its
@@ -131,6 +135,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                resolves_light: stage == "compute" && crate::ambient::resolves_light(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(all(windows, feature = "diagnostics"))]
@@ -226,6 +232,7 @@ impl Shader {
                     stage: self.stage,
                     hash: self.hash.clone(),
                     container: self.container.clone(),
+                    resolves_light: self.resolves_light,
                     translated: OnceLock::new(),
                     #[cfg(feature = "diagnostics")]
                     loop_slot: OnceLock::new(),

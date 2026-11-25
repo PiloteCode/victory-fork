@@ -272,6 +272,13 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// Set by [`State::execute_indirect`] instead of recording an indirect
+    /// draw whose records a shader of the list may have written: the list
+    /// is to be cut there and the draw recorded again in the new part,
+    /// whose prelude then clamps them (`crate::indirect::hoisting`).
+    pub(crate) hoist_cut: bool,
+    /// The command is recorded again after such a cut: no second one.
+    pub(crate) hoist_retry: bool,
     /// Diagnostics: the last indirect dispatch whose record was clamped
     /// (host list, copy, stride; the record's offset in the copy).
     #[cfg(feature = "diagnostics")]
@@ -284,6 +291,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Of them, the large ones ([`LARGE_TABLE`]) by table: the records each
+    /// was made from and its first dynamic slot. A draw that reads less of
+    /// one takes it if the records it reads are the same ([`table_longest`]).
+    large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -329,10 +340,49 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.large_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
     }
+}
+
+/// Tables of this many entries and more are made at the longest length
+/// shaders read them to ([`table_longest`]).
+const LARGE_TABLE: u32 = 64;
+
+/// Whether a large descriptor table made afresh is made at the longest
+/// length any shader has read it to, and a draw that reads less of it
+/// takes one made for a longer read while the entries it reads are the
+/// same (on by default; `VICTORY_TABLE_LONGEST=0` makes each at the length
+/// its draw reads, as before).
+///
+/// Shaders read the world's big tables to many lengths, and each length
+/// was a copy of its own: a run of Belobug's fork ran its 524,288 dynamic
+/// slots out after six minutes (draws dropped), copies of one table at
+/// several lengths taking most of them; with this its peak was 369,107,
+/// none refused (its df715461). Ours are 262,144 on a card that caps view
+/// heaps at 1,000,000 views, and the opening cutscene refused up to 721
+/// tables a frame.
+fn table_longest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_LONGEST").is_none_or(|v| v != "0"))
+}
+
+/// The longest table `table` of `heap` has been asked for, now that a draw
+/// asks for `n` entries: that length if the heap has slots for all of it
+/// and the dynamic slots can hold it, else `n`.
+fn longest_read(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
+    static LONGEST: std::sync::Mutex<Option<std::collections::HashMap<u64, u32>>> = std::sync::Mutex::new(None);
+    let most = {
+        let mut all = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
+        let most = all.get_or_insert_default().entry(table).or_insert(n);
+        *most = (*most).max(n);
+        *most
+    };
+    let fits = most <= crate::descriptor::host::DYNAMIC
+        && table.checked_add(u64::from(most - 1) * 32).and_then(|last| heap.index(last)).is_some();
+    if fits { most } else { n }
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
@@ -2384,6 +2434,38 @@ impl State {
             None => unsafe { list.list.Dispatch(x, y, z) },
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list, p);
+    }
+
+    /// After a dispatch of `p`: its output replaced by the constant
+    /// indirect light if it is the program that resolves the probes and
+    /// `VICTORY_AMBIENT` asks for it (`crate::ambient`). The pass binds a
+    /// heap, root signature and pipeline of its own: the next draw or
+    /// dispatch binds the title's again.
+    fn ambient(&mut self, list: &HostList, p: &HostPipeline) {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return;
+        };
+        let (slot, dword) = crate::ambient::place();
+        let found = stage.translated().used.iter().find(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, dword)
+        });
+        let light = found.and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+            Some(Root::Table(table)) => match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                Some(View::Unordered(r, ..)) if r != 0 => Some(r),
+                _ => None,
+            },
+            _ => None,
+        });
+        let Some(light) = light else {
+            once!(slot, dword, "no ambient light: the program has no image at that place of its tables");
+            return;
+        };
+        if crate::ambient::replace(list, light as This) {
+            self.host_heaps = [usize::MAX; 2];
+            self.host_roots = [0; 2];
+            self.host_pipeline = 0;
+        }
     }
 
     /// A dispatch by thread counts (`DispatchX` with the console's
@@ -2888,6 +2970,27 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            // A large table: made at the longest read of it, and one made
+            // for a longer read whose entries this draw reads are the same
+            // serves it ([`table_longest`]).
+            let needed = n;
+            let large = table_longest() && n >= LARGE_TABLE;
+            let n = if large { longest_read(heap, table, n) } else { n };
+            let records: Vec<[u32; 3]> = if large {
+                (0..n)
+                    // SAFETY: descriptor slots in title memory (the heap has them all).
+                    .map(|k| unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let longer = large
+                .then(|| {
+                    let made = self.large_tables.get(&table)?;
+                    let at = needed as usize;
+                    made.iter().find(|(r, _)| r.len() >= at && r[..at] == records[..at]).map(|&(_, first)| first)
+                })
+                .flatten();
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -2899,7 +3002,11 @@ impl State {
                 }
                 (table, n, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            #[cfg(feature = "diagnostics")]
+            if longer.is_some() {
+                crate::copystat::add(crate::copystat::C::TablesPrefix, 1);
+            }
+            if let Some(&first) = longer.as_ref().or_else(|| self.fresh_tables.get(&key)) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2920,13 +3027,29 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            // No room for the longest read: the length this draw reads, kept
+            // for this draw alone.
+            let (n, first) = match host.dynamic(n) {
+                Some(first) => (n, Some(first)),
+                None if n > needed => (needed, host.dynamic(needed)),
+                None => (n, None),
+            };
+            let Some(first) = first else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            if n == key.1 {
+                self.fresh_tables.insert(key, first);
+                if large {
+                    #[cfg(feature = "diagnostics")]
+                    if n > needed {
+                        crate::copystat::add(crate::copystat::C::TablesLonger, 1);
+                    }
+                    self.large_tables.entry(table).or_default().push((records, first));
+                }
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3330,8 +3453,9 @@ impl State {
                         || list.writes_declared_since((w.at as usize, end as usize), w.mark))
             })
             .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base), w.step));
+        // (Counted once for a command recorded again after a cut.)
         #[cfg(feature = "diagnostics")]
-        {
+        if !self.hoist_retry {
             use crate::copystat::{C, add};
             let why = if !windows() {
                 None
@@ -3394,10 +3518,6 @@ impl State {
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
-                if let Some((s, at)) = &counter {
-                    s.refresh(list, *at, 4);
-                }
                 // Whether a shader recorded before in the list may write the
                 // records: if none may, the card holds them as they are when
                 // the list begins, and they are clamped in its prelude
@@ -3410,6 +3530,25 @@ impl State {
                 let written = args.in_place()
                     || list.asked(crate::memory::STORES)
                     || list.writes_declared((arguments as usize, (arguments + span) as usize));
+                // A draw's records one may have written, with hoisting on:
+                // nothing is recorded, the caller cuts the list here and
+                // records the draw again in the new part, where none may
+                // have, so its clamp (and those of the draws after it, until
+                // the list writes again) goes to the new part's prelude
+                // instead of between the draws.
+                if written
+                    && kind != DISPATCH
+                    && counter.is_none()
+                    && !self.hoist_retry
+                    && crate::indirect::hoisting()
+                {
+                    self.hoist_cut = true;
+                    return false;
+                }
+                args.refresh(list, arguments, span);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
                 let early = crate::indirect::early() && counter.is_none() && !written;
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3546,6 +3685,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.ambient(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

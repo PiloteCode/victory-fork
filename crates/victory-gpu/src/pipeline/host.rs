@@ -254,6 +254,17 @@ impl GraphicsState {
         }
     }
 
+    /// Whether this is a pass over the screen: triangles with no vertex
+    /// input and no depth or stencil test (`crate::pipeline::make` makes
+    /// such pipelines first). The title fills its lighting tables with such
+    /// draws, once.
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -1144,6 +1155,38 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// Triangles with no vertex input and no depth or stencil test are a
+    /// pass over the screen; lines, a vertex input or a depth test are not.
+    #[test]
+    fn a_screen_pass_is_told_by_its_state() {
+        let triangles = || GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..GraphicsState::default()
+        };
+        assert!(triangles().screen_pass(), "no depth target");
+        let lines = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+            ..GraphicsState::default()
+        };
+        assert!(!lines.screen_pass());
+        let tested = GraphicsState {
+            depth_format: DXGI_FORMAT_D32_FLOAT,
+            ..triangles()
+        };
+        assert!(!tested.screen_pass(), "a depth target with its test on (the default)");
+        let mut untested = GraphicsState {
+            depth_format: DXGI_FORMAT_D32_FLOAT,
+            ..triangles()
+        };
+        untested.depth.DepthEnable = false.into();
+        assert!(untested.screen_pass(), "a depth target with no test");
+        let fed = GraphicsState {
+            inputs: vec![D3D12_INPUT_ELEMENT_DESC::default()],
+            ..triangles()
+        };
+        assert!(!fed.screen_pass(), "a vertex input");
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };

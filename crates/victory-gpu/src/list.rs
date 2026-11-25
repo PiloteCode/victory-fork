@@ -343,8 +343,57 @@ fn cut(this: This, wait: ValueWait) {
     }
 }
 
+/// Before an indirect draw whose records the list may have written: the
+/// recording is cut here with no wait, so that the clamps of the draws
+/// from here on run in the new part's prelude, all together and ahead of
+/// the draws, instead of each in the list between two of them
+/// (`crate::indirect::hoisting`). What was recorded so far keeps its place
+/// as a part of its own ([`Part`], with the waits before it); the new part
+/// waits for nothing, and runs in the same submission right after it
+/// ([`detach`], [`detach_parts`]). Whether it was cut: not past
+/// [`HOIST_PARTS_MOST`] parts (a list that writes records before each of
+/// its draws would be cut at every draw), nor where nothing was recorded.
+#[cfg(windows)]
+pub(crate) fn hoist_cut(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(current) = list.host.as_ref() else {
+        return false;
+    };
+    if current.untouched() || list.earlier.len() + 1 >= HOIST_PARTS_MOST {
+        return false;
+    }
+    let Some(fresh) = fresh_list() else {
+        return false;
+    };
+    current.close();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::HoistCuts, 1);
+    if let Some(done) = list.host.replace(fresh) {
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part { waits, host: done });
+    }
+    if let Some(host) = list.host.as_ref() {
+        list.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replay(host);
+    }
+    true
+}
+
+/// The most parts a list is cut into for hoisted clamps ([`hoist_cut`]);
+/// past them the clamps stay in the list, as without the switch.
+#[cfg(windows)]
+const HOIST_PARTS_MOST: usize = 32;
+
 /// Whether list `this` recorded a wait for a memory value (with waits cut
-/// into lists).
+/// into lists). A list cut only for hoisted clamps ([`hoist_cut`]) waits
+/// for nothing: [`detach`] takes its parts in order.
 #[cfg(windows)]
 pub(crate) fn cut_list(this: This) -> bool {
     if this.is_null() {
@@ -353,7 +402,19 @@ pub(crate) fn cut_list(this: This) -> bool {
     // SAFETY: one of our lists, closed and submitted: nothing records
     // into it.
     let list = unsafe { &*this.cast::<List>() };
-    !list.earlier.is_empty() || !list.gate.is_empty()
+    !list.gate.is_empty() || list.earlier.iter().any(|part| !part.waits.is_empty())
+}
+
+/// Whether list `this` was cut into parts (at waits, or for hoisted
+/// clamps): its host list alone is not all it runs.
+#[cfg(windows)]
+pub(crate) fn has_parts(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: one of our lists, closed and submitted: nothing records
+    // into it.
+    !unsafe { &*this.cast::<List>() }.earlier.is_empty()
 }
 
 /// What a queue is given for submitted lists that were cut at their waits:
@@ -454,16 +515,21 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// Takes the host sides of submitted lists (each once, however often the
 /// submission names it) and leaves each list a new, closed host list for
 /// its next reset: what was taken, and which of them run in what order.
+/// A list cut for hoisted clamps ([`hoist_cut`]) gives its parts in order,
+/// its upload memory and draw state going with the last, as
+/// [`detach_parts`] does; it waits for nothing ([`cut_list`]).
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
+    let mut taken: Vec<Detached> = Vec::new();
+    // The lists taken: where their host lists are in `taken`, and how many.
+    let mut seen: Vec<(This, usize, usize)> = Vec::new();
     let mut order = Vec::new();
     for &this in lists {
         if this.is_null() {
             continue;
         }
-        if let Some(i) = taken.iter().position(|(t, _)| *t == this) {
-            order.push(i);
+        if let Some(&(_, first, n)) = seen.iter().find(|(t, ..)| *t == this) {
+            order.extend(first..first + n);
             continue;
         }
         let Some(fresh) = fresh_list() else {
@@ -475,7 +541,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
-        let (host, uploads, state) = unsafe {
+        let (host, uploads, state, earlier, gate) = unsafe {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
@@ -483,19 +549,28 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
-            (host, uploads, state)
+            (host, uploads, state, std::mem::take(&mut (*list).earlier), std::mem::take(&mut (*list).gate))
         };
-        order.push(taken.len());
-        taken.push((
-            this,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+        if !gate.is_empty() || earlier.iter().any(|part| !part.waits.is_empty()) {
+            // (Not reached: such a list goes through `detach_parts`.)
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("the waits of a list cut at them were passed over"));
+        }
+        let first = taken.len();
+        taken.extend(earlier.into_iter().map(|part| Detached {
+            host: part.host,
+            _uploads: Uploads::default(),
+            _state: Default::default(),
+        }));
+        taken.push(Detached {
+            host,
+            _uploads: uploads,
+            _state: state,
+        });
+        order.extend(first..taken.len());
+        seen.push((this, first, taken.len() - first));
     }
-    (taken.into_iter().map(|(_, d)| d).collect(), order)
+    (taken, order)
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -2050,9 +2125,22 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let mut cut = false;
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            cut = std::mem::take(&mut s.hoist_cut);
         });
+        // Its clamp hoisted (`crate::indirect::hoisting`): the list is cut
+        // here and the command recorded in the new part (in this one, its
+        // clamp before it as before, if no part could be made).
+        if cut {
+            hoist_cut(this);
+            with_state(this, |list, s| {
+                s.hoist_retry = true;
+                ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+                s.hoist_retry = false;
+            });
+        }
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
@@ -2524,6 +2612,46 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A list cut for hoisted clamps (`crate::indirect::hoisting`) waits for
+    /// nothing, and a submission takes its parts in the order they were
+    /// recorded, each time the submission names it (needs a host device;
+    /// the software adapter does: `VICTORY_D3D12_WARP=1`).
+    #[cfg(windows)]
+    #[test]
+    fn a_list_cut_for_hoisted_clamps_gives_its_parts_in_order() {
+        use windows::core::Interface;
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let raw = |list: This| host_list(list).expect("a host list").list.as_raw() as usize;
+        assert!(!hoist_cut(list), "nothing recorded: nothing to cut");
+        let mut recorded = Vec::new();
+        for _ in 0..2 {
+            recorded.push(raw(list));
+            // Some work in the part (a texture it brought up to date).
+            host_list(list).unwrap().first_use(1);
+            assert!(hoist_cut(list));
+        }
+        recorded.push(raw(list));
+        assert!(has_parts(list), "cut");
+        assert!(!cut_list(list), "a cut for hoisted clamps waits for nothing");
+        assert_eq!(close(list), S_OK);
+        let (taken, order) = detach(&[list, list]);
+        let ran: Vec<usize> = taken.iter().map(|d| d.host().list.as_raw() as usize).collect();
+        assert_eq!(ran, recorded, "the parts, in the order recorded");
+        assert_eq!(order, [0, 1, 2, 0, 1, 2], "named twice, run twice");
+        assert!(!has_parts(list), "the parts went with the submission");
+        drop(taken);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

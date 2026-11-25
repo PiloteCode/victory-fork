@@ -261,6 +261,16 @@ fn submit_cut(this: This, lists: &[This]) {
         // and come back, with their tables' slots, when they are settled.
         let (taken, order) = crate::list::detach(&lists[..first]);
         host.execute_late(taken, order);
+    } else if first > 0 && lists[..first].iter().any(|&l| crate::list::has_parts(l)) {
+        // Lists cut for hoisted clamps (`crate::list::hoist_cut`): their
+        // parts in order, as a held submission runs them; their tables'
+        // slots go with their draw state when the host lists are recycled.
+        let (taken, order) = crate::list::detach(&lists[..first]);
+        {
+            let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| taken[i].host()).collect();
+            host.execute(&runs);
+        }
+        crate::list::recycle(taken, &order);
     } else if first > 0 {
         let now: Vec<_> = lists[..first]
             .iter()

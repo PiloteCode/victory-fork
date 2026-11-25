@@ -1197,7 +1197,7 @@ fn install() {
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if writable(at) {
+        if writable(at) || reopen_unknown(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
@@ -1208,6 +1208,39 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// A write faulted at `at`, in a view of physical pages the runtime told
+/// us of, read-only, and no guard holds its block: only we make title views
+/// read-only, so it is given back (logged once) rather than ending the run.
+/// Belobug's fork met such blocks (its 1c7231d9: a view made read-only as
+/// another view of a guarded page before the runtime's notice of it, which
+/// then forgot the guard); the order here (the notice of a mapping, then
+/// its view) leaves none known, so this only stands between such a slip
+/// and a crash. Not with `VICTORY_VIEW_GUARD=0`, which guards no other view.
+fn reopen_unknown(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    };
+    let block = at - at % BLOCK;
+    if !view_guard() || crate::inplace::pages_of(block).is_empty() {
+        return false;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || info.Protect != PAGE_READONLY {
+        return false;
+    }
+    let mut old = 0;
+    // SAFETY: a block of a title view; only its protection changes.
+    let opened = unsafe { VirtualProtect(block as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+    if opened {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block no guard knew was opened"));
+    }
+    opened
 }
 
 /// Whether `at` is committed read-write memory now.
