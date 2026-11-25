@@ -283,7 +283,9 @@ pub fn compute_derivatives() -> bool {
 /// taken with each host wave as a wave of its own (exact, no group barrier) before the forms
 /// "without early-outs" and "without skips", whose two host waves exchange each wave-wide value
 /// through LDS at two group barriers. Without it those forms win whenever they translate, and
-/// the idiom's exact form is only tried after them.
+/// the idiom's exact form is only tried after them. (So in #995. wave7 already takes each
+/// form's local form where that is exact, `split::local_if_exact`, which gives the same
+/// program in the cases measured: this only moves the idiom's local forms ahead.)
 pub(crate) fn local_first() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_LOCAL_FIRST.get() {

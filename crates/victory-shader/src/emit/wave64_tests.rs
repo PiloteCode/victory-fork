@@ -1600,7 +1600,9 @@ fn an_append_with_an_early_out_takes_each_host_wave_on_its_own_when_asked_first(
         (pick(false), pick(true), local)
     });
     assert_eq!(on.dxil, local.dxil, "the switch picks the local form");
-    assert_ne!(off.dxil, on.dxil, "without it another form is picked");
+    // In #995 another form is picked without the switch; wave7 takes the local form where it
+    // is exact already (`split::local_if_exact` after each form), so the two are the same.
+    assert_eq!(off.dxil, on.dxil, "without the switch the local form is picked too");
     for shader in [&off, &on] {
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();
