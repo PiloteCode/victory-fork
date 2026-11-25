@@ -6134,20 +6134,38 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::WAITS, &mut part);
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted: here, or by a
+        // thread of their own beside the preparing, waited for before the
+        // lists go to the card (`crate::descriptor::heap_sync_beside`;
+        // behind flights, with no sweep due).
+        static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut beside = (late
+            && crate::descriptor::heap_sync_beside()
+            && flying()
+            && !(late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500))
+            .then(crate::descriptor::heap_sync_begin)
+            .flatten();
+        if beside.is_none() {
+            crate::descriptor::sync_heaps();
+        }
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::HEAPS, &mut part);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
         // sweep waits for a submission that finds none in the air: there is
-        // one at every present).
-        static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // one at every present). Never beside a sync (the flights may have
+        // landed since it began).
         if !behind {
+            if let Some(ticket) = beside.take() {
+                crate::descriptor::heap_sync_joined(ticket);
+            }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+            if let Some(ticket) = beside.take() {
+                crate::descriptor::heap_sync_joined(ticket);
+            }
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -6156,8 +6174,11 @@ impl Host {
         }
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // lists that may read them run (after the sync: with one beside,
+        // when it is done, below).
+        if beside.is_none() {
+            crate::descriptor::make_waiting();
+        }
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::SWEEP, &mut part);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
@@ -6261,6 +6282,14 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::CARD, &mut part);
+        // The descriptor sync beside the preparing, before the lists that
+        // read its slots go to the card; then the slots that waited.
+        if let Some(ticket) = beside {
+            crate::descriptor::heap_sync_joined(ticket);
+            crate::descriptor::make_waiting();
+            #[cfg(feature = "diagnostics")]
+            submit_parts::to(submit_parts::HEAPS, &mut part);
+        }
         let prepared = std::time::Instant::now();
         let compare = card.as_ref().is_some_and(|c| c.check.is_some());
         if late {

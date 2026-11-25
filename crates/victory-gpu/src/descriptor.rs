@@ -275,6 +275,106 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Whether a submission sent ahead has its [`sync_heaps`] done by a thread
+/// of its own, beside the submission's preparing, and waited for only
+/// before its lists go to the card (`VICTORY_HEAP_SYNC_BESIDE=1`; off by
+/// default: on the submitting thread first, as before).
+///
+/// Why: the sync is 10 to 31 ms a frame of the thread that submits, and the
+/// frame waits for that thread (wave 3's gameplay: 222 to 311 changed heap
+/// pages a frame, 320,000 to 490,000 slots looked at). Nothing the
+/// preparing does reads what the sync makes (fills, refreshes, snapshots,
+/// the card copies' sends, the preludes' barriers and clamps): the lists
+/// read the host slots when they run, and they go to the card after the
+/// wait. The slots that waited for a texture's host copy are made after
+/// the wait too ([`make_waiting`]), so they still follow the sync. The
+/// title's recording threads mirror slots beside the sync already.
+///
+/// What differs: the heap's pages are read a little later (while the
+/// submission is prepared, not before), so a record the title writes in
+/// that time for a later submission is taken by this one too, as one
+/// written before the call would have been. A submission behind no flight
+/// (when the sweep may run) syncs as before.
+#[cfg(windows)]
+pub(crate) fn heap_sync_beside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BESIDE").is_some_and(|v| v == "1"))
+}
+
+/// The thread of [`heap_sync_beside`]: the syncs asked for so far and those
+/// done, and the word that either moved.
+#[cfg(windows)]
+struct Beside {
+    counts: std::sync::Mutex<(u64, u64)>,
+    moved: std::sync::Condvar,
+}
+
+#[cfg(windows)]
+fn beside() -> Option<&'static Beside> {
+    static BESIDE: std::sync::OnceLock<Option<&'static Beside>> = std::sync::OnceLock::new();
+    *BESIDE.get_or_init(|| {
+        let beside: &'static Beside = Box::leak(Box::new(Beside {
+            counts: std::sync::Mutex::new((0, 0)),
+            moved: std::sync::Condvar::new(),
+        }));
+        let started = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(move || {
+            crate::framelog::keep_on_fast_cores("victory-heap-sync");
+            loop {
+                let asked = {
+                    let mut counts = beside.counts.lock().unwrap_or_else(|e| e.into_inner());
+                    while counts.0 == counts.1 {
+                        counts = beside.moved.wait(counts).unwrap_or_else(|e| e.into_inner());
+                    }
+                    counts.0
+                };
+                sync_heaps();
+                beside.counts.lock().unwrap_or_else(|e| e.into_inner()).1 = asked;
+                beside.moved.notify_all();
+            }
+        });
+        match started {
+            Ok(_) => {
+                tracing::info!(
+                    "the descriptor records the title copied into its heaps are looked at beside a submission's preparing, \
+                     by a thread of their own (VICTORY_HEAP_SYNC_BESIDE=1)"
+                );
+                Some(beside)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread for the descriptor sync beside the preparing: it is done before, as without the switch");
+                None
+            }
+        }
+    })
+}
+
+/// [`sync_heaps`] on the thread of [`heap_sync_beside`]: the ticket that
+/// [`heap_sync_joined`] waits for, or `None` if there is no such thread
+/// (the caller then syncs itself).
+#[cfg(windows)]
+pub(crate) fn heap_sync_begin() -> Option<u64> {
+    let beside = beside()?;
+    let ticket = {
+        let mut counts = beside.counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.0 += 1;
+        counts.0
+    };
+    beside.moved.notify_all();
+    Some(ticket)
+}
+
+/// Waits until the sync of `ticket` ([`heap_sync_begin`]) is done.
+#[cfg(windows)]
+pub(crate) fn heap_sync_joined(ticket: u64) {
+    let Some(beside) = beside() else {
+        return;
+    };
+    let mut counts = beside.counts.lock().unwrap_or_else(|e| e.into_inner());
+    while counts.1 < ticket {
+        counts = beside.moved.wait(counts).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 /// Since the last frame line, of [`sync_heaps`]: microseconds asking which
 /// heap pages changed, reading them, and looking at their slots (the
 /// mirrors of the changed ones included).
@@ -1234,6 +1334,26 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// A sync asked of the thread beside the preparing is waited for by its
+    /// ticket: each ticket is newer than the last, a wait returns once its
+    /// sync is done, and a wait for an older ticket returns at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_sync_beside_the_preparing_is_waited_for_by_its_ticket() {
+        let first = heap_sync_begin().expect("the thread of the sync beside");
+        heap_sync_joined(first);
+        let second = heap_sync_begin().expect("the thread of the sync beside");
+        assert!(second > first);
+        heap_sync_joined(second);
+        // Two asked before a wait: the newer one's sync covers the older.
+        let (third, fourth) = (heap_sync_begin().unwrap(), heap_sync_begin().unwrap());
+        assert!(fourth > third);
+        heap_sync_joined(fourth);
+        heap_sync_joined(third);
+        let counts = beside().expect("made above").counts.lock().unwrap().to_owned();
+        assert!(counts.1 >= fourth && counts.0 >= counts.1, "{counts:?}");
     }
 
     #[cfg(windows)]
