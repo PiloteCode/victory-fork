@@ -481,11 +481,14 @@ pub(crate) fn builder_off(why: &'static str) {
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
-/// [`Builder`]; `VICTORY_BVH_BUILDER=0` turns it off).
+/// [`Builder`]; off unless `VICTORY_BVH_BUILDER=1`). Off by default: with it
+/// on, the opening's frame went from 385 to 752 ms (median, wave 4 against
+/// wave 3) and the card took some 88 ms more a frame in gameplay; node tests
+/// answer "no hit" while it does not run.
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "0")) {
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());

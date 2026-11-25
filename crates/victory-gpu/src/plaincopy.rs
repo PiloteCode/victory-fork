@@ -55,11 +55,14 @@ unsafe extern "C" {
 }
 
 /// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
+/// (on by default; `VICTORY_COPY_PLAIN=0` turns it off). In a gameplay run
+/// it took the copies from 43 to 24.5 ms a frame and the submitting thread's
+/// kernel time in submissions from 42-50 to 20 ms, with 0-2 falls back to
+/// the kernel's copy a frame and no fault.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
+        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_none_or(|v| v != "0");
         if on {
             install();
             tracing::info!(

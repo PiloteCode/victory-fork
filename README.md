@@ -163,7 +163,7 @@ What did it, on top of the list below:
     sync looks at a changed page's records under one lock, fingerprint
     first; guarded view memory is left out of a submission's write-watch
     askings ahead (after triippywhale).
-  - `VICTORY_COPY_PLAIN=1`: copies of title memory made in place by this
+  - `VICTORY_COPY_PLAIN` (on by default here; `=0` turns it off): copies of title memory made in place by this
     process, with a handler that falls back to the kernel's copy on a
     missing page. Its first form also took the layer's one-byte "is this
     page there" reads, 1,000 to 1,300 faults a frame, and won nothing;
@@ -185,7 +185,7 @@ What did it, on top of the list below:
   - Tried and refused: `VICTORY_BVH_HOLD=1` holds back the 64 programs
     that walk ray-tracing structures nothing has built; the picture loses
     its indirect light with it, so it stays off. Instead, while the
-    structure builder does not run (`VICTORY_BVH_BUILDER=0`, or before its
+    structure builder does not run (the default; `VICTORY_BVH_BUILDER=1` runs it; or before its
     first frame), those programs run with every node test answering no
     hit, not walking whatever lies in memory (`VICTORY_BVH_NO_HIT=0`: as
     before); picture to be checked.
@@ -257,7 +257,7 @@ Rendering:
 - Gathers at a named mip level (with and without an offset) read level 0; fixed.
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress: the game's own structure builder runs by default (`VICTORY_BVH_BUILDER=0` turns it off; 420 s of save gameplay with it, no fault, some 88 ms more card time a frame), title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- Ray tracing, in progress: the game's own structure builder works but is off by default for speed (`VICTORY_BVH_BUILDER=1` runs it; 420 s of save gameplay with it, no fault, some 88 ms more card time a frame and the opening's frame 385 -> 752 ms; while it is off, node tests answer no hit), title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.

@@ -1,7 +1,8 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **the structure builder runs by default**
-(`VICTORY_BVH_BUILDER=0` turns it off). Its first frame in the game is some
+Status, 2026-11-25: **the structure builder works, off by default for its
+cost** (`VICTORY_BVH_BUILDER=1` runs it; with it the opening's frame went
+from 385 to 752 ms). Its first frame in the game is some
 12,000 dispatches in the user-save scenario. In run rt-int1 the title died
 one frame later, its threads reading pointers of all ones out of pages that
 held what the builder wrote: the builder dispatches its box rehydration by
@@ -69,12 +70,12 @@ shaders and emulates the one instruction.
    64-lane waves running on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
    every builder pipeline the title has created has a host pipeline; otherwise
-   none run (on by default, `VICTORY_BVH_BUILDER=0` turns the builder off;
+   none run (off by default, `VICTORY_BVH_BUILDER=1` turns the builder on;
    `VICTORY_BVH_QUARANTINE=1`
    also keeps the builder's stores out of title memory, for a first test). A
    partly working builder wrote garbage bounds into title memory and crashed
    the title. While the builder does not run (before its first dispatch,
-   turned off, or with `VICTORY_BVH_BUILDER=0`), every node test of the
+   turned off, or without `VICTORY_BVH_BUILDER=1`), every node test of the
    trace programs answers no hit without reading the node (a host word,
    `USER_STRUCTURES`): their rays see an empty scene instead of whatever
    bytes lie where the structures would be, which with the builder off made

@@ -384,9 +384,14 @@ const LARGE_TABLE: u32 = 64;
 /// none refused (its df715461). Ours are 262,144 on a card that caps view
 /// heaps at 1,000,000 views, and the opening cutscene refused up to 721
 /// tables a frame.
+///
+/// Off by default (`VICTORY_TABLE_LONGEST=1` turns it on): every slot up to
+/// the longest read gets a host view, so textures no draw reads get host
+/// copies too; while the title streamed, host textures made went from 225
+/// to 676 a frame and the heap pass from 74 to 230 ms.
 fn table_longest() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_LONGEST").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_LONGEST").is_some_and(|v| v == "1"))
 }
 
 /// The longest table `table` of `heap` has been asked for, now that a draw
