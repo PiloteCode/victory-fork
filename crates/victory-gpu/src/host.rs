@@ -8723,6 +8723,8 @@ impl Meter {
         late_line(frames);
         #[cfg(feature = "diagnostics")]
         submit_parts::line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::watch::remap_hooks_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::fence::event_waits_line(frames);

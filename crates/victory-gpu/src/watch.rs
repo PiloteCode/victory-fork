@@ -1463,20 +1463,83 @@ pub fn title_memory_reading_range_now(at: usize, len: usize) -> Option<Reading> 
     Some(Reading(Held { start, end, change: false }))
 }
 
+/// Diagnostics: our own work inside the runtime's changes of what title
+/// memory shows, since the last frame line (calls, then microseconds):
+/// [`title_memory_remapped`] calls and its parts (descriptor slots,
+/// textures, views and memory in place, guards), then
+/// `crate::inplace::title_memory_view` calls and their time.
+///
+/// The frame log's "remapping: N calls, X ms" is the whole time the
+/// runtime holds a change (wave 3's gameplay: 1 to 3 ms a call, a long
+/// frame of 12.9 s with 7,018 calls holding 12.1 s of it, the disk's
+/// workers waiting on the runtime's page table meanwhile); these say how
+/// much of it is ours.
+#[cfg(feature = "diagnostics")]
+pub(crate) static REMAP_HOOKS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// [`REMAP_HOOKS`]: the microseconds since `from` to place `i`; the next
+/// part starts now.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn remap_hook_part(i: usize, from: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    REMAP_HOOKS[i].fetch_add((now - *from).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    *from = now;
+}
+
+/// With the frame line: [`REMAP_HOOKS`] per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn remap_hooks_line(frames: f64) {
+    let v: Vec<f64> = REMAP_HOOKS.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    if v[0] == 0.0 && v[5] == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "our work inside the runtime's changes of title memory, per frame (the frame log's \"remapping\" is the whole \
+         time they hold): {:.0} remaps told {:.1} ms (descriptor slots {:.1}, textures {:.1}, views and memory in place \
+         {:.1}, guards {:.1}); {:.0} views mapped told {:.1} ms (the guards of their other views opened in it)",
+        v[0],
+        (v[1] + v[2] + v[3] + v[4]) / 1e3,
+        v[1] / 1e3,
+        v[2] / 1e3,
+        v[3] / 1e3,
+        v[4] / 1e3,
+        v[5],
+        v[6] / 1e3
+    );
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let mut part = std::time::Instant::now();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
+    #[cfg(feature = "diagnostics")]
+    remap_hook_part(1, &mut part);
     // Textures already uploaded from there must be uploaded again, or the
     // next list that samples them reads their old contents.
     crate::texture::remapped(at, len);
+    #[cfg(feature = "diagnostics")]
+    remap_hook_part(2, &mut part);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    #[cfg(feature = "diagnostics")]
+    remap_hook_part(3, &mut part);
+    remapped_guards(at, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        remap_hook_part(4, &mut part);
+        REMAP_HOOKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// [`title_memory_remapped`]'s part in the guards.
+fn remapped_guards(at: usize, len: usize) {
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
