@@ -139,6 +139,9 @@ pub(crate) enum C {
     IndirectNotWindowedCount,
     IndirectNotWindowedMany,
     IndirectNotWindowedStores,
+    /// Changes of state recorded for title textures before their use
+    /// (`crate::list::ensure_state`), each its own barrier.
+    StateChanges,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1266,6 +1269,7 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectNotWindowedMany as usize],
         c[C::IndirectNotWindowedStores as usize],
     );
+    tracing::info!("  changes of state of title textures before their use, per frame: {:.0}", c[C::StateChanges as usize]);
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();

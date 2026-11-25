@@ -102,8 +102,16 @@ struct Window {
 const WINDOW_MOST: u64 = 64;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (on by default;
+/// `VICTORY_INDIRECT_WINDOW=0` turns it off).
+///
+/// It was off by default, and saved nothing measurable then: after each
+/// draw the scratch buffer went back to the common state, a change of
+/// state per draw as costly as the bounding pass it saved. With the buffer
+/// left read between draws (`HostList::scratch_read`), two pairs of runs on
+/// an RTX 5090 (2026-11-25, the opening of the gameplay) gave the card
+/// 95 and 103 ms a frame with windows against 131 and 129 without, frames
+/// of 221 and 218 ms against 240 and 238.
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -143,7 +151,7 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// What one title list has set, and what its host list was last given.
