@@ -327,7 +327,11 @@ fn beside() -> Option<&'static Beside> {
                     }
                     counts.0
                 };
-                sync_heaps();
+                // A panic in the sync must not leave the submitting thread
+                // waiting for ever: it is said, and the sync counts as done.
+                if std::panic::catch_unwind(sync_heaps).is_err() {
+                    tracing::error!("the descriptor sync beside the preparing panicked (VICTORY_HEAP_SYNC_BESIDE=1)");
+                }
                 beside.counts.lock().unwrap_or_else(|e| e.into_inner()).1 = asked;
                 beside.moved.notify_all();
             }
