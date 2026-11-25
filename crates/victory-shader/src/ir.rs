@@ -462,12 +462,7 @@ fn unspill(
     }
     let code_of = |reg: u8, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
     let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, word: u32| {
-        list[i] = gfx10::Instruction {
-            offset: list[i].offset,
-            encoding,
-            opcode,
-            words: vec![word],
-        };
+        list[i] = gfx10::Instruction::new(list[i].offset, encoding, opcode, vec![word]);
     };
     // `s_mov_b32` / `s_mov_b64 dst, src` (SOP1, opcodes 3 and 4); `s_nop`. A code
     // from `PARKED` up does not fit the word: s0 stands in for it there.
@@ -1483,13 +1478,33 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
 fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
-    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
-    let find = |replaced: &[Value], mut v: Value| {
-        while replaced[v.0 as usize] != v {
-            v = replaced[v.0 as usize];
+    remove_trivial_phis_steps(blocks, values);
+}
+
+/// [`remove_trivial_phis`], returning how many links its lookups followed. A
+/// lookup points every value it passes at the chain's end (path compression):
+/// without that, a chain of replaced phis built in reverse order was walked
+/// whole by every later lookup, quadratic in its length. (Official VIctory
+/// #1371, 5c445628.)
+fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
+    fn find(replaced: &mut [Value], v: Value, steps: &mut usize) -> Value {
+        let mut root = v;
+        while replaced[root.0 as usize] != root {
+            *steps += 1;
+            root = replaced[root.0 as usize];
         }
-        v
-    };
+        let mut cur = v;
+        while replaced[cur.0 as usize] != root {
+            *steps += 1;
+            let next = replaced[cur.0 as usize];
+            replaced[cur.0 as usize] = root;
+            cur = next;
+        }
+        root
+    }
+
+    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+    let mut steps = 0usize;
     let mut changed = true;
     while changed {
         changed = false;
@@ -1497,7 +1512,7 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
             block.phis.retain(|phi| {
                 let mut only = None;
                 for &a in &phi.args {
-                    let a = find(&replaced, a);
+                    let a = find(&mut replaced, a, &mut steps);
                     if a == phi.value || Some(a) == only {
                         continue;
                     }
@@ -1516,15 +1531,16 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
     for block in blocks {
         for phi in &mut block.phis {
             for a in &mut phi.args {
-                *a = find(&replaced, *a);
+                *a = find(&mut replaced, *a, &mut steps);
             }
         }
         for inst in &mut block.insts {
             for (_, v) in &mut inst.reads {
-                *v = find(&replaced, *v);
+                *v = find(&mut replaced, *v, &mut steps);
             }
         }
     }
+    steps
 }
 
 /// Scheduling hints, performance counters and tracing: no effect on results.
@@ -1944,6 +1960,229 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    // Official VIctory #1371 (5c445628): trivial phis replaced along long chains.
+
+    const fn s_branch(simm16: i16) -> u32 {
+        0xBF82_0000 | simm16 as u16 as u32
+    }
+
+    const fn s_cbranch_scc1(simm16: i16) -> u32 {
+        0xBF85_0000 | simm16 as u16 as u32
+    }
+
+    #[test]
+    fn reverse_order_diamond_chain_eliminates_trivial_phis() {
+        const LAYERS: usize = 4096;
+        let mut reverse = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBE82_0382, // s_mov_b32 s2, 2
+            s_branch(((LAYERS - 1) * 4) as i16),
+        ];
+        for k in 0..LAYERS {
+            reverse.extend([
+                0xBF06_0201, // s_cmp_eq_u32 s1, s2
+                s_cbranch_scc1(1),
+                0xBF80_0000, // s_nop 0
+                if k == 0 {
+                    s_branch((LAYERS * 4 - 4) as i16)
+                } else {
+                    s_branch(-8)
+                },
+            ]);
+        }
+        reverse.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
+
+        let mut forward = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBE82_0382, // s_mov_b32 s2, 2
+            s_branch(0),
+        ];
+        for _ in 0..LAYERS {
+            forward.extend([
+                0xBF06_0201, // s_cmp_eq_u32 s1, s2
+                s_cbranch_scc1(1),
+                0xBF80_0000, // s_nop 0
+                s_branch(0),
+            ]);
+        }
+        forward.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
+
+        let rev = build_words(&reverse, false);
+        let fwd = build_words(&forward, false);
+        assert!(rev.inputs.is_empty(), "{:?}", rev.inputs);
+        assert!(fwd.inputs.is_empty(), "{:?}", fwd.inputs);
+        assert!(rev.blocks.iter().all(|b| b.phis.is_empty()));
+        assert!(fwd.blocks.iter().all(|b| b.phis.is_empty()));
+        assert_eq!(rev.blocks.len(), fwd.blocks.len());
+
+        for p in [&rev, &fwd] {
+            let s1 = p.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+            let s2 = p.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+            let add = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.name() == "s_add_u32")
+                .expect("the add");
+            assert_eq!(add.read(Reg::S(1)), Some(s1));
+            assert_eq!(add.read(Reg::S(2)), Some(s2));
+        }
+    }
+
+    #[test]
+    fn remove_trivial_phis_compresses_reverse_chain_in_bounded_steps() {
+        const CHAIN: usize = 4096;
+        let mut template = build_words(&[0xBE80_0380, S_ENDPGM], false).blocks[0].insts[0].clone();
+        template.writes.clear();
+        let mut blocks = Vec::with_capacity(CHAIN);
+        for k in 0..CHAIN {
+            let v1 = Value(2 + 2 * k as u32);
+            let v2 = Value(3 + 2 * k as u32);
+            let (n1, n2) = if k + 1 < CHAIN {
+                (Value(2 + 2 * (k + 1) as u32), Value(3 + 2 * (k + 1) as u32))
+            } else {
+                (Value(0), Value(1))
+            };
+            let mut inst = template.clone();
+            inst.reads = vec![(Reg::S(1), v1), (Reg::S(2), v2)];
+            blocks.push(Block {
+                offset: k * 4,
+                preds: vec![],
+                phis: vec![
+                    Phi {
+                        reg: Reg::S(1),
+                        value: v1,
+                        args: vec![n1, n1],
+                    },
+                    Phi {
+                        reg: Reg::S(2),
+                        value: v2,
+                        args: vec![n2, n2],
+                    },
+                ],
+                insts: vec![inst],
+                exit: Exit::End,
+            });
+        }
+        let steps = remove_trivial_phis_steps(&mut blocks, 2 + 2 * CHAIN as u32);
+        assert!(blocks.iter().all(|b| b.phis.is_empty()));
+        assert!(
+            blocks
+                .iter()
+                .all(|b| b.insts[0].reads == [(Reg::S(1), Value(0)), (Reg::S(2), Value(1))])
+        );
+        assert!(steps < 100_000, "steps = {steps}");
+    }
+
+    #[test]
+    fn non_trivial_phis_preserve_compressed_representatives() {
+        const LAYERS: usize = 4;
+        let mut code = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBE82_0382, // s_mov_b32 s2, 2
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            s_cbranch_scc1((2 + (LAYERS - 1) * 4) as i16),
+            0xBE81_0383, // s_mov_b32 s1, 3
+            s_branch((LAYERS * 4) as i16),
+        ];
+        for k in 0..LAYERS {
+            code.extend([
+                0xBF06_0201, // s_cmp_eq_u32 s1, s2
+                s_cbranch_scc1(1),
+                0xBF80_0000, // s_nop 0
+                if k == 0 {
+                    s_branch((LAYERS * 4 - 4) as i16)
+                } else {
+                    s_branch(-8)
+                },
+            ]);
+        }
+        code.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
+
+        let p = build_words(&code, false);
+        let entry_s1 = p.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+        let entry_s2 = p.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let arm_s1 = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.write(Reg::S(1)).is_some() && i.write(Reg::S(1)) != Some(entry_s1))
+            .and_then(|i| i.write(Reg::S(1)))
+            .expect("the arm's s1");
+        let (merge, add) = p
+            .blocks
+            .iter()
+            .find_map(|b| {
+                b.insts
+                    .iter()
+                    .find(|i| i.name() == "s_add_u32")
+                    .map(|i| (b, i))
+            })
+            .expect("the add");
+        let phis: Vec<&Phi> = p.blocks.iter().flat_map(|b| &b.phis).collect();
+        let [phi] = &phis[..] else { panic!("{phis:?}") };
+        assert_eq!(phi.reg, Reg::S(1));
+        let mut args = phi.args.clone();
+        args.sort_by_key(|v| v.0);
+        let mut want = vec![arm_s1, entry_s1];
+        want.sort_by_key(|v| v.0);
+        assert_eq!(args, want);
+        assert!(merge.phis.iter().any(|m| m.value == phi.value));
+        assert_eq!(add.read(Reg::S(1)), Some(phi.value));
+        assert_eq!(add.read(Reg::S(2)), Some(entry_s2));
+
+        // The same chain in front of a loop: only the loop's own phi stays.
+        let mut loop_code = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBE82_0382, // s_mov_b32 s2, 2
+            s_branch(((LAYERS - 1) * 4) as i16),
+        ];
+        for k in 0..LAYERS {
+            loop_code.extend([
+                0xBF06_0201, // s_cmp_eq_u32 s1, s2
+                s_cbranch_scc1(1),
+                0xBF80_0000, // s_nop 0
+                if k == 0 {
+                    s_branch((LAYERS * 4 - 4) as i16)
+                } else {
+                    s_branch(-8)
+                },
+            ]);
+        }
+        loop_code.extend([
+            0x8001_0201, // s_add_u32 s1, s1, s2
+            0xBF07_8401, // s_cmp_lg_u32 s1, 4
+            s_cbranch_scc1(-3),
+            0x8000_0201, // s_add_u32 s0, s1, s2
+            S_ENDPGM,
+        ]);
+        let lp = build_words(&loop_code, false);
+        let lp_s1 = lp.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+        let lp_s2 = lp.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let adds: Vec<&Inst> = lp
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == "s_add_u32")
+            .collect();
+        let (step, exit) = (adds[0], adds[adds.len() - 1]);
+        let next_s1 = step.write(Reg::S(1)).unwrap();
+        let phis: Vec<&Phi> = lp.blocks.iter().flat_map(|b| &b.phis).collect();
+        let [loop_phi] = &phis[..] else {
+            panic!("{phis:?}")
+        };
+        assert_eq!(loop_phi.reg, Reg::S(1));
+        let mut args = loop_phi.args.clone();
+        args.sort_by_key(|v| v.0);
+        let mut want = vec![lp_s1, next_s1];
+        want.sort_by_key(|v| v.0);
+        assert_eq!(args, want);
+        assert_eq!(step.read(Reg::S(1)), Some(loop_phi.value));
+        assert_eq!(step.read(Reg::S(2)), Some(lp_s2));
+        assert_eq!(exit.read(Reg::S(1)), Some(next_s1));
+        assert_eq!(exit.read(Reg::S(2)), Some(lp_s2));
     }
 
     /// `if (v0 < s0) { ... }` whose body changes s6: `body` are its words, `after` what
