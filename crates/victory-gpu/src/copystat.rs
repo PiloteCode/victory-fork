@@ -148,8 +148,23 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Clamps of indirect records (no window hit) by where the records
+    /// come from: no shader the list recorded before the command may write
+    /// them (as declared: the card had them when the list began), or one
+    /// may; draws and mesh dispatches, then compute dispatches.
+    ClampFromBefore,
+    ClampWrittenInList,
+    ClampDispatchFromBefore,
+    ClampDispatchWrittenInList,
+    /// Clamps recorded into lists' preludes (`crate::indirect::early`).
+    IndirectEarly,
+    /// Clamps of an indirect dispatch's record a short step after the
+    /// record the list's last clamped dispatch read (the same copy).
+    ClampDispatchWalks,
 }
-const COUNTERS: usize = 80;
+/// One past the last counter (it was a number kept by hand: 84 for 86
+/// counters had the last two index past the array).
+const COUNTERS: usize = C::ClampDispatchWalks as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -244,6 +259,49 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
     let mut longest = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
     if us > longest.0 {
         *longest = (us, text);
+    }
+}
+
+/// The title's barrier groups since the last line by what their barriers
+/// say (diagnostics): (kind, sync before, sync after, access before, access
+/// after) and how many, read as the PC's enhanced barrier groups (16 bytes:
+/// kind 0 global, 1 texture, 2 buffer; the count; the barriers).
+type GroupKinds = HashMap<(u32, u32, u32, u32, u32), u64>;
+static GROUP_KINDS: Mutex<Option<GroupKinds>> = Mutex::new(None);
+
+/// Tallies the barriers of `count` groups at `groups` ([`GROUP_KINDS`]).
+///
+/// # Safety
+/// `groups` points at `count` groups as the title passes them.
+pub(crate) unsafe fn barrier_groups_seen(groups: *const u8, count: u32) {
+    if groups.is_null() {
+        return;
+    }
+    let mut map = GROUP_KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    for g in 0..count.min(64) as usize {
+        // SAFETY: as the caller vouches.
+        let (kind, n, at) = unsafe {
+            let group = groups.add(g * 16);
+            (group.cast::<u32>().read_unaligned(), group.add(4).cast::<u32>().read_unaligned(), group.add(8).cast::<*const u8>().read_unaligned())
+        };
+        let size = match kind {
+            0 => 16,
+            1 => 64,
+            2 => 40,
+            _ => {
+                *map.entry((kind, n, 0, 0, 0)).or_insert(0) += 1;
+                continue;
+            }
+        };
+        if at.is_null() {
+            continue;
+        }
+        for b in 0..n.min(256) as usize {
+            // SAFETY: as the caller vouches: `n` barriers of the kind's size.
+            let w = |k: usize| unsafe { at.add(b * size + 4 * k).cast::<u32>().read_unaligned() };
+            *map.entry((kind, w(0), w(1), w(2), w(3))).or_insert(0) += 1;
+        }
     }
 }
 
@@ -1280,10 +1338,17 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    // `VICTORY_GPU_TIMING_LINES=<n>`: the heaviest n kinds (every kind with a large n: the
-    // card's time of each translated program, the light ones too).
-    let lines = std::env::var("VICTORY_GPU_TIMING_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
-    for (what, (n, us, longest)) in by.into_iter().take(lines) {
+    // `VICTORY_GPU_TIMING_LINES=<n>` (or `VICTORY_GPU_TIMING_TOP=<n>`, the same): the heaviest
+    // n kinds, forty by default (every kind with a large n: the card's time of each translated
+    // program, the light ones too).
+    static TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let top = *TOP.get_or_init(|| {
+        ["VICTORY_GPU_TIMING_LINES", "VICTORY_GPU_TIMING_TOP"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()))
+            .unwrap_or(40)
+    });
+    for (what, (n, us, longest)) in by.into_iter().take(top) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
@@ -1318,6 +1383,19 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectNotWindowedMany as usize],
         c[C::IndirectNotWindowedStores as usize],
     );
+    tracing::info!(
+        "  indirect clamps per frame by their records: draws {:.0} with records no shader of the list wrote before \
+         them, {:.0} with records it may have written; dispatches {:.0} and {:.0} ({:.0} of them a short step \
+         after the last dispatch's record); {:.0} clamped in lists' preludes (VICTORY_INDIRECT_EARLY=0 turns \
+         that off: now {})",
+        c[C::ClampFromBefore as usize],
+        c[C::ClampWrittenInList as usize],
+        c[C::ClampDispatchFromBefore as usize],
+        c[C::ClampDispatchWrittenInList as usize],
+        c[C::ClampDispatchWalks as usize],
+        c[C::IndirectEarly as usize],
+        if crate::indirect::early() { "on" } else { "off" },
+    );
     tracing::info!("  changes of state of title textures before their use, per frame: {:.0}", c[C::StateChanges as usize]);
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
@@ -1332,6 +1410,19 @@ pub(crate) fn log(frames: f64) {
             (len as u64 * n) as f64 / 1e6 / frames,
             written as f64 / 1e6 / frames
         );
+    }
+    {
+        let kinds = GROUP_KINDS.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut kinds: Vec<_> = kinds.into_iter().flatten().collect();
+        kinds.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        let text: Vec<String> = kinds
+            .iter()
+            .take(16)
+            .map(|((kind, sb, sa, ab, aa), n)| {
+                format!("{:.0}x {} sync {sb:#x}->{sa:#x} access {ab:#x}->{aa:#x}", *n as f64 / frames, ["global", "texture", "buffer"].get(*kind as usize).unwrap_or(&"?"))
+            })
+            .collect();
+        tracing::info!("  the title's barriers per frame by what they say (kind, sync, access): {}", text.join("; "));
     }
     let mut submitters = std::mem::take(&mut *SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner()));
     submitters.sort_by_key(|s| std::cmp::Reverse(s.1.submissions));

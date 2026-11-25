@@ -2171,10 +2171,13 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+    // Diagnostics: counted, what they hold tallied, and left out under
+    // `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        // SAFETY: the title passes `count` groups.
+        unsafe { crate::copystat::barrier_groups_seen(_groups, count) };
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }

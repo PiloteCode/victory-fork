@@ -227,6 +227,10 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// Diagnostics: the last indirect dispatch whose record was clamped
+    /// (host list, copy, stride; the record's offset in the copy).
+    #[cfg(feature = "diagnostics")]
+    dispatch_clamped: Option<((usize, u64, u32), u64)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -3245,6 +3249,40 @@ impl State {
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
+                // Whether a shader recorded before in the list may write the
+                // records: if none may, the card holds them as they are when
+                // the list begins, and they are clamped in its prelude
+                // (`crate::indirect::early`): nothing of ours goes into the
+                // list.
+                let span = len.max(u64::from(step) * u64::from(records));
+                let written = list.writes_declared((arguments as usize, (arguments + span) as usize));
+                let early = crate::indirect::early() && counter.is_none() && !written;
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(
+                        match (kind == DISPATCH, written) {
+                            (false, false) => crate::copystat::C::ClampFromBefore,
+                            (false, true) => crate::copystat::C::ClampWrittenInList,
+                            (true, false) => crate::copystat::C::ClampDispatchFromBefore,
+                            (true, true) => crate::copystat::C::ClampDispatchWrittenInList,
+                        },
+                        1,
+                    );
+                    // A dispatch's record a short step after the last
+                    // dispatch's clamped in this list: what a window of
+                    // dispatch records could have held.
+                    if kind == DISPATCH {
+                        let here = (std::ptr::from_ref(list) as usize, args.id(), stride);
+                        if let Some((at, last)) = self.dispatch_clamped
+                            && at == here
+                            && offset > last
+                            && offset - last <= 256
+                        {
+                            crate::copystat::add(crate::copystat::C::ClampDispatchWalks, 1);
+                        }
+                        self.dispatch_clamped = Some((here, offset));
+                    }
+                }
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
@@ -3252,7 +3290,10 @@ impl State {
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let clamped = if split.is_some() { crate::indirect::SPLIT_DISPATCH } else { kind };
-                let bounded = if windowed && records > 1 {
+                let ahead = windowed && records > 1;
+                let bounded = if early {
+                    crate::indirect::bound_early(list, (&args.buffer, offset), (clamped, step, records), ahead)
+                } else if ahead {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (clamped, step, records))
@@ -3262,8 +3303,12 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
+                // A clamp in the list bound its own pipeline and compute
+                // root signature.
+                if !early {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,

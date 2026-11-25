@@ -991,6 +991,11 @@ fn lazy_prelude() -> bool {
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
 
+/// Of [`STAMPS`], those of the list's own commands; the two after them
+/// time its prelude when the prelude runs uploads or clamps of ours.
+#[cfg(feature = "diagnostics")]
+const LIST_STAMPS: u32 = STAMPS - 2;
+
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
@@ -1713,12 +1718,103 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, a group of 256 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts
+/// them): `differs` gets a dword per piece, 1 where a byte differs. The
+/// offsets are widened to 16 bytes; buffers are multiples of 64 KiB, and a
+/// piece flagged for a byte just outside the range costs a fetch that finds
+/// nothing. Each thread hashes the piece's 16-byte steps 4 KiB apart from
+/// its own (the group's loads side by side), and the group folds the 256
+/// hashes in a fixed order, each step's place in the fold its own; told 0
+/// it stores the piece's hash, else compares it with the one stored (2:
+/// and then stores it). One group a piece: dispatch [`card_groups`].
+///
+/// It was one thread per piece ([`CARD_COMPARE_THREAD`], `VICTORY_CARD_WIDE_HASH=0`),
+/// which walks its 4,096 steps one after the other: on an RTX 5090 a pass
+/// took 0.22 ms whatever its pieces (two pieces: 0.002 ms in this form), a
+/// compare of 92 pieces 0.56 ms (0.003), a whole 174 MB copy 0.79 ms
+/// (0.11). The card runs these passes around every submission: some 270
+/// hash passes and 100 compares a frame of the gameplay, and none of them
+/// is in the timing run's command times.
 pub(crate) const CARD_COMPARE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;    // the first piece
+    uint skew;     // where the copy starts in its piece 0
+    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
+    uint pieces;
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+};
+ByteAddressBuffer now : register(t0);
+// 16 bytes per piece of the copy: the hash of its bytes when they were
+// last sent up (or hashed whole, the first time).
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 part[256];
+uint4 mix(uint4 h, uint4 v) {
+    h = (h ^ v) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    // A group per piece; past 65,535 pieces the groups go on by that many.
+    [loop]
+    for (uint i = group.x; i < pieces; i += 65535u) {
+        uint piece = first + i;
+        uint lo = piece * 65536u;
+        lo = lo > skew ? lo - skew : 0u;
+        uint hi = min((piece + 1u) * 65536u - skew, size);
+        lo = lo & ~15u;
+        hi = (hi + 15u) & ~15u;
+        // 17 rounds: a piece widened at both ends spans 4,097 steps.
+        uint4 h = uint4(0x9E3779B9u ^ t, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu + t);
+        [unroll]
+        for (uint k = 0u; k < 17u; k++) {
+            uint at = lo + k * 4096u + t * 16u;
+            if (at < hi) h = mix(h, now.Load4(at));
+        }
+        part[t] = h;
+        GroupMemoryBarrierWithGroupSync();
+        [unroll]
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (t < s) part[t] = mix(part[t], part[t + s] ^ uint4(s, t, s ^ t, 0x5BD1E995u));
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (t == 0u) {
+            h = part[0];
+            if (compare != 0u) {
+                differs.Store(out_at + i * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+                // With the copy-back on its own thread: the next compare of
+                // the piece finds what is written from here on.
+                if (compare == 2u) hashes.Store4(piece * 16u, h);
+            } else {
+                hashes.Store4(piece * 16u, h);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+"#;
+
+/// Whether the card compare is [`CARD_COMPARE`] (a group a piece; on by
+/// default) or [`CARD_COMPARE_THREAD`] (a thread a piece,
+/// `VICTORY_CARD_WIDE_HASH=0`). Every pass of a run is of the one form:
+/// the hashes one stores are the ones the other compares.
+pub(crate) fn card_wide_hash() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WIDE_HASH").is_none_or(|v| v != "0"))
+}
+
+/// The groups a card compare or hash pass over `pieces` pieces dispatches.
+pub(crate) fn card_groups(pieces: u32) -> u32 {
+    if card_wide_hash() { pieces.min(65535) } else { pieces.div_ceil(64) }
+}
+
+/// The compare as it was, one thread per 64 KiB piece walking its 16-byte
+/// steps one after the other ([`card_wide_hash`]).
+pub(crate) const CARD_COMPARE_THREAD: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
     uint first;    // the first piece
@@ -2021,6 +2117,19 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Clamps of indirect records for the list's prelude
+    /// (`crate::indirect::early`), and the rings they write.
+    early: Vec<crate::indirect::Early>,
+    early_rings: Vec<ID3D12Resource>,
+    /// Texture uploads for the list's prelude (`crate::texture::prelude_uploads`):
+    /// the host copy and its staging buffer.
+    early_uploads: Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::texture::Staging>)>,
+    /// The ranges of title memory the list's shaders may write as declared
+    /// so far (`Step::GpuWrite`, whatever host copy: copies of the same
+    /// bytes count alike), each once (the world's passes declare the same
+    /// ranges dozens of times).
+    written: Vec<(usize, usize)>,
+    written_once: std::collections::HashSet<(usize, usize)>,
 }
 
 impl Deferred {
@@ -3642,12 +3751,14 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let source = if card_wide_hash() { CARD_COMPARE } else { CARD_COMPARE_THREAD };
+        tracing::info!(wide = card_wide_hash(), "card compare: a group of threads per piece (VICTORY_CARD_WIDE_HASH)");
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -3886,7 +3997,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(card_groups(run.pieces), 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3974,7 +4085,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_groups(r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
@@ -5508,26 +5619,39 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let (Some((_, back)), count) = (self.stamps(), notes.len().min(LIST_STAMPS as usize - 1)) else {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        let range = D3D12_RANGE { Begin: 0, End: STAMPS as usize * 8 };
         // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
+        let (stamps, early): (Vec<u64>, [u64; 2]) = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
                 return Vec::new();
             }
             let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            let e = std::slice::from_raw_parts(data.cast::<u64>().add(LIST_STAMPS as usize), 2);
+            let e = [e[0], e[1]];
             back.Unmap(0, None);
-            s
+            (s, e)
         };
+        let ms = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64;
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (ms(ticks), notes[i].0.chars().take(300).collect())
             })
             .collect();
+        // The prelude, when it ran uploads or clamps of ours
+        // (`crate::texture::prelude_uploads`, `crate::indirect::early`), as
+        // one command.
+        let (uploads, clamps) = {
+            let deferred = self.deferred();
+            (deferred.early_uploads.len(), deferred.early.len())
+        };
+        if uploads + clamps > 0 {
+            times.push((ms(early[1].saturating_sub(early[0])), format!("prelude (ours): {uploads} texture uploads, {clamps} clamps")));
+        }
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
@@ -5551,7 +5675,7 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(LIST_STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
@@ -5888,13 +6012,35 @@ impl HostList {
                 }
             }
         }
+        // The list's texture uploads (`crate::texture::prelude_uploads`) and
+        // clamps of indirect records it has not written
+        // (`crate::indirect::early`), at every submission of the list. An
+        // uploaded texture goes to the copy state with the twins' copies,
+        // and from there to the state the list starts with (back to its
+        // real state if the list does not use it after the upload).
+        let deferred = self.deferred();
+        for (texture, _) in &deferred.early_uploads {
+            let key = std::sync::Arc::as_ptr(texture) as usize;
+            if copying.contains_key(&key) {
+                continue;
+            }
+            let real = texture.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(&texture.texture, host_state(real), host_state(COPY_DEST)));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(&texture.texture, host_state(COPY_DEST), host_state(real)));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let ours = !deferred.early.is_empty() || !deferred.early_uploads.is_empty();
+        if barriers.is_empty() && syncs.is_empty() && !ours {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5904,23 +6050,44 @@ impl HostList {
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        // Diagnostics: the timing run times the prelude, with its uploads
+        // and clamps.
+        #[cfg(feature = "diagnostics")]
+        let stamps = self.stamps().filter(|_| ours);
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures are live; the clamps' and uploads' buffers are
+        // kept by the list.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                #[cfg(feature = "diagnostics")]
+                if let Some((heap, _)) = stamps {
+                    list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, LIST_STAMPS);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
+                for (texture, staging) in &deferred.early_uploads {
+                    crate::texture::record_upload(list, &texture.texture, staging);
+                }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if !deferred.early.is_empty() {
+                    crate::indirect::record_early(list, &deferred.early, &deferred.early_rings);
+                }
+                #[cfg(feature = "diagnostics")]
+                if let Some((heap, back)) = stamps {
+                    list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, LIST_STAMPS + 1);
+                    list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, LIST_STAMPS, 2, back, u64::from(LIST_STAMPS) * 8);
                 }
                 list.Close()
             })
         };
+        drop(deferred);
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
@@ -5952,7 +6119,7 @@ impl HostList {
         {
             let started = std::time::Instant::now();
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+            if let Some((heap, _)) = self.stamps() && at < LIST_STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
@@ -6129,9 +6296,47 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let range = (address, address.saturating_add(len));
+        if deferred.written_once.insert(range) {
+            deferred.written.push(range);
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// Whether the list's shaders recorded so far may write a byte of
+    /// `[from, to)` of title memory, as they declare their writes
+    /// ([`HostList::defer_gpu_write`]).
+    pub(crate) fn writes_declared(&self, (from, to): (usize, usize)) -> bool {
+        self.deferred().written.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    /// An upload of `staging` into the host texture `copy` for the list's
+    /// prelude (`crate::texture::prelude_uploads`): recorded there at each
+    /// submission of the list until it is reset.
+    pub(crate) fn prelude_upload(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        staging: std::sync::Arc<crate::texture::Staging>,
+    ) {
+        self.deferred().early_uploads.push((copy, staging));
+    }
+
+    /// A clamp of indirect records into `ring` for the list's prelude
+    /// (`crate::indirect::early`): recorded there at each submission of
+    /// the list until it is reset.
+    pub(crate) fn early_clamp(&self, clamp: crate::indirect::Early, ring: &ID3D12Resource) {
+        let mut deferred = self.deferred();
+        deferred.early.push(clamp);
+        if !deferred.early_rings.iter().any(|r| r.as_raw() == ring.as_raw()) {
+            deferred.early_rings.push(ring.clone());
+        }
+    }
+
+    /// The clamps noted for the list's prelude (the tests).
+    #[cfg(test)]
+    pub(crate) fn deferred_early(&self) -> usize {
+        self.deferred().early.len()
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go

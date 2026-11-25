@@ -377,6 +377,128 @@ pub(crate) fn bound_ahead(
     record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, None, spec, true).then_some((dst, 0))
 }
 
+/// Whether indirect records that no shader of the list may have written
+/// before the command are clamped in the list's prelude (on by default
+/// with [`ring`]; `VICTORY_INDIRECT_EARLY=0` clamps each in the list, as
+/// before).
+///
+/// A clamp in the list stops the card twice: the card turns from drawing
+/// to compute for the clamp and back, and its barrier waits for it before
+/// the indirect call. The title's ~2,500 clamps a frame took 19 ms of the
+/// card's ~95 (timing run of the gameplay, RTX 5090), and the calls around
+/// them could not overlap. Records that the list itself does not write
+/// before the command (by the writes its shaders declare,
+/// `HostList::writes_declared`) are what the card holds when the list
+/// begins: the title's CPU wrote them, or an earlier list's shaders. Their
+/// clamps run in the list's prelude, which the card runs just before the
+/// list ([`record_early`]): a wait for the earlier lists' shader writes,
+/// the clamps with no wait between them, and one barrier from their writes
+/// to the indirect reads. The command reads its room of the ring as
+/// before, and the list keeps its pipeline and root bindings.
+pub(crate) fn early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ring() && std::env::var_os("VICTORY_INDIRECT_EARLY").is_none_or(|v| v != "0"))
+}
+
+/// A clamp for the list's prelude ([`early`]): the clamp pass's root
+/// constants and its source, count, ring and budget addresses.
+pub(crate) struct Early {
+    constants: [u32; 6],
+    src: u64,
+    count: u64,
+    dst: u64,
+    budget: u64,
+}
+
+/// [`bound`] or [`bound_ahead`] (`ahead`) of records the list has not
+/// written ([`early`]): room in the list's ring, and the clamp into it
+/// noted for the list's prelude. `None` if the records cannot be clamped
+/// (the caller clamps nothing then, as with [`bound`]).
+pub(crate) fn bound_early(
+    list: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<(ID3D12Resource, u64)> {
+    validate_layout(spec, src_offset, None)?;
+    let bytes = scratch_bytes(spec)?;
+    clamp()?;
+    let budget = list.budget()?;
+    let (dst, at) = list.indirect_ring(bytes)?;
+    // SAFETY: a live D3D12 buffer resource.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let (constants, src_gpu, count_gpu) = clamp_arguments(dst_gpu, budget, (src, src_offset), None, spec, ahead)?;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectEarly, 1);
+    if constants[2] > 0 {
+        list.keep(src);
+        list.early_clamp(Early { constants, src: src_gpu, count: count_gpu, dst: dst_gpu, budget }, &dst);
+    }
+    Some((dst, at))
+}
+
+/// Records `clamps` ([`bound_early`]) into `l`, a list the card runs just
+/// before the list they were noted for: a wait for every earlier shader
+/// write (the records may come from an earlier list, behind a barrier of
+/// the title's in this one), the clamps with no wait between them (each
+/// writes room of its own; the budget is taken atomically), and one
+/// barrier from their writes to the indirect reads of `rings`.
+///
+/// # Safety
+/// An open list; live buffers behind the addresses; `rings` live.
+pub(crate) unsafe fn record_early(l: &ID3D12GraphicsCommandList, clamps: &[Early], rings: &[ID3D12Resource]) {
+    use windows::core::Interface;
+    let (Some(c), Ok(l7)) = (clamp(), l.cast::<ID3D12GraphicsCommandList7>()) else {
+        return;
+    };
+    let before = [D3D12_GLOBAL_BARRIER {
+        SyncBefore: D3D12_BARRIER_SYNC_ALL,
+        SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+        AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+        AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+    }];
+    let after: Vec<D3D12_BUFFER_BARRIER> = rings
+        .iter()
+        .map(|ring| D3D12_BUFFER_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            SyncAfter: D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            AccessAfter: D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+            pResource: std::mem::ManuallyDrop::new(Some(ring.clone())),
+            Offset: 0,
+            Size: u64::MAX,
+        })
+        .collect();
+    // SAFETY: as the caller vouches; the barriers name live buffers.
+    unsafe {
+        l7.Barrier(&[D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: before.as_ptr() },
+        }]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        for e in clamps {
+            l.SetComputeRoot32BitConstants(0, 6, e.constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, e.src);
+            l.SetComputeRootShaderResourceView(2, e.count);
+            l.SetComputeRootUnorderedAccessView(3, e.dst);
+            l.SetComputeRootUnorderedAccessView(4, e.budget);
+            l.Dispatch(e.constants[2].div_ceil(64), 1, 1);
+        }
+        if !after.is_empty() {
+            l7.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_BUFFER,
+                NumBarriers: after.len() as u32,
+                Anonymous: D3D12_BARRIER_GROUP_0 { pBufferBarriers: after.as_ptr() },
+            }]);
+        }
+    }
+    for b in after {
+        drop(std::mem::ManuallyDrop::into_inner(b.pResource));
+    }
+}
+
 /// Whether clamped indirect records go each to room of their own in a ring
 /// of the list's ([`HostList::indirect_ring`]), behind one barrier of the
 /// host's enhanced kind that orders the clamp's writes before the indirect
@@ -924,10 +1046,17 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        // Both forms: a group a piece (the default), a thread a piece.
+        for (source, groups) in [(crate::host::CARD_COMPARE, 3), (crate::host::CARD_COMPARE_THREAD, 1)] {
+            card_compare_stores_the_hash_it_made_when_told(source, groups);
+        }
+    }
+
+    fn card_compare_stores_the_hash_it_made_when_told(source: &str, groups: u32) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -953,7 +1082,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(groups, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -981,6 +1110,171 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// Both forms of the card compare on the host GPU flag the same pieces
+    /// for the same bytes, and exactly the pieces whose bytes (widened to
+    /// 16 at both ends) changed: a copy of 16 pieces that starts 40 bytes
+    /// into its first piece, hashed (told 0), then 48 rounds of a few
+    /// random byte changes, some at the pieces' edges, each compared and
+    /// stored (told 2) by both forms.
+    #[test]
+    fn card_compare_forms_flag_alike_on_the_card() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let wide = compile_cs(&host.device, crate::host::CARD_COMPARE).expect("the card compare must compile");
+        let thread = compile_cs(&host.device, crate::host::CARD_COMPARE_THREAD).expect("the old compare must compile");
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 16;
+        const SKEW: u32 = 40;
+        let size = PIECE * PIECES as usize;
+        let (Some((now, now_ptr)), Some((hashes_w, _)), Some((hashes_t, _)), Some((differs, differs_ptr))) = (
+            host.shared_buffer(size as u64),
+            host.shared_buffer(16 * u64::from(PIECES)),
+            host.shared_buffer(16 * u64::from(PIECES)),
+            host.shared_buffer(8 * u64::from(PIECES)),
+        ) else {
+            return;
+        };
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut bytes: Vec<u8> = (0..size).map(|_| next() as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), now_ptr, size) };
+        // Both forms' passes in one list: the wide form's flags go to dwords
+        // 0..16 of `differs`, the old form's to 16..32.
+        let run = |mode: u32| -> Vec<u32> {
+            // SAFETY: an open list; the compares' own root signatures; live
+            // buffers; the mapping holds the flags.
+            unsafe {
+                for k in 0..2 * PIECES as usize {
+                    differs_ptr.cast::<u32>().add(k).write_volatile(7);
+                }
+                for (shader, hashes, out_at, groups) in
+                    [(&wide, &hashes_w, 0, PIECES), (&thread, &hashes_t, 4 * PIECES, PIECES.div_ceil(64))]
+                {
+                    list.list.SetComputeRootSignature(&shader.root);
+                    list.list.SetPipelineState(&shader.pso);
+                    let constants = [0u32, SKEW, size as u32, PIECES, out_at, mode];
+                    list.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    list.list.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
+                    list.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                    list.list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                    list.list.Dispatch(groups, 1, 1);
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the submission was waited for.
+            (0..2 * PIECES as usize).map(|k| unsafe { differs_ptr.cast::<u32>().add(k).read_volatile() }).collect()
+        };
+        // Piece p's bytes as both forms hash them.
+        let span = |p: usize| {
+            let lo = (p * PIECE).saturating_sub(SKEW as usize) & !15;
+            let hi = (((p + 1) * PIECE - SKEW as usize).min(size) + 15) & !15;
+            (lo, hi.min(size))
+        };
+        run(0);
+        for round in 0..48 {
+            let before = bytes.clone();
+            for _ in 0..1 + next() % 4 {
+                let at = if next() % 3 == 0 {
+                    // At a piece's edge, where the widened pieces overlap.
+                    let edge = (1 + next() as usize % (PIECES as usize - 1)) * PIECE - SKEW as usize;
+                    (edge + next() as usize % 32).saturating_sub(16).min(size - 1)
+                } else {
+                    next() as usize % size
+                };
+                bytes[at] ^= 1 << (next() % 8);
+                // SAFETY: inside the mapping.
+                unsafe { now_ptr.add(at).write_volatile(bytes[at]) };
+            }
+            let wanted: Vec<u32> = (0..PIECES as usize)
+                .map(|p| {
+                    let (lo, hi) = span(p);
+                    u32::from(before[lo..hi] != bytes[lo..hi])
+                })
+                .collect();
+            let flags = run(2);
+            assert_eq!(&flags[..PIECES as usize], &wanted[..], "the group-a-piece form, round {round}");
+            assert_eq!(&flags[PIECES as usize..], &wanted[..], "the thread-a-piece form, round {round}");
+        }
+    }
+
+    /// A copy that starts 40 bytes into its first piece: its pieces are
+    /// widened to 16 bytes at both ends, and a middle one spans 4,097
+    /// steps of 16 bytes. A byte in the last of them (the next piece's
+    /// first step too) flags both pieces, in both forms of the compare;
+    /// one in a piece's middle, that piece alone; two equal rows swapped,
+    /// the piece.
+    #[test]
+    fn warp_card_compare_sees_each_step_of_a_widened_piece() {
+        for (source, groups) in [(crate::host::CARD_COMPARE, 3), (crate::host::CARD_COMPARE_THREAD, 1)] {
+            let Some(mut warp) = WarpHarness::new() else {
+                return;
+            };
+            let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
+            const PIECE: usize = 64 << 10;
+            const PIECES: u32 = 3;
+            const SKEW: u32 = 40;
+            let size = PIECE * PIECES as usize;
+            let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+            let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
+            let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+            let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 509) as u8).collect();
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+            let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+                // SAFETY: our open list, live buffers, the compare's own
+                // root signature; the mappings hold what is read and written.
+                unsafe {
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    warp.list.Dispatch(groups, 1, 1);
+                }
+                warp.submit_and_wait();
+                // SAFETY: as above.
+                [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+            };
+            // SAFETY (each): inside the mapping.
+            let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+            run(&mut warp, 0);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+            // Piece 1 is [65,496, 131,032) of the copy, widened to
+            // [65,488, 131,040): its last step [131,024, 131,040) is also
+            // piece 2's first.
+            let last = 2 * PIECE - SKEW as usize - 2;
+            set(last, content[last] ^ 0x10);
+            assert_eq!(run(&mut warp, 1), [0, 1, 1], "the widened last step");
+            set(last, content[last]);
+            let middle = PIECE + 30_000;
+            set(middle, content[middle] ^ 0x01);
+            assert_eq!(run(&mut warp, 1), [0, 1, 0], "a piece's middle");
+            set(middle, content[middle]);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+            // Two 16-byte rows of piece 1 swapped.
+            let (a, b) = (PIECE + 1600, PIECE + 3200);
+            for k in 0..16 {
+                set(a + k, content[b + k]);
+                set(b + k, content[a + k]);
+            }
+            assert_eq!(run(&mut warp, 1), [0, 1, 0], "two rows swapped");
+        }
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
@@ -1027,7 +1321,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(pieces, 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
@@ -1756,6 +2050,75 @@ void main(uint3 g : SV_GroupID) {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// Clamps noted for the list's prelude ([`bound_early`]) run there, at
+    /// each submission of the list: the indirect dispatches the list
+    /// records read their records clamped (a record over the groups a
+    /// dispatch runs is cut to 65,535 in x; one of all ones runs empty),
+    /// the title's records stay as they are, and a second submission of
+    /// the list (records changed by the CPU in between) clamps them again.
+    #[test]
+    fn early_clamps_run_in_the_prelude_at_each_submission() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if !enhanced_barriers() {
+            return;
+        }
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (Some((src_buf, src_ptr)), Some((hits_buf, hits_ptr))) = (host.shared_buffer(256), host.shared_buffer(256)) else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a single-argument command signature description.
+            unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig) }.unwrap();
+            sig.unwrap()
+        };
+        let records: [[u32; 3]; 3] = [[3, 2, 1], [70_000, 1, 1], [u32::MAX, u32::MAX, u32::MAX]];
+        let write = |records: &[[u32; 3]; 3]| {
+            for (i, r) in records.iter().enumerate() {
+                for (k, w) in r.iter().enumerate() {
+                    // SAFETY: inside the 256-byte mapping.
+                    unsafe { src_ptr.cast::<u32>().add(i * 3 + k).write_volatile(*w) };
+                }
+            }
+            // SAFETY: as above.
+            unsafe { hits_ptr.cast::<u32>().write_volatile(0) };
+        };
+        write(&records);
+        let rooms: Vec<(ID3D12Resource, u64)> =
+            (0..3u64).map(|i| bound_early(&list, (&src_buf, i * 12), (2, 12, 1), false).expect("an early clamp")).collect();
+        assert_eq!(list.deferred_early(), 3, "three clamps noted for the prelude");
+        // SAFETY: an open list; the worker's own root signature; live buffers.
+        unsafe {
+            list.list.SetComputeRootSignature(&worker.root);
+            list.list.SetPipelineState(&worker.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, hits_buf.GetGPUVirtualAddress());
+            for (ring, at) in &rooms {
+                list.list.ExecuteIndirect(&signature, 1, ring, *at, None, 0);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the submission was waited for.
+        let hits = || unsafe { hits_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(hits(), 3 * 2 + 65_535, "6 groups, 65,535 groups, none");
+        // SAFETY: as above.
+        let kept = unsafe { src_ptr.cast::<u32>().add(3).read_volatile() };
+        assert_eq!(kept, 70_000, "the title's record is left as it was");
+        // Submitted again with other records: clamped again in the prelude.
+        write(&[[1, 1, 1], [5, 1, 1], [2, 2, 2]]);
+        host.execute(&[&list]);
+        assert_eq!(hits(), 1 + 5 + 8);
+        list.reset();
+        assert_eq!(list.deferred_early(), 0, "a reset forgets them");
     }
 }
 
