@@ -237,6 +237,9 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// 64-bit float wave sums made (their two dwords), by the terms' dwords, mask and the
+    /// block made in: a section's result asks for each dword on its own.
+    sums64: HashMap<(Value, Value, Value, usize), [V; 2]>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -1702,6 +1705,7 @@ impl<'a> Lower<'a> {
             halves,
             wave_base: None,
             flat: None,
+            sums64: HashMap::new(),
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2009,7 +2013,7 @@ impl<'a> Lower<'a> {
             };
             let made = match shape {
                 None => Err(UNKNOWN),
-                Some(sh @ (Shape::Active(..) | Shape::Prefix(..) | Shape::ActiveF64(..))) => self.paired_shape(sh),
+                Some(sh @ (Shape::Active(..) | Shape::Prefix(..) | Shape::Sum64 { .. })) => self.paired_shape(sh),
                 Some(sh) => self.both(|l| l.shape(sh, false)),
             };
             match made {
@@ -2032,10 +2036,10 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
-            Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
-            Shape::ActiveF64(lo, hi, mask, high) => {
-                return self.active_f64_sum(lo, hi, mask, high);
+            Shape::Sum64 { high, lo, hi, mask } => {
+                return self.sum64(lo, hi, mask).map(|d| d[usize::from(high)]);
             }
+            Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -2235,6 +2239,9 @@ impl<'a> Lower<'a> {
     /// lanes' total.
     fn paired_shape(&mut self, shape: super::wave::Shape) -> Result<[V; 2], Why> {
         use super::wave::{Op, Shape};
+        if let Shape::Sum64 { high, lo, hi, mask } = shape {
+            return self.paired_sum64(high, lo, hi, mask);
+        }
         let (op, src, mask, ident, prefix) = match shape {
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Prefix(op, src, mask, ident, inclusive) => (op, src, mask, ident, Some(inclusive)),
@@ -6934,6 +6941,9 @@ impl<'a> Lower<'a> {
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
+        if let Some(r) = self.valu_f64(inst, name, guard) {
+            return r;
+        }
         match name {
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
@@ -7443,12 +7453,6 @@ impl<'a> Lower<'a> {
                     Cast::UiToFp
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
-                float(self, r)
-            }
-            "v_cvt_f32_f64" => {
-                let (lo, hi) = self.f64_pair(inst, 0)?;
-                let bits = self.f64_to_f32_bits(lo, hi);
-                let r = self.as_float(bits);
                 float(self, r)
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
