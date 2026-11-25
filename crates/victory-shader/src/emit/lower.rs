@@ -1227,6 +1227,13 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// `s_setreg*` of `HW_REG_POPS_PACKER` (hardware register 25): how a pixel program takes part
+/// in POPS, the console's ordering of the view accesses of overlapping pixels by primitive.
+fn sets_pops_packer(i: &Inst) -> bool {
+    matches!(i.name(), "s_setreg_b32" | "s_setreg_imm32_b32")
+        && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == 25)
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1241,6 +1248,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -2057,6 +2065,15 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        // Title memory written by address has no rasterizer-ordered form.
+        let by_address = |&&(site, a): &&(Site, Address)| {
+            let name = self.x.p.blocks[site.0].insts[site.1].name();
+            a.param == MEMORY && (name.contains("store") || name.contains("atomic"))
+        };
+        if self.s.ordered && let Some(&(site, _)) = self.x.res.scalar.iter().find(by_address) {
+            let offset = self.x.p.blocks[site.0].insts[site.1].machine.offset;
+            return Err(unsupported(offset, "a write by address in a pixel program ordered by primitive"));
+        }
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -6101,6 +6118,10 @@ impl<'a> Lower<'a> {
                     // (11) or writes (11 with the UAV bit). Indexed
                     // accesses reach here as raw ones at index times the
                     // entry's stride (`buffer`).
+                    // (no rasterizer-ordered form: only heap views are ordered)
+                    (RootType::Descriptor, Some(ResourceType::Uav), _) if self.s.ordered => {
+                        Err("a root UAV of a pixel program ordered by primitive")
+                    }
                     (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }

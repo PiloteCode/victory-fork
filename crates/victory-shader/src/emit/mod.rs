@@ -308,6 +308,16 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    // A pixel program that waits for the pixels it overlaps (POPS): the host orders its views
+    // instead (`Shader::ordered`), and the program goes past the wait.
+    if native.stage == HwStage::Ps
+        && let Some(q) = ir::without_pops_wait(p)
+    {
+        let st = structure::structure(&q)?;
+        let io = io::raise(&q, native)?;
+        let res = resource::track(&q, &native.layout, native.stage, Some(&st))?;
+        return emit(c, native, &q, &st, &io, &res);
+    }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -1726,6 +1736,62 @@ mod barycentric_tests {
         let layout = vec![table(0), table(1)];
         let used = vec![range(ResourceType::Srv, 8, 0), range(ResourceType::Sampler, 4, 1)];
         let shader = pixel_of(&words, PERSP_CENTER, false, layout, used).unwrap();
+        validate(&shader);
+    }
+
+    /// A pixel program ordered by primitive (POPS, the title's pedestrian cut-out
+    /// programs): it takes part in the ordering, waits for the overlapping waves to leave
+    /// the section, reads and writes a texture, and says it is done. The wait goes; the
+    /// texture is a rasterizer-ordered view.
+    #[test]
+    fn an_ordered_pixel_program_writes_through_a_rasterizer_ordered_view() {
+        let [e0, e1] = exp_mrt0(4);
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0101,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null
+            0xBA80_1019,
+            0x0000_0001, // s_setreg_imm32_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), 1
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0004, // s_cbranch_scc1 -> past the wait
+            0xBF8E_FFFF, // s_sleep 0xffff
+            0x810C_01EF, // s_add_i32 s12, src_pops_exiting_wave_id, s1
+            0xBF0A_0C01, // s_cmp_lt_u32 s1, s12
+            0xBF84_FFFC, // s_cbranch_scc0 -> s_sleep
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xF000_3F08,
+            0x0001_0402, // image_load v[4:7], v[2:3], s[4:11] dmask:0xf 2D unorm glc
+            0xF020_3F08,
+            0x0001_0402, // image_store v[4:7], v[2:3], s[4:11] dmask:0xf 2D unorm glc
+            0xBF90_0007, // s_sendmsg(MSG_ORDERED_PS_DONE)
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let param = |root, sgprs, user_data| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        let layout = vec![param(RootType::Table, 1, 0), param(RootType::Constants, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        let shader = pixel_of(&words, PERSP_CENTER, false, layout, used).unwrap();
+        let (features, _) = parts(&shader);
+        assert_ne!(features & 0x1000, 0, "no rasterizer-ordered views");
         validate(&shader);
     }
 
