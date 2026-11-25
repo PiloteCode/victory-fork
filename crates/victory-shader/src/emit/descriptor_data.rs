@@ -300,6 +300,8 @@ impl<'a> Lower<'a> {
     /// - A buffer's four dwords whose table entry says what it is: a view as the title made
     ///   it, structured where its elements are whole dwords (the title's water simulation
     ///   tests a structured buffer it does not read for being empty, by its record count).
+    ///   A raw handle of the structured view the heap holds answers wrong: 2 records for 9
+    ///   of 16 bytes on an RTX 5090 (`descriptor_tests`, run with a raw handle).
     ///   With no entry, a raw view where the code reads the record count (dword 2).
     // shortcut: an image whose kind nothing tells is taken for a 2D texture; a host view of
     // another kind is queried through a 2D texture's handle.
