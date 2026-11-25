@@ -1999,7 +1999,7 @@ impl HostHeap {
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due: Vec<(u32, u64, Option<[u32; 3]>)> = Vec::new();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -2034,11 +2034,16 @@ impl HostHeap {
                     continue;
                 }
                 *last = print;
-                due.push((index as u32, handle));
+                due.push((index as u32, handle, record_words(record)));
             }
         }
-        for &(index, handle) in &due {
-            self.mirror(index, handle, false);
+        // Each from the record that was fingerprinted, as in
+        // `mirror_copied`: the slot may hold another one by now.
+        for &(index, handle, words) in &due {
+            match words {
+                Some(words) => self.mirror_record(index, handle, false, words),
+                None => self.mirror(index, handle, false),
+            };
         }
         (looked, due.len() as u64)
     }
