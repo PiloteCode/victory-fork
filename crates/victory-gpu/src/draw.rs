@@ -324,6 +324,23 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Of those microseconds (diagnostics): the buffer views and their copies,
+/// the textures, and of the textures' looking at their memory
+/// (`texture::mapped_bytes`), making host views (`mirror`), making them
+/// readable (host textures and uploads recorded) and their staging.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_STEPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// `f`, its microseconds added to [`HEAP_STEPS`]`[i]` (diagnostics).
+#[inline]
+fn heap_step<T>(_i: usize, f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let out = f();
+    #[cfg(feature = "diagnostics")]
+    HEAP_STEPS[_i].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    out
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1400,7 +1417,9 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
-        self.heap_textures(list, heap, host);
+        #[cfg(feature = "diagnostics")]
+        HEAP_STEPS[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        heap_step(1, || self.heap_textures(list, heap, host));
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1520,7 +1539,7 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let mapped = heap_step(2, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1560,7 +1579,7 @@ impl State {
                 }
                 continue;
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = heap_step(3, || heap.handle(index).and_then(|handle| host.mirror(index, handle, true)));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1580,7 +1599,7 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                heap_step(4, || readable(list, sampled.kind, view));
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1593,7 +1612,7 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
-            let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
+            let (bytes, whole) = heap_step(5, || crate::texture::staged(resource)).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
