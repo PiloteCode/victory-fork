@@ -1779,7 +1779,9 @@ mod tests {
         hub.poll();
         let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
         tick();
-        host.lock().unwrap().keys = vec![key(b'W')];
+        // A key that is no control of the stand-in pad: the keyboard also
+        // drives the first connected pad, which would add a reading of it.
+        host.lock().unwrap().keys = vec![key_at(b'M', 0x32)];
         hub.poll();
         let w = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
         tick();
