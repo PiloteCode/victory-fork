@@ -24,7 +24,7 @@ developer or publisher.
 
 ## Status of this fork (2026-11-25)
 
-**Not playable yet: about 4.5 frames per second on an RTX 5090 (2.5 to 4 on an RTX 4070 before the second pass below), and shadowed areas are dark.**
+**Not playable yet: about 5 to 5.5 frames per second in gameplay on an RTX 5090 (2.5 to 4 on an RTX 4070 before the second pass below), about 5 in the opening cutscenes, and shadowed areas are dark.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -70,29 +70,46 @@ draws or more.
 
 | Change | What it fixed | Measured |
 |--------|---------------|----------|
-| Range lock for reads of title memory in place (`watch.rs`, `xmem.rs`) | one lock over all title memory: while the world streamed in, texture refreshes waited 1-6.7 s a frame for the runtime's remappings | waits in the opening cutscene 439 ms â†’ 0.7 ms a frame line |
+| Range lock for reads of title memory in place (`watch.rs`, `xmem.rs`) | one lock over all title memory: while the world streamed in, texture refreshes waited 1-6.7 s a frame for the runtime's remappings | waits in the opening cutscene 439 ms → 0.7 ms a frame line |
 | Shader cache keyed by the translator (`build.rs`, `shader_cache.rs`) | every rebuild retranslated all ~3,000 shaders | a rebuild that leaves the translator alone keeps them |
 | 3/4 of the processors make pipelines (`pipeline/make.rs`) | 8 of 32 threads | the first run's backlog clears sooner |
-| On by default: relay, wide snapshots/compares/refreshes/merges, card copies from 1 MiB (`=0` turns each off) | prepare, card and copy-back ran one after another | gameplay frame 408 â†’ 232 ms |
-| Indirect windows on by default, scratch buffer left read between draws (`draw.rs`, `indirect.rs`, `host.rs`) | a change of state around each of 5,000 one-record indirect draws stopped the card each time | card 131/129 â†’ 95/103 ms, frame 240/238 â†’ 221/218 ms |
+| On by default: relay, wide snapshots/compares/refreshes/merges, card copies from 1 MiB (`=0` turns each off) | prepare, card and copy-back ran one after another | gameplay frame 408 → 232 ms |
+| Indirect windows on by default, scratch buffer left read between draws (`draw.rs`, `indirect.rs`, `host.rs`) | a change of state around each of 5,000 one-record indirect draws stopped the card each time | card 131/129 → 95/103 ms, frame 240/238 → 221/218 ms |
 | Shader translation fixes (agent, `victory-shader`) | 110 programs did not translate (puddles, terrain samplers, ped cut-outs, decals...) | 16 left; 25,576 of 25,758 pass translation, validation and pipeline creation |
+| Relay fetches on a copy queue of their own (`host.rs`) | the copy-back's fetches of card copies waited behind every later flight on the title's queue (88-104 ms a frame on the relay thread) | gameplay frame 213 → 170 ms, mean 371 → 228 ms |
+| Wave64 compute programs in the paired form (agent, `victory-shader`) | 24 compute programs (screen-tracing tiles, particles, alpha resolve, decal trails, hair shadow masks), 3 builder programs and the alpha-tested cascade shadows were refused on 32-lane GPUs; tiles of an older picture showed in the opening cutscene | no compute pipeline refused in play; the rectangles are gone |
+| Spare staging buffers (`texture.rs`) | every streamed texture made and let go an upload buffer of its own, ~500 a second at 0.2-0.3 ms each | opening cutscenes: heap pass 187 → 65 ms, frame 307 → 205 ms |
+| DirectStorage page numbers read again (`dstorage.rs`, `xmem.rs`) | a request whose page numbers the title wrote after enqueueing it failed (up to 302 in a burst at loading): its model or texture kept old data | no failed request since |
 
-Together: the opening of the gameplay went from 487 ms to about 218 ms a
-frame (2 â†’ 4.5 fps), the opening cutscene's streaming from a median of 590 ms
-(and seconds-long frames) to about 260 ms.
+Together: the opening of the gameplay went from 487 ms to about 175-195 ms a
+frame (2 → 5-5.5 fps), the opening cutscene's streaming from a median of 590 ms
+(and seconds-long frames) to about 205 ms.
 
 Tried and left off, with numbers: title memory in place (`VICTORY_INPLACE=1`:
 358 ms, `=2`: 677 ms; the card reading system memory is slower), 512 lists in
 the air (248 ms; the wait moves to reads of title memory), no waits around
 the indirect clamp (no change), skipping the ray-tracing passes (35 ms saved
-but the indirect light they already give is lost: rooms go black).
+but the indirect light they already give is lost: rooms go black), unguarded
+copies of title memory (`VICTORY_COPY_MODE=plain`: crashes at once on pages
+never committed), the title's buffer copies run on the card (205 → 232 ms:
+they fill small constant buffers whose CPU-side copies then wait for the
+card), a table's constants read from the card copies (the scene vanished:
+refreshes leave ranges under shader writes alone), clamp windows of 1,024
+records or lasting to the title's next barrier (no fewer clamps that matter,
+no frame time gained), the ray-tracing structure builder
+(`VICTORY_BVH_BUILDER=1`, with or without quarantine: the title crashes
+about 80 s into the gameplay, reading a pointer of all ones).
 
-Still open: 24 compute programs need 64-lane waves, which NVIDIA cards do
-not run (screen tracing tiles, particles, alpha transmission; also the
-ray-tracing structure builder, so shadows stay dark); rectangles of an older
-picture in the opening cutscene; ~100 ms of card time a frame in translated
-shaders; the copy-back's fetches wait behind later work on the queue (about
-100 ms a frame on the relay thread).
+Still open: the ray-tracing structure builder (all 52 programs now get
+pipelines, but switched on it crashes the title, so shadows stay dark);
+~100 ms of card time a frame, a third of it our clamps of indirect records
+(2,500 a frame, each between two waits of the whole card: the title's ~710
+barriers a frame cut its runs of records short); ~60 ms a frame that the
+submitting thread waits for flights to land, because a table's constants
+and the title's buffer copies read title memory inside a 174 MB pool that
+every flight declares written as a whole; about 350 programs that still do
+not translate offline (mostly mesh outputs over the host's limit and
+interpolation modes packed in one row; few of them seen in play).
 
 To run it: `Lancer GTA6 (VIctory).bat` next to the game's files builds the
 release and starts the title.
@@ -163,7 +180,7 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
 The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager â†’ Performance â†’ Memory**. If
+Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
