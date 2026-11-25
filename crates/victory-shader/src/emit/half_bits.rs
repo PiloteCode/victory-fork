@@ -21,7 +21,22 @@
 //! same `R16_UINT` views. A place is named only where every access through it moves halves and
 //! the program picks nothing of its table at run time; every other access keeps the float path.
 //!
-//! `VICTORY_HALF_BITS=0`: no place named, every translation as before.
+//! What the host needs: the places (`HostShader::half_views`, kept by the shader cache), and an
+//! unsigned 16-bit buffer view at each when the shader runs (the title's are; `victory-gpu`
+//! shows a 16-bit float or signed one there as its unsigned twin). No per-slot format bits: the
+//! choice is made here, from the program's code.
+//!
+//! In the title's pack (CPU census, 32-lane host): every one of its 1,156 d16 buffer
+//! instructions (616 `buffer_load_format_d16_x`, 99 `_xyzw`, 441 `buffer_store_format_d16_xyzw`)
+//! is in the 65 `compute_graph_ops` programs, and each of them names its places; 12 more name a
+//! place through format loads read as halves (the head's
+//! `CS_BlendshapeTranslationsHSSGraphOutputExtract`, six `indirect_light_probes` shading
+//! programs, the screen-probe injection, a scattering and a water volume program, two light
+//! proxy pixel programs). 77 programs and 183 places in all; every program still validates;
+//! host instructions 96,238,542, 96,238,565 before.
+//!
+//! `VICTORY_HALF_BITS=0`: no place named, every translation as before (the census: all 25,953
+//! DXIL files byte for byte the translator's before this).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
