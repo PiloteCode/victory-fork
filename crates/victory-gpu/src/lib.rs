@@ -18,12 +18,16 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod barrier;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod bvhtrace;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(windows)]
+mod coherence;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -84,7 +88,11 @@ mod texture;
 #[cfg(windows)]
 mod uheap;
 #[cfg(windows)]
+mod waits;
+#[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;

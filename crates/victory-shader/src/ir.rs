@@ -381,12 +381,14 @@ fn unspill(
     // Lane pairs (register, lower lane) that always move together: each
     // save of the lower lane is followed, in the same block and before its
     // register changes, by the save of the next register into the next
-    // lane; each restore of the lower lane is followed at once by the
-    // restore of the next lane into the next register.
+    // lane; each restore of the lower lane is followed, in the same block
+    // and before the next register is read or written, by the restore of
+    // the next lane into the next register.
     // The second save may come any number of instructions after the first (the
     // compiler puts loads and constants between the two: five instructions later
-    // in the ped mesh programs). Only wave64 programs have pairs: a wave32 mask
-    // is one dword, and a pair move of it with its neighbour would hide it.
+    // in the ped mesh programs), and so may the second restore. Only wave64
+    // programs have pairs: a wave32 mask is one dword, and a pair move of it
+    // with its neighbour would hide it.
     let mut slots: Vec<(u8, u32)> = parks.iter().flatten().map(|p| (p.1, p.3)).collect();
     slots.sort_unstable();
     slots.dedup();
@@ -2215,6 +2217,57 @@ mod tests {
         assert_eq!(step.read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.read(Reg::S(2)), Some(lp_s2));
+    }
+
+    /// A lane mask parked in lanes 6 and 7 of a VGPR comes back as the pair
+    /// it is also when the compiler puts other work between the two
+    /// restores (the irradiance cache's shading programs: one vector
+    /// instruction), and as two scalars when that work reads the second
+    /// register.
+    #[test]
+    fn a_parked_pair_restored_with_work_between_moves_as_a_pair() {
+        let program = |between: u32| {
+            [
+                0xD761_0000,
+                0x0001_0C04, // v_writelane_b32 v0, s4, 6
+                0xD761_0000,
+                0x0001_0E05, // v_writelane_b32 v0, s5, 7
+                0xBE84_0380, // s_mov_b32 s4, 0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xD760_000A,
+                0x0001_0D00, // v_readlane_b32 s10, v0, 6
+                between,
+                0xD760_000B,
+                0x0001_0F00, // v_readlane_b32 s11, v0, 7
+                0xBE8C_040A, // s_mov_b64 s[12:13], s[10:11]
+                S_ENDPGM,
+            ]
+        };
+        // v_mov_b32 v1, v2 between the restores: one pair move.
+        let p = build_words(&program(0x7E02_0302), true);
+        let insts = &p.blocks[0].insts;
+        let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+        assert_eq!(
+            names,
+            ["s_mov_b64", "s_mov_b32", "s_mov_b32", "s_mov_b64", "v_mov_b32", "s_mov_b64", "s_endpgm"],
+            "{insts:?}"
+        );
+        // The pair saved is the input pair, and the pair restored is that.
+        let (save, restore, last) = (&insts[0], &insts[3], &insts[5]);
+        let parked = |reg| save.write(Reg::S(reg));
+        let slot = (0..=255u8).find(|&c| parked(c).is_some()).expect("a slot");
+        assert_eq!(save.read(Reg::S(4)), Some(input(&p, Reg::S(4))));
+        assert_eq!(save.read(Reg::S(5)), Some(input(&p, Reg::S(5))));
+        assert_eq!(restore.read(Reg::S(slot)), save.write(Reg::S(slot)));
+        assert_eq!(restore.read(Reg::S(slot + 1)), save.write(Reg::S(slot + 1)));
+        assert_eq!(last.read(Reg::S(10)), restore.write(Reg::S(10)));
+        assert_eq!(last.read(Reg::S(11)), restore.write(Reg::S(11)));
+        // v_mov_b32 v1, s11 between reads the second register before its
+        // restore: the two lanes move as scalars, saves and restores.
+        let p = build_words(&program(0x7E02_020B), true);
+        let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "s_mov_b64").count(), 1, "{names:?}");
+        assert_eq!(names[4..7], ["s_mov_b32", "v_mov_b32", "s_mov_b32"], "{names:?}");
     }
 
     /// `if (v0 < s0) { ... }` whose body changes s6: `body` are its words, `after` what

@@ -194,7 +194,30 @@ impl Latch {
     }
 }
 
+/// `VICTORY_ARROWS_LOOK=1` (off by default; on unless `0` in fxceless #995,
+/// tunczzz): the arrow keys are the right stick too (look and turn, as the
+/// I/J/K/L places), and the D-pad moves to the numpad's 8/2/4/6. The letter
+/// places (AZERTY as US) are not touched.
+fn arrows_look() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ARROWS_LOOK").is_some_and(|v| v == "1"))
+}
+
+/// The D-pad on the numpad (8 up, 2 down, 4 left, 6 right), for
+/// [`arrows_look`].
+const NUMPAD_DPAD: [(Place, u32); 4] = [
+    (Place::Key(0x68), UP),
+    (Place::Key(0x62), DOWN),
+    (Place::Key(0x64), LEFT),
+    (Place::Key(0x66), RIGHT),
+];
+
 fn fallback(keys: &[KeyState]) -> PadState {
+    fallback_with(keys, arrows_look())
+}
+
+/// [`fallback`], the arrow keys turning the camera when `look`.
+fn fallback_with(keys: &[KeyState], look: bool) -> PadState {
     let on = |place: Place| -> f32 {
         if keys.iter().any(|k| place.held(k)) {
             1.0
@@ -202,17 +225,24 @@ fn fallback(keys: &[KeyState]) -> PadState {
             0.0
         }
     };
+    let arrow = |place: &Place| matches!(place, Place::Key(0x25..=0x28));
+    let buttons = FALLBACK_BUTTONS
+        .iter()
+        // (the arrows' D-pad entries give way to the numpad's)
+        .filter(|(place, _)| !(look && arrow(place)))
+        .chain(NUMPAD_DPAD.iter().filter(|_| look))
+        .filter(|(place, _)| on(*place) != 0.0)
+        .fold(0, |all, (_, bit)| all | bit);
+    let key = |vk: u8| on(Place::Key(vk));
+    let (ax, ay) = if look { (key(0x27) - key(0x25), key(0x26) - key(0x28)) } else { (0.0, 0.0) };
     PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(place, _)| on(*place) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
+        buttons,
         left_trigger: on(US_Z),
         right_trigger: on(US_C),
         left_x: on(US_D) - on(US_A),
         left_y: on(US_W) - on(US_S),
-        right_x: on(US_L) - on(US_J),
-        right_y: on(US_I) - on(US_K),
+        right_x: (on(US_L) - on(US_J) + ax).clamp(-1.0, 1.0),
+        right_y: (on(US_I) - on(US_K) + ay).clamp(-1.0, 1.0),
     }
 }
 
@@ -1517,6 +1547,26 @@ mod tests {
         // Keys that are the same on every layout go by virtual key.
         assert_eq!(fallback(&[key_at(0x20, 0x39)]).buttons, A);
         assert_eq!(fallback(&[key_at(0x1B, 0x01)]).buttons, MENU);
+    }
+
+    /// `VICTORY_ARROWS_LOOK=1`: the arrows also turn the camera and the
+    /// numpad has the D-pad; off (the default), the arrows are the D-pad
+    /// and the numpad nothing. The letter places stay either way.
+    #[test]
+    fn the_arrows_look_only_when_asked() {
+        let up_left = [key_at(0x26, 0xE048), key_at(0x25, 0xE04B)];
+        let pad = fallback_with(&up_left, false);
+        assert_eq!((pad.buttons, pad.right_x, pad.right_y), (UP | LEFT, 0.0, 0.0));
+        assert_eq!(fallback_with(&[key_at(0x68, 0x48)], false).buttons, 0);
+        let pad = fallback_with(&up_left, true);
+        assert_eq!((pad.buttons, pad.right_x, pad.right_y), (0, -1.0, 1.0));
+        assert_eq!(fallback_with(&[key_at(0x68, 0x48), key_at(0x66, 0x4D)], true).buttons, UP | RIGHT);
+        // The right stick's places and the arrows together stay in range.
+        let pad = fallback_with(&[key_at(0x27, 0xE04D), key_at(b'L', 0x26)], true);
+        assert_eq!(pad.right_x, 1.0);
+        // AZERTY letters as before.
+        let pad = fallback_with(&[key_at(b'Z', 0x11), key_at(b'Q', 0x1E)], true);
+        assert_eq!((pad.left_y, pad.left_x), (1.0, -1.0));
     }
 
     fn slot<F: Copy, T>(object: *const T, offset: usize) -> F {

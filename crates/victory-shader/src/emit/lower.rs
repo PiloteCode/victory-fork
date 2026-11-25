@@ -339,6 +339,10 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// With `split_lds` and [`lds_reads_on`]: the host block whose last LDS access was a read
+    /// after its meeting, which a read that follows in that block needs no meeting of its
+    /// own after.
+    lds_read_met: Option<usize>,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -365,6 +369,12 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange`: two pairs of exchange dwords for each console wave, taken in turn
+    /// ([`exchange2_on`]), and per host block the pair its next exchange takes with the
+    /// meeting after the last one's reads (taken out again when another exchange follows in
+    /// that block).
+    exchange_two: bool,
+    exchange_turn: HashMap<usize, (bool, Option<V>)>,
     /// With `exchange`, in a program for dispatches by thread counts ([`with_thread_limits`]):
     /// whether the other host wave of this thread's console wave has a launched thread (made
     /// in the entry block). One that has none has left, and its exchange dword holds 0.
@@ -536,10 +546,24 @@ fn need(block: usize) {
 /// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
 /// constants and such values; or loaded from an address made of them. The compiler keeps
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
+/// With [`wave_uniform`] bit 4, an LDS read (`ds_read*`) at an address held alike in every
+/// lane counts too when no LDS write of the program can run while it reads ([`lds_unraced`]):
+/// every lane, in whichever host wave and at whatever time, then reads the same bytes.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+/// With [`wave_uniform`] bit 2, a buffer load counts too where `read_only` says its view is
+/// one nothing in the dispatch writes, its address is held alike (or is the offset alone) and
+/// every lane runs it.
+fn lane_uniform(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    waits: &dyn Fn(usize) -> bool,
+    read_only: &dyn Fn(Site) -> bool,
+) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let own_registers = wave_uniform() & 1 != 0;
+    let lds_reads = wave_uniform() & 4 != 0;
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
         let block = &p.blocks[b];
@@ -551,6 +575,40 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            if let Fields::Ds {
+                addr: Some(Operand::Vector { reg, .. }),
+                gds: false,
+                ..
+            } = inst.fields
+                && lds_reads
+                && name.starts_with("ds_read")
+                && st.guards[b][i].is_none()
+                && inst.read(Reg::V(reg)).is_some_and(|a| same.contains(&a))
+                && lds_unraced(p, (b, i), waits)
+            {
+                same.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
+                continue;
+            }
+            if let Fields::Buffer {
+                addr: Operand::Vector { reg, dwords },
+                offen,
+                idxen,
+                lds: false,
+                tfe: false,
+                ..
+            } = inst.fields
+                && name.contains("_load_")
+                && st.guards[b][i].is_none()
+                && read_only((b, i))
+            {
+                // without `offen` and `idxen` the address register is not read
+                let addressed = !(offen || idxen)
+                    || (reg..reg.saturating_add(dwords)).all(|r| inst.read(Reg::V(r)).is_some_and(|a| same.contains(&a)));
+                if addressed {
+                    same.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
+                }
+                continue;
+            }
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
@@ -566,11 +624,21 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
             if st.guards[b][i].is_some() {
                 continue; // lanes outside EXEC keep another value
             }
+            // `VICTORY_WAVE_UNIFORM` bit 1: an operand is its own registers; of the other VGPRs
+            // the instruction reads, the old values of those it writes (kept in the lanes a
+            // guard masks; unguarded here) do not count. Not for what accumulates into its
+            // destination or reads registers by M0.
+            let own = own_registers && !(name.contains("mac") || name.contains("dot") || name.contains("movrel"));
             let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
+                Operand::Vector { reg, dwords } => {
                     // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                    let end = if own { reg.saturating_add(dwords.max(1)) } else { u8::MAX };
+                    let read: Vec<Value> = inst
+                        .reads
+                        .iter()
+                        .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && (x < end || !own)))
+                        .map(|r| r.1)
+                        .collect();
                     !read.is_empty() && read.iter().all(|x| same.contains(x))
                 }
                 // a scalar is one value; a lane mask is not, unless a compare of such values made it
@@ -578,6 +646,15 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                     inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
                 }
                 _ => true,
+            }) && (!own || {
+                let in_operand = |x: u8| {
+                    ops.iter().any(|op| matches!(*op, Operand::Vector { reg, dwords } if x >= reg && x < reg.saturating_add(dwords.max(1))))
+                };
+                let written = |x: u8| inst.writes.iter().any(|w| w.0 == Reg::V(x));
+                inst.reads.iter().all(|r| match r.0 {
+                    Reg::V(x) if !in_operand(x) => written(x) || same.contains(&r.1),
+                    _ => true,
+                })
             });
             if alike {
                 same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
@@ -585,6 +662,83 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// Whether no LDS write can run while the read at `at` does, in any wave of the group: none
+/// lies in the stretch between group barriers that holds the read. The stretch starts where
+/// the read can be reached from without passing a barrier (going back to the barriers, or the
+/// entry, it comes from); everything those starts reach without passing a barrier is
+/// searched, so a write on another branch of the same stretch counts too. A barrier counts
+/// only where the host waits there for the whole group (`waits`, by block). A write is a
+/// `ds_` instruction other than a read, swizzle or permute, or a buffer or flat load into LDS;
+/// an indirect jump ends the search with a no.
+fn lds_unraced(p: &Program, at: (usize, usize), waits: &dyn Fn(usize) -> bool) -> bool {
+    let writes = |inst: &Inst| match &inst.fields {
+        Fields::Ds { .. } => {
+            let n = inst.name();
+            !(n.starts_with("ds_read") || matches!(n, "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32" | "ds_nop"))
+        }
+        Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => *lds,
+        _ => false,
+    };
+    let barrier = |b: usize, inst: &Inst| inst.name() == "s_barrier" && waits(b);
+    // Back from the read: the points the stretch starts at.
+    let mut starts: Vec<(usize, usize)> = Vec::new();
+    let mut seen = vec![false; p.blocks.len()];
+    let mut back = vec![at];
+    while let Some((b, end)) = back.pop() {
+        let insts = &p.blocks[b].insts;
+        let mut started = false;
+        for j in (0..end.min(insts.len())).rev() {
+            if barrier(b, &insts[j]) {
+                starts.push((b, j + 1));
+                started = true;
+                break;
+            }
+            if writes(&insts[j]) {
+                return false;
+            }
+        }
+        if started {
+            continue;
+        }
+        if b == 0 || p.blocks[b].preds.is_empty() {
+            starts.push((b, 0));
+        }
+        for &q in &p.blocks[b].preds {
+            if !std::mem::replace(&mut seen[q], true) {
+                back.push((q, p.blocks[q].insts.len()));
+            }
+        }
+    }
+    // Forward from the starts to the barriers that end the stretch.
+    let mut seen = vec![false; p.blocks.len()];
+    let mut ahead = starts;
+    while let Some((b, from)) = ahead.pop() {
+        let block = &p.blocks[b];
+        let mut ended = false;
+        for inst in block.insts.iter().skip(from) {
+            if barrier(b, inst) {
+                ended = true;
+                break;
+            }
+            if writes(inst) {
+                return false;
+            }
+        }
+        if ended {
+            continue;
+        }
+        if matches!(block.exit, crate::ir::Exit::Indirect) {
+            return false;
+        }
+        for s in block.exit.successors() {
+            if !std::mem::replace(&mut seen[s], true) {
+                ahead.push((s, 0));
+            }
+        }
+    }
+    true
 }
 
 /// The paired form: scalar values each console lane has its own of in the lowering, a waterfall
@@ -687,6 +841,20 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+                let mut list = Vec::new();
+                for (b, block) in p.blocks.iter().enumerate().take(n) {
+                    if all[b] || find(&mut region, b) != r {
+                        continue;
+                    }
+                    for i in block.insts.iter().filter(|i| matches!(i.fields, Fields::Ds { .. })) {
+                        list.push(format!("{:#x} {}", i.machine.offset, i.name()));
+                    }
+                }
+                eprintln!("WAVE64-LDS-REGION [{}]", list.join(", "));
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -859,11 +1027,116 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_WAVE_UNIFORM` (default 0): more values a console wave64 program in two host waves
+/// of 32 finds alike in every lane ([`lane_uniform`]), so that a `v_readfirstlane` of them
+/// takes the host wave's own first lane instead of the lower half's through LDS (two group
+/// barriers each). Bit 1: an operand is judged by its own registers only (not by the old
+/// value of the destination, which the instruction reads for lanes a guard masks). Bit 2:
+/// buffer loads at an address alike in every lane through a view the title declares read-only
+/// (SRV or CBV: nothing in the dispatch writes it, so both halves read the same bytes). Bit 4:
+/// LDS reads at an address alike in every lane where no LDS write can run meanwhile
+/// ([`lds_unraced`]; always on in #995, off here unless asked for, so that the default
+/// translation stays as it was).
+pub(super) fn wave_uniform() -> u8 {
+    #[cfg(test)]
+    if let Some(bits) = TEST_WAVE_UNIFORM.get() {
+        return bits;
+    }
+    static BITS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_UNIFORM").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0) & 7
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wave_uniform`], for its thread only.
+    pub(super) static TEST_WAVE_UNIFORM: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_WAVE_EXCHANGE2=1`: the two host waves of a console wave exchange through two
+/// pairs of dwords taken in turn, and meet once an exchange instead of twice where another
+/// exchange follows in the same host block ([`Lower::exchange_halves`]). Off by default.
+pub(super) fn exchange2_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EXCHANGE2.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EXCHANGE2").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_LEGACY_MUL=ieee`: `v_mul_legacy_f32`, `v_mac_legacy_f32` and `v_mad_legacy_f32`
+/// multiply as the host does, without D3D9's `0 × anything = 0` (a zero times an infinity or
+/// a NaN gives a NaN, a zero's sign is the product's). Not the console's results: a
+/// measurement of what the exact form costs on the card, the title's most frequent
+/// instruction being `v_mul_legacy_f32`, which the exact form makes a multiply, two compares,
+/// an OR and a select. Off by default.
+fn legacy_mul_ieee() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LEGACY_MUL").is_ok_and(|v| v.trim() == "ieee"))
+}
+
+/// A legacy multiply of a value by itself is the plain multiply (the same bits: `±0 × ±0`
+/// is +0, and a value that is not zero gives the host's product either way); on by default,
+/// `VICTORY_LEGACY_SQUARE=0` turns it off.
+fn legacy_square_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LEGACY_SQUARE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_SQUARE").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_WAVE_LDS_READS=1`: where the two host waves of a console wave meet before each LDS
+/// access (`split_lds`), an LDS read right after another in the same host block goes without
+/// its meeting. Off by default.
+pub(super) fn lds_reads_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_READS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_LDS_READS").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_WAVE_BASE_DIRECT=1`: a console wave64 program in host waves of 32 whose host group
+/// has one dimension numbers its host waves from their first thread index
+/// ([`Lower::wave_base`]), not from an LDS counter the group meets around at its start. Off by
+/// default: it takes NVIDIA's and AMD's order of a one-dimension group's threads in waves,
+/// which D3D12 does not promise.
+pub(super) fn base_direct_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BASE_DIRECT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`exchange2_on`], for its thread only.
+    pub(super) static TEST_EXCHANGE2: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The meetings left out on this thread: exchanges' second ones ([`Lower::exchange_halves`])
+    /// and those before LDS reads that follow a read ([`lds_reads_on`]).
+    pub(super) static TEST_MEETINGS_DROPPED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A test's choice for [`lds_reads_on`], for its thread only.
+    pub(super) static TEST_LDS_READS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`legacy_square_on`], for its thread only.
+    pub(super) static TEST_LEGACY_SQUARE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`base_direct_on`], for its thread only.
+    pub(super) static TEST_BASE_DIRECT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The wave bases made from thread indices on this thread ([`Lower::wave_base`]).
+    pub(super) static TEST_BASES_DIRECT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -1134,6 +1407,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // with `exchange`: two pairs of exchange dwords a console wave (`exchange2_on`)
+        let mut exchange_two = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
@@ -1236,8 +1511,18 @@ impl<'a> Lower<'a> {
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
+                                // (two pairs of them with `exchange2_on`, where the group's LDS
+                                // still fits: not for a group cut short by thread counts, whose
+                                // departed half leaves 0 in its dword of the first pair only)
+                                let waves = group.div_ceil(64);
+                                exchange_two = group > 32
+                                    && exchange2_on()
+                                    && !LOCAL_WAVES.get()
+                                    && !THREAD_LIMITS.get()
+                                    && super::group_sync() != 0
+                                    && s.lds_dwords + 4 * waves <= 8192;
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += (if exchange_two { 4 } else { 2 }) * waves;
                             }
                         }
                     }
@@ -1345,6 +1630,7 @@ impl<'a> Lower<'a> {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
+                payload: super::shader::mesh_payload(),
             });
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
@@ -1381,7 +1667,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Lower {
+        let mut l = Lower {
             s,
             x,
             bad,
@@ -1440,12 +1726,24 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_read_met: None,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                    // where the host waits for the whole group at an `s_barrier` (see its lowering)
+                    let waits = |b: usize| {
+                        !no_barrier.contains(&b)
+                            && match super::group_sync() {
+                                0 => false,
+                                1 => !fence_only.contains(&b),
+                                _ => true,
+                            }
+                    };
+                    lane_uniform(p, x.st, all, &waits, &|_| false)
+                }
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -1457,6 +1755,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            exchange_two,
+            exchange_turn: HashMap::new(),
             partner_live: None,
             halves,
             wave_base: None,
@@ -1510,7 +1810,29 @@ impl<'a> Lower<'a> {
             drop_in,
             drop_out,
             emitted: Default::default(),
+        };
+        // `VICTORY_WAVE_UNIFORM` bit 2: again, with buffer loads through read-only views
+        if wave_uniform() & 2 != 0
+            && let Some((_, false, all)) = &l.exchange
+            && !LOCAL_WAVES.get()
+        {
+            let waits = |b: usize| {
+                !l.no_barrier.contains(&b)
+                    && match super::group_sync() {
+                        0 => false,
+                        1 => !l.fence_only.contains(&b),
+                        _ => true,
+                    }
+            };
+            let read_only = |site: Site| {
+                l.descriptors.get(&(site, false)).and_then(|src| l.used_kind(src)).is_some_and(|u| {
+                    matches!(u.kind, ResourceType::Srv | ResourceType::Cbv)
+                })
+            };
+            let uniform = lane_uniform(p, x.st, all, &waits, &read_only);
+            l.uniform = uniform;
         }
+        l
     }
 
     /// Element `id` of the inputs (`input`) or the vertex outputs as the finished signature
@@ -3626,6 +3948,17 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
+        let lean = super::lean_math();
+        if lean >= 1 {
+            // Only two zeros need the fix: none with a constant other than ±0
+            // (NaN and infinity included), and none for a value and itself,
+            // whose host maximum is one of two equal operands. Level 2: the
+            // host's FMax and FMin order the zeros themselves (measured).
+            let nonzero = |l: &Self, v: V| l.s.m.float_bits(v).is_some_and(|k| k & 0x7FFF_FFFF != 0);
+            if a == b || nonzero(self, a) || nonzero(self, b) || lean >= 2 {
+                return r;
+            }
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -3831,7 +4164,46 @@ impl<'a> Lower<'a> {
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        // (`VICTORY_LEGACY_MUL=ieee`, a measurement: the host's multiply as it is)
+        if legacy_mul_ieee() {
+            return m;
+        }
+        // A value times itself is +0 for either zero, as D3D9's rule gives it, and the host's
+        // product otherwise: the multiply alone, bit for bit (`VICTORY_LEGACY_SQUARE=0`: the
+        // compare and select as for any two values).
+        if a == b && legacy_square_on() {
+            return m;
+        }
         let zero = self.s.m.f32(0);
+        if super::lean_math() >= 1 {
+            // The same values for every input, with fewer tests: the result is
+            // +0 exactly when an operand is ±0, so an operand known not to be
+            // one needs no test (a constant other than ±0: NaN and infinity
+            // are not zero either), and an operand known to be one gives +0.
+            // Negations and absolute values are zero when what they take is,
+            // so `x * x`, `-x * x` and `|x| * x` need one test.
+            let zero_bits = |l: &Self, v: V| l.s.m.float_bits(v).map(|k| k & 0x7FFF_FFFF == 0);
+            let (ka, kb) = (zero_bits(self, a), zero_bits(self, b));
+            if ka == Some(true) || kb == Some(true) {
+                return zero;
+            }
+            let (ra, rb) = (self.s.m.zero_root(a), self.s.m.zero_root(b));
+            let tested = match (ka, kb) {
+                (Some(false), Some(false)) => return m,
+                (Some(false), None) => Some(rb),
+                (None, Some(false)) => Some(ra),
+                _ if ra == rb => Some(ra),
+                _ => None,
+            };
+            if let Some(x) = tested {
+                let z = self.s.m.cmp(c, pred::OEQ, x, zero);
+                return self.s.m.select(c, z, zero, m);
+            }
+            let az = self.s.m.cmp(c, pred::OEQ, ra, zero);
+            let bz = self.s.m.cmp(c, pred::OEQ, rb, zero);
+            let z = self.s.m.bin(c, Bin::Or, az, bz);
+            return self.s.m.select(c, z, zero, m);
+        }
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
@@ -3939,13 +4311,34 @@ impl<'a> Lower<'a> {
     /// consecutive thread indices (NVIDIA's 8 x 8 groups), so each wave takes the next 32 (64)
     /// from an LDS counter instead: every thread zeroes it, the group meets, each wave's first
     /// lane adds 32 (64) and the wave takes what it found. Branch-free, in the entry block,
-    /// which every thread runs.
+    /// which every thread runs. With [`base_direct_on`], a host group of one dimension takes
+    /// its wave's first thread index instead.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
+        if base_direct_on() && matches!(self.s.threads, Some([_, 1, 1])) {
+            // A host group of one dimension (the paired form's always): NVIDIA and AMD give
+            // each wave a run of 32 thread indices in a row, the first a multiple of 32, as
+            // the lowering already takes it for a console wave run as one host wave. The
+            // wave's first index rounded down, with no LDS and no meeting.
+            let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+            let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
+            let mask = self.s.m.i32(!31);
+            let mut base = self.s.m.bin(e, Bin::And, first, mask);
+            if self.twin.is_some() {
+                // (two console lanes a thread: host wave n is console wave n)
+                let one = self.s.m.i32(1);
+                base = self.s.m.bin(e, Bin::Shl, base, one);
+            }
+            self.s.flags |= flags::WAVE_OPS;
+            #[cfg(test)]
+            TEST_BASES_DIRECT.set(TEST_BASES_DIRECT.get() + 1);
+            self.wave_base = Some(base);
+            return Some(base);
+        }
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
@@ -4016,10 +4409,10 @@ impl<'a> Lower<'a> {
     }
 
     /// A group barrier with an LDS fence in `block`.
-    fn group_sync(&mut self, block: usize) {
+    fn group_sync(&mut self, block: usize) -> V {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode])
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -4043,7 +4436,16 @@ impl<'a> Lower<'a> {
             return (lo, hi);
         }
         // the pair of dwords of this thread's console wave: its half's, then both
-        let pair = self.exchange_pair(slot);
+        let mut pair = self.exchange_pair(slot);
+        // (`exchange_two`) the other pair than the last exchange of this host block took
+        let (second, before) = match self.exchange_two {
+            true => self.exchange_turn.get(&at).copied().unwrap_or((false, None)),
+            false => (false, None),
+        };
+        if second {
+            let two = self.s.m.i32(2);
+            pair = self.s.m.bin(at, Bin::Add, pair, two);
+        }
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -4059,12 +4461,26 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        self.group_sync(at);
+        let after = self.group_sync(at);
+        if self.exchange_two {
+            // The last exchange of this host block took the other pair, and every thread read
+            // it before the meeting above (its reads come first in the block): that pair is
+            // written again, by the exchange after this one, only past this one's meeting. So
+            // the last exchange's second meeting goes; the last of the block keeps its own,
+            // which every later write of either pair comes after.
+            if let Some(b) = before {
+                self.s.m.unlink(at, b);
+                #[cfg(test)]
+                TEST_MEETINGS_DROPPED.set(TEST_MEETINGS_DROPPED.get() + 1);
+            }
+            self.exchange_turn.insert(at, (!second, Some(after)));
+        }
         (lo, hi)
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// block): a group of several console waves has a pair for each (two with
+    /// `exchange_two`, the second two dwords on).
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -4073,7 +4489,7 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
+        let one = self.s.m.i32(if self.exchange_two { 2 } else { 1 });
         let twice = self.s.m.bin(e, Bin::Shl, wave, one);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
@@ -4840,9 +5256,19 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // (`VICTORY_WAVE_LDS_READS=1`: a read right after a read in the same host block
+            // needs no meeting of its own. Neither half writes between the two, and each
+            // half's next write comes after a meeting that both reads come before.)
+            let read = name.starts_with("ds_read");
+            if !(read && lds_reads_on() && self.lds_read_met == Some(self.cur)) {
+                let mode = self.s.m.i32(meeting_mode());
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            } else {
+                #[cfg(test)]
+                TEST_MEETINGS_DROPPED.set(TEST_MEETINGS_DROPPED.get() + 1);
+            }
+            self.lds_read_met = (read && lds_reads_on()).then_some(self.cur);
         }
         // (a guard with no host value: the instruction's own lowering says so where it needs it)
         self.raw_use = self.raw_use_for(b, i, inst).unwrap_or(None);

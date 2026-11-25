@@ -116,6 +116,18 @@ pub(crate) fn next_start(start: u64, end: u64) -> Option<u64> {
         .min()
 }
 
+/// The bytes of the placed texture at `start` (`len` at full size) that are
+/// its own: up to where the next texture placed inside it starts
+/// ([`next_start`]), all of them if none does (fxceless #995).
+pub(crate) fn texture_own_bytes(start: u64, len: u64) -> u64 {
+    texture_own_len(next_start(start, start.saturating_add(len)), start, len)
+}
+
+/// [`texture_own_bytes`] given where the next texture starts.
+fn texture_own_len(next: Option<u64>, start: u64, len: u64) -> u64 {
+    next.map_or(len, |at| at.saturating_sub(start).clamp(1, len))
+}
+
 /// The lowest level that a view of the placed texture at `start` shows,
 /// over the slots shaders pick by index that hold one now. The title
 /// views a texture from the first level it holds. `None`: no such slot.
@@ -312,7 +324,14 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        // A texture smaller than HEAD has nothing past its head to look in
+        // (BTreeMap::range panics when the start is past the end; fxceless
+        // #995).
+        let from = start.saturating_add(HEAD);
+        if from >= end {
+            return None;
+        }
+        self.by_start.range(from..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -380,6 +399,16 @@ static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// `VICTORY_PAGE_WRITES` asks for it.
 pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// At the last pass: slots of placed textures that show bytes from before
+/// a write behind the guards' back under them (uploaded before it, not
+/// since: `TextureQueue::behind`), and the frames since the oldest such
+/// write; since the start, slots made due again for such a write. With
+/// `VICTORY_PAGE_WRITES` not asking for slots the first stays high: those
+/// textures keep the bytes from before for the rest of the run (fxceless
+/// #995).
+pub(crate) static PAGE_BEHIND: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Frames from the pass that takes a written range to the look at its
 /// slots: the levels of one texture arrive in a few requests, and a look
@@ -541,6 +570,14 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// Slots whose texture was uploaded before title memory under it was
+    /// written behind the guards' back ([`HostHeap::slots_written_under`]),
+    /// each with the frame the first such write was taken: what shaders
+    /// read there is older than the title's bytes until an upload made
+    /// after the write. Out of it at that upload (a hand-back of a write
+    /// made after it, [`TextureQueue::uploaded`]), or when the slot leaves
+    /// the queue's care.
+    behind: std::collections::BTreeMap<u32, u64>,
 }
 
 impl TextureQueue {
@@ -559,6 +596,30 @@ impl TextureQueue {
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
+        self.behind.remove(&index);
+    }
+
+    /// The pass handed back slot `index` as of `write` after an upload (or
+    /// after finding nothing of the title's there to upload): if the write
+    /// is still the slot's, the upload read memory after every write the
+    /// queue was told of, so the slot shows nothing older.
+    fn uploaded(&mut self, index: u32, write: u64) {
+        if self.slots.get(&index).is_some_and(|w| w.write == write) {
+            self.behind.remove(&index);
+        }
+    }
+
+    /// Slot `index` was uploaded before title memory under it was written
+    /// (taken by the pass of `frame`).
+    fn fell_behind(&mut self, index: u32, frame: u64) {
+        self.behind.entry(index).or_insert(frame);
+    }
+
+    /// For the log: slots that show bytes from before a write now, and the
+    /// frames since the oldest such write.
+    fn behind_now(&self, frame: u64) -> [u64; 2] {
+        let oldest = self.behind.values().map(|&since| frame.saturating_sub(since)).max().unwrap_or(0);
+        [self.behind.len() as u64, oldest]
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -603,6 +664,7 @@ impl TextureQueue {
 
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
+        self.uploaded(index, write);
         if self.same(index, write).is_some() {
             self.slots.remove(&index);
         }
@@ -651,6 +713,7 @@ impl TextureQueue {
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
+        self.uploaded(index, write);
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
@@ -662,6 +725,7 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+        self.uploaded(index, write);
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
@@ -1220,6 +1284,9 @@ impl HostHeap {
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let [behind, oldest] = textures.behind_now(frame);
+        PAGE_BEHIND[0].store(behind, std::sync::atomic::Ordering::Relaxed);
+        PAGE_BEHIND[1].store(oldest, std::sync::atomic::Ordering::Relaxed);
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
 
@@ -1365,12 +1432,16 @@ impl HostHeap {
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
         PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
         PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
+        for &slot in &slots {
+            textures.fell_behind(slot, frame);
+        }
         if !due {
             return [held, slots.len(), 0];
         }
         for &slot in &slots {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
+        PAGE_BEHIND[2].fetch_add(slots.len() as u64, Relaxed);
         [held, slots.len(), slots.len()]
     }
 
@@ -3755,6 +3826,24 @@ mod tests {
         assert_eq!(spans.first_viewed(0x1_0000), Some(3));
     }
 
+    /// A texture's own bytes for the re-check after its upload end where a
+    /// texture placed in its large levels starts (packed textures: 16 KiB
+    /// apart, 684 KiB each at full size, fxceless #995's run n14); a texture
+    /// smaller than the head has nothing past it to look in (no panic).
+    #[test]
+    fn own_bytes_end_at_the_next_texture_placed_inside() {
+        let mut spans = Spans::default();
+        spans.note(1, 0x000b_5bc3_0000, 0x000b_5bc3_0000 + 700_416, true);
+        let len = 700_416;
+        assert_eq!(texture_own_len(spans.next_start(0x000b_5bc3_0000, 0x000b_5bc3_0000 + len), 0x000b_5bc3_0000, len), len);
+        spans.note(2, 0x000b_5bc3_4000, 0x000b_5bc3_4000 + 700_416, true);
+        // Both kept (the neighbour starts past the first 4 KiB).
+        assert_eq!(spans.slots_at(0x000b_5bc3_0000), vec![1]);
+        assert_eq!(texture_own_len(spans.next_start(0x000b_5bc3_0000, 0x000b_5bc3_0000 + len), 0x000b_5bc3_0000, len), 0x4000);
+        assert_eq!(texture_own_len(spans.next_start(0x000b_5bc3_4000, 0x000b_5bc3_4000 + len), 0x000b_5bc3_4000, len), len);
+        assert_eq!(spans.next_start(0x000b_5bc3_0000, 0x000b_5bc3_0000 + 16), None);
+    }
+
     /// Views of one placed texture are told from views of others by the
     /// address and the resource description, not by what they show.
     #[test]
@@ -4267,6 +4356,17 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+        // Older than the title's bytes (since the counted-only write at
+        // frame 60) until an upload of the write made for it (fxceless
+        // #995).
+        let behind = |frame: u64| heap.textures.lock().unwrap().behind_now(frame);
+        assert_eq!(behind(70), [1, 10]);
+        let (_, write) = heap.texture_slots_due(62, 8).0[0];
+        heap.texture_slot_done(1, write - 1, None);
+        assert_eq!(behind(70), [1, 10]);
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(behind(70), [0, 0]);
+        assert_eq!(slots(u64::MAX), []);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

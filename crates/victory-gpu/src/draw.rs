@@ -537,8 +537,11 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
 /// Looks at uploaded textures picked by index that found the memory as it
-/// was, and that found it changed (uploaded again), since the start.
-pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// was, and that found it changed (uploaded again), since the start; of
+/// the changed, those found after the scheduled looks
+/// (`VICTORY_HEAP_RECHECK_EVERY`) and those only between the three
+/// windows (`VICTORY_HEAP_RECHECK_WHOLE_MB`).
+pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Uploads of textures already on the card made while it had no room for
 /// new ones, since the start.
@@ -2088,18 +2091,46 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            // Of its memory, only the bytes before the next texture placed in
+            // it (`descriptor::host::texture_own_bytes`, fxceless #995): the
+            // title keeps only a texture's small levels and places the next
+            // textures where its large ones would be, so the fingerprint's
+            // middle and end windows saw the neighbours stream in, and it was
+            // uploaded again with their bytes as its own large levels (#995's
+            // runs n7-n14: the most re-uploaded slots 4, 8 and 16 KiB apart,
+            // 344-684 KiB each; the blocks on the near surfaces at the bottom
+            // of the picture).
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                let own = crate::descriptor::host::texture_own_bytes(at, len);
+                let now = crate::texture::fingerprint(at, own);
+                if now == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
+                    // Past the last of `RECHECK_FRAMES`: every
+                    // `VICTORY_HEAP_RECHECK_EVERY` frames while unchanged, when set.
+                    let wait = RECHECK_FRAMES.get(usize::from(looks) + 1).copied();
+                    match wait.or_else(|| Some(crate::texture::recheck_every()).filter(|&n| n > 0)) {
+                        Some(wait) => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + wait,
+                            (at, len),
+                            print,
+                            looks.saturating_add(1),
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                // What only the recheck switches found: a change after the
+                // scheduled looks, and one between the three windows.
+                if usize::from(looks) >= RECHECK_FRAMES.len() {
+                    HEAP_TEXTURES_RECHECKED[2].fetch_add(1, Ordering::Relaxed);
+                }
+                if crate::texture::fingerprint_split(own) && crate::texture::windows_same(now, print) {
+                    HEAP_TEXTURES_RECHECKED[3].fetch_add(1, Ordering::Relaxed);
+                }
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
                         slot = index,
@@ -2263,6 +2294,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
+                    let len = crate::descriptor::host::texture_own_bytes(at, len);
                     let print = crate::texture::fingerprint(at, len);
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }
@@ -2815,6 +2847,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    list.drew();
                     true
                 }
                 Err(_) => false,
@@ -3261,6 +3294,7 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.drew();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3361,6 +3395,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.drew();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3741,6 +3776,7 @@ impl State {
             self.ambient(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.drew();
         }
         true
     }
@@ -4015,6 +4051,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Some compute-written textures are also read by the title CPU.
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

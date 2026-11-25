@@ -110,6 +110,25 @@ const STAND_IN: PCWSTR = w!("victory.standin");
 // comes from GameInput (polled, not window messages), and frames are
 // presented to the visible window of the process, the stand-in.
 
+/// `VICTORY_GHOSTING=0` turns window ghosting off for the process, once,
+/// before the title's first window (fxceless #995, tunczzz, where it is
+/// off unless `VICTORY_GHOSTING=1`): a window whose thread has not taken a
+/// message for five seconds is otherwise covered by a "not responding"
+/// ghost painted from what it last showed. The stand-in above already
+/// keeps the window the player sees answering, so ghosting stays on by
+/// default; the switch is for a stand-in thread that stalls too.
+fn no_ghosting() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if !std::env::var_os("VICTORY_GHOSTING").is_some_and(|v| v == "0") {
+            return;
+        }
+        // SAFETY: a plain call with no arguments.
+        unsafe { wm::DisableProcessWindowsGhosting() };
+        tracing::info!("window ghosting off (VICTORY_GHOSTING=0)");
+    });
+}
+
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -124,6 +143,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    no_ghosting();
     let top = parent.is_null();
     // SAFETY: the title's own arguments, forwarded (a top-level window
     // made message-only).
@@ -165,6 +185,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    no_ghosting();
     let top = parent.is_null();
     // SAFETY: the title's own arguments, forwarded (a top-level window
     // made message-only).
