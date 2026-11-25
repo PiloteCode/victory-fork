@@ -81,6 +81,8 @@ struct Tally {
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
+    /// With `--hashes`: each emitted program's line names its DXIL.
+    hashes: bool,
     lines: Vec<String>,
 }
 
@@ -265,6 +267,7 @@ pub fn run(
     validate: bool,
     pipelines: bool,
     list: bool,
+    hashes: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
@@ -272,6 +275,8 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
+    // (the hashes are on the program lines)
+    let list = list || hashes;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
@@ -319,6 +324,7 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
+                            hashes,
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -750,6 +756,15 @@ fn check(
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
+    // `--hashes`: the line names the emitted DXIL, hashed before the
+    // validator signs it (`translate-diff` compares two runs by it).
+    let hash = t
+        .hashes
+        .then(|| blake3::hash(&shader.dxil).to_hex()[..16].to_owned());
+    let label = || match &hash {
+        Some(h) => format!("{} dxil={h}", label()),
+        None => label(),
+    };
     if let (Some(keep), Some(bytes)) = (&checks.keep, &checks.current) {
         lock(keep).push((label(), shader.clone(), bytes.clone()));
     }
@@ -792,7 +807,7 @@ fn check(
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
-            Err(e) => t.fail(format!("pipeline: {e}"), &label),
+            Err(e) => t.fail(format!("pipeline: {e}"), label),
         }
     }
     let Some(v) = checks.validator.as_mut() else {
