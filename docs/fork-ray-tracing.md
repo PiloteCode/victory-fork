@@ -158,9 +158,12 @@ shaders and emulates the one instruction.
    (with their ranges) and copies; `VICTORY_BVH_DRY=1` binds the builder's
    dispatches without running them; `VICTORY_BVH_CHECK=<hash of the header
    stage>[,<hash of the header decompression>]` walks the structures they
-   start a frame later, in title memory, and reports bad nodes (`V` lines for
+   start, in title memory, from the frame after the shaders' writes over
+   their header were put back, and reports bad nodes (`V` lines for
    those built on the card, `V rebuilt` for those rebuilt in place from what
-   was streamed); `VICTORY_CRASH_MEMORY=1` adds the title memory
+   was streamed; the nodes of those are in a space of their own, the leaf
+   rehydration's vertices scaled by powers of two such as 2^18, so their
+   root is not held to the header's bounds); `VICTORY_CRASH_MEMORY=1` adds the title memory
    around the registers (and one pointer further) to a crash report. With the
    user's own `XboxBvhBuilder.dll`, `VICTORY_TEST_BVH_DLL` runs the builder's
    wave64 programs in their picked and paired forms on the card and compares
