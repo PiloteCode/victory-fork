@@ -109,7 +109,15 @@ impl Lower<'_> {
                     && !name.starts_with("v_movrel")
                     && !matches!(name, "v_swap_b32")
             }
-            Fields::Ds { .. } => !name.starts_with("ds_swizzle") && !name.contains("permute"),
+            // (outside the paired form, not an LDS read: every lane makes it (`lds.rs`), and a
+            // lane outside the guard would take the raw address, one the console never forms
+            // there, maybe past the LDS the program allocates (a bounds test as the guard),
+            // which DXIL leaves undefined; buffer and image reads are bounded by their views)
+            Fields::Ds { .. } => {
+                !name.starts_with("ds_swizzle")
+                    && !name.contains("permute")
+                    && (self.twin.is_some() || !name.starts_with("ds_read"))
+            }
             // (outside the paired form, not a sample whose level comes from its quad's
             // coordinates: lanes outside the guard keep their old coordinates on the console,
             // and those are what its quad's differences take)
