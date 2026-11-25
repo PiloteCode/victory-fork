@@ -518,6 +518,20 @@ fn heap_step<T>(_i: usize, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Table entries shaders picked by a root constant in tables made from
+/// the title's own slots (not fresh), since the last frame line.
+pub(crate) static TABLE_INDEXED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw makes the table entries its shaders pick by a root
+/// constant in tables made from the title's own slots
+/// (`VICTORY_TABLE_INDEXED=1`, from fxceless #995, tunczzz; off by default:
+/// they are made only when the title writes them, by its view calls or the
+/// heap sync, which leaves tables' slots to their draws).
+pub(crate) fn table_indexed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_INDEXED").is_some_and(|v| v == "1"))
+}
+
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
@@ -2934,6 +2948,39 @@ impl State {
         }
     }
 
+    /// A table entry the shader picks by a root constant (`index`) in a
+    /// table made from the title's own slots: made as [`State::table_entry`]
+    /// makes the entries the used-resource list names ([`table_indexed`]).
+    /// Without it the slot is made only by the view calls and the pass over
+    /// records copied in as bytes, which leaves tables' slots to their draws
+    /// (`VICTORY_HEAP_SYNC_TABLES=0`).
+    fn table_indexed_entry(&self, list: &HostList, index: &RootIndexedView, compute: bool) {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(index.table_slot)) else {
+            return;
+        };
+        let constant = self.user_value(compute, index.constant_slot, RootType::Constants, index.constant_dword);
+        // The shader adds i32 byte offsets and shifts by 5.
+        let k = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+        let handle = table + u64::from(k) * 32;
+        let Some(heap) = self.heap_of(handle) else {
+            return;
+        };
+        if heap.samplers() {
+            return;
+        }
+        let (Some(host), Some(slot)) = (heap.host(), heap.index(handle)) else {
+            return;
+        };
+        if let Some(view) = host.mirror(slot, handle, true) {
+            if let Some(kind) = view_kind(&view) {
+                readable(list, kind, &view);
+            }
+            if crate::descriptor::host::is_texture_view(&view) {
+                host.texture_slot_tabled(slot, true);
+            }
+        }
+    }
+
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
@@ -3007,6 +3054,12 @@ impl State {
                 self.table_entry(list, u, compute);
             }
         }
+        for index in indexed.iter().filter(|index| !fresh.contains(&index.table_slot)) {
+            TABLE_INDEXED.fetch_add(1, Ordering::Relaxed);
+            if table_indexed() {
+                self.table_indexed_entry(list, index, compute);
+            }
+        }
         let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
@@ -3077,6 +3130,13 @@ impl State {
                     made.iter().find(|(r, _)| r.len() >= at && r[..at] == records[..at]).map(|&(_, first)| first)
                 })
                 .flatten();
+            // With `VICTORY_HEAP_SYNC_TABLES=2|3` (fxceless #995, tunczzz):
+            // the heap sync number before the records are read, and each
+            // entry's record key, for `HostHeap::drawn_fresh` (the records
+            // the sync left to tables' draws that this draw read).
+            let stamps = crate::descriptor::host::sync_tables() >= 2;
+            let seq = crate::descriptor::host::sync_seq();
+            let mut read: Vec<u64> = Vec::with_capacity(if stamps { n as usize } else { 0 });
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -3084,7 +3144,11 @@ impl State {
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    words.hash(&mut h);
+                    if stamps {
+                        read.push(crate::descriptor::host::words_key(words));
+                    }
                 }
                 (table, n, h.finish())
             };
@@ -3093,6 +3157,11 @@ impl State {
                 crate::copystat::add(crate::copystat::C::TablesPrefix, 1);
             }
             if let Some(first) = longer.or_else(|| self.fresh_tables.get(&key).map(|&(first, _)| first)) {
+                if stamps && let Some(title) = heap.index(table) {
+                    for (k, &read) in (0..).zip(&read) {
+                        host.drawn_fresh(title + k, seq, read);
+                    }
+                }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -3143,6 +3212,11 @@ impl State {
             let mut has_cbv = false;
             for k in 0..n {
                 let index = first + k;
+                if let Some(title) = title_first
+                    && let Some(&read) = read.get(k as usize)
+                {
+                    host.drawn_fresh(title + k, seq, read);
+                }
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
