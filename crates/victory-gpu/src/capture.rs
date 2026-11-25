@@ -47,7 +47,54 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+        || TIMED_FRAMES.iter().any(|f| f.load(std::sync::atomic::Ordering::Relaxed) == n)
+}
+
+/// `VICTORY_CAPTURE_SECONDS` (comma-separated): the first frame begun at
+/// least that many seconds after the world's first frame (the frame of 500
+/// draws or more; `VICTORY_CAPTURE_WORLD` must be set) is listed as those of
+/// `VICTORY_CAPTURE_FRAMES` are. The opening cutscene keeps time with its
+/// sound, not with frames: a shot that came at frame 2,979 of one run came
+/// at frame 2,393 of a slower one, 296 and 278 seconds after the world's
+/// first frame.
+fn seconds() -> &'static [f64] {
+    static LIST: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let list = std::env::var("VICTORY_CAPTURE_SECONDS").unwrap_or_default();
+        let mut s: Vec<f64> = list.split(',').filter_map(|f| f.trim().parse().ok()).collect();
+        s.sort_by(f64::total_cmp);
+        s
+    })
+}
+
+/// The last frames listed by [`seconds`], a ring read without a lock (every
+/// operation recorded asks [`listed`]).
+static TIMED_FRAMES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 4];
+
+/// When the world's first frame was presented, and how many of [`seconds`]
+/// have been given a frame.
+static TIMED: std::sync::Mutex<(Option<std::time::Instant>, usize)> = std::sync::Mutex::new((None, 0));
+
+/// At the present of `frame`: the next frame is listed if it is the first
+/// to begin past one of [`seconds`] after the world's first frame.
+fn timed_frames(frame: u64) {
+    let wanted = seconds();
+    if wanted.is_empty() || WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
+        return;
+    }
+    let mut timed = TIMED.lock().unwrap_or_else(|e| e.into_inner());
+    let since = timed.0.get_or_insert_with(std::time::Instant::now).elapsed().as_secs_f64();
+    let given = timed.1;
+    while timed.1 < wanted.len() && wanted[timed.1] <= since {
+        timed.1 += 1;
+    }
+    if timed.1 > given {
+        TIMED_FRAMES[given % TIMED_FRAMES.len()].store(frame + 1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(frame = frame + 1, seconds = since, "a frame listed by its time after the world's first frame");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -140,6 +187,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 "));
         }
     }
+    timed_frames(frame);
 }
 
 /// Whether frame `n` is saved.
