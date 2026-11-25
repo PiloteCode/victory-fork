@@ -109,6 +109,11 @@ mod interp;
 #[path = "export.rs"]
 mod export;
 
+/// Changes taken from the official repository (Marvisak/VIctory), a child module so they share
+/// the emitter's state.
+#[path = "official.rs"]
+mod official;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -310,6 +315,7 @@ struct Lower<'a> {
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
+    mode16: official::Mode16,
     /// DXIL block each IR block ends in (guarded stores split blocks).
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
@@ -1428,6 +1434,7 @@ impl<'a> Lower<'a> {
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
+            mode16: official::Mode16::new(p),
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
@@ -2312,6 +2319,7 @@ impl<'a> Lower<'a> {
                 self.lds_meeting();
             }
             self.lds_last = None;
+            self.mode16.enter(b);
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 if self.twin.is_some() {
@@ -2319,6 +2327,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.inst(b, i)?;
                 }
+                self.mode16.after(&p.blocks[b].insts[i]);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         if self.twin.is_some() {
@@ -4328,13 +4337,8 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let mut f = f;
-        match v.omod {
-            0 => {}
-            k => {
-                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
-                let c = self.s.m.f32(factor.to_bits());
-                f = self.s.m.bin(self.cur, Bin::Mul, f, c);
-            }
+        if v.omod != 0 {
+            f = self.omod(f, v.omod);
         }
         if v.clamp {
             f = self.unary(7, f);

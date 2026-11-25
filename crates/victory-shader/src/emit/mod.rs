@@ -116,6 +116,8 @@ mod own_bits;
 mod quad_tests;
 mod rect;
 mod sampler;
+#[cfg(all(test, windows))]
+mod semantics_tests;
 mod shader;
 mod split;
 mod threading;

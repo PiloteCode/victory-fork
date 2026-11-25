@@ -563,11 +563,7 @@ impl Lower<'_> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    let lod = self.cube_level(texels, has_cl.then_some(clamp));
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

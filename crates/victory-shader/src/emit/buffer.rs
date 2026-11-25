@@ -17,7 +17,13 @@ impl Lower<'_> {
     // driver does 1 ULP off the hardware's correctly rounded conversion for
     // some values; correct it with an integer check if a title compares
     // converted values exactly.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    pub(super) fn format_load(
+        &mut self,
+        h: V,
+        off: V,
+        format: u8,
+        channels: u32,
+    ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
@@ -79,6 +85,7 @@ impl Lower<'_> {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
                     let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
                     let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                    let q = self.norm_exact(q, field, w, false);
                     float(self, q)
                 }
                 Numeric::Snorm => {
@@ -88,6 +95,7 @@ impl Lower<'_> {
                     let q = self.s.m.bin(c, Bin::SDiv, f, max);
                     let lo = self.s.m.f32((-1.0f32).to_bits());
                     let q = self.binary(35, q, lo);
+                    let q = self.norm_exact(q, s, w, true);
                     float(self, q)
                 }
                 Numeric::Uscaled => {
@@ -185,7 +193,7 @@ impl Lower<'_> {
             _ => None,
         };
         // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -516,7 +524,11 @@ impl Lower<'_> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            for (k, x) in self
+                .format_load_d16(h, off, f, count, d16)?
+                .into_iter()
+                .enumerate()
+            {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
