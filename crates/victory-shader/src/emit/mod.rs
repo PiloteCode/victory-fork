@@ -88,6 +88,8 @@ mod descriptor_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+#[cfg(all(test, windows))]
+mod loop_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
@@ -118,7 +120,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    LAUNCH_SPACE, mesh_payload_bytes, MEMORY_FAULTS, MEMORY_NOTES, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    LAUNCH_SPACE, LOOP_NOTE_DWORDS, LOOP_NOTES, mesh_payload_bytes, MEMORY_FAULTS, MEMORY_NOTES,
+    MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_LOOPS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS, USER_MEMORY_BASE,
     USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
@@ -162,6 +165,21 @@ pub fn loop_limits() -> LoopLimits {
         } else {
             DEFAULT_LOOP_LIMITS
         }
+    })
+}
+
+/// Whether translated loops count the lanes that reach their iteration
+/// limit ([`SLOT_LOOPS`]): with the `diagnostics` feature,
+/// `VICTORY_LOOP_NOTES=1`. Each lane that reaches a limit adds one to its
+/// loop's record (a helper lane of a pixel shader writes nothing); the host
+/// logs the records by program. It adds a root UAV to every program with a
+/// loop, so it is off unless asked for. Part of the translation: the shader
+/// cache keys on it (`victory-gpu`'s does).
+pub fn loop_notes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_LOOP_NOTES").is_ok_and(|v| v.trim() == "1")
     })
 }
 
@@ -239,6 +257,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     for limit in [limits.pixel, limits.vertex, limits.compute, limits.trace] {
         out.extend_from_slice(&limit.to_le_bytes());
     }
+    out.push(u8::from(loop_notes()));
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(u8::from(wave_pairs_on()));
