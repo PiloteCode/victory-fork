@@ -2386,6 +2386,38 @@ impl State {
             None => unsafe { list.list.Dispatch(x, y, z) },
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list, p);
+    }
+
+    /// After a dispatch of `p`: its output replaced by the constant
+    /// indirect light if it is the program that resolves the probes and
+    /// `VICTORY_AMBIENT` asks for it (`crate::ambient`). The pass binds a
+    /// heap, root signature and pipeline of its own: the next draw or
+    /// dispatch binds the title's again.
+    fn ambient(&mut self, list: &HostList, p: &HostPipeline) {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return;
+        };
+        let (slot, dword) = crate::ambient::place();
+        let found = stage.translated().used.iter().find(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, dword)
+        });
+        let light = found.and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+            Some(Root::Table(table)) => match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                Some(View::Unordered(r, ..)) if r != 0 => Some(r),
+                _ => None,
+            },
+            _ => None,
+        });
+        let Some(light) = light else {
+            once!(slot, dword, "no ambient light: the program has no image at that place of its tables");
+            return;
+        };
+        if crate::ambient::replace(list, light as This) {
+            self.host_heaps = [usize::MAX; 2];
+            self.host_roots = [0; 2];
+            self.host_pipeline = 0;
+        }
     }
 
     /// A dispatch by thread counts (`DispatchX` with the console's
@@ -3562,6 +3594,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.ambient(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
