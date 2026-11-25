@@ -3723,6 +3723,24 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether, with [`relay`], the thread that submits leaves the landed
+/// flights' lists to the thread that settles ([`late_helper`], woken by
+/// every landing), and does not reset them itself after each submission
+/// sent ahead (`VICTORY_LAND_BESIDE=1`; off by default: whichever of the
+/// two comes first, as before).
+///
+/// Why: resetting lists is 9 to 45 ms a frame in wave 3's gameplay (the
+/// copy statistics' "lists reset in"), the title's own resets and these
+/// together; the share of these on the thread that submits is time the
+/// frame waits for. The same lists are reset and kept, by the other
+/// thread, a moment later: until then the title's next lists may find
+/// fewer kept ones and make new ones (the copy statistics' "host lists
+/// made" says if they do).
+fn land_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_BESIDE").is_some_and(|v| v == "1"))
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -5904,7 +5922,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::WAITS, &mut part);
         drop(submitted);
-        land();
+        // With the relay the thread that settles is woken for every landing
+        // and resets the landed lists itself ([`land_beside`]).
+        if !(relay() && land_beside()) {
+            land();
+        }
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::AFTER, &mut part);
     }
