@@ -1245,6 +1245,64 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// Diagnostics, for `this`, a texture the title fills that is read through
+/// a view and that [`alias_of`] found no texture of its shape for: when its
+/// memory meets the memory of a texture the host writes (a target, depth
+/// or unordered access texture), logs both once. What such a view shows
+/// comes from title memory, which does not hold what the host wrote there:
+/// the frames of the opening cutscene that mix two moments, in rectangles
+/// (2026-11-25), may be read this way.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_unaliased(this: This) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<usize>>> = std::sync::Mutex::new(None);
+    if this.is_null() {
+        return;
+    }
+    let r = resource(this);
+    if !r.host.placed.load(std::sync::atomic::Ordering::Relaxed) || !fills(&r.desc) {
+        return;
+    }
+    let Some(size) = footprint(&r.desc).map(|f| f.size) else {
+        return;
+    };
+    let (start, end) = (r.data() as u64, r.data() as u64 + size);
+    let hit = {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        // The targets that begin before this one ends, nearest first.
+        targets.range(..end).rev().take(256).find_map(|(&at, &other)| {
+            let o = resource(other as This);
+            let len = footprint(&o.desc).map_or(0, |f| f.size);
+            (at + len > start).then_some((at, len, other))
+        })
+    };
+    let Some((at, len, other)) = hit else {
+        return;
+    };
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        if seen.len() >= 256 || !seen.insert(this as usize) {
+            return;
+        }
+    }
+    let o = resource(other as This);
+    let shape = |d: &ResourceDesc| {
+        format!(
+            "{}x{}x{} levels {} format {} flags {:#x} dim {}",
+            d.width, d.height, d.depth_or_array_size, d.mip_levels, d.format, d.flags, d.dimension
+        )
+    };
+    tracing::warn!(
+        texture = ?this,
+        at = format_args!("{start:#x}+{size:#x}"),
+        shape = %shape(&r.desc),
+        written = ?other,
+        written_at = format_args!("{at:#x}+{len:#x}"),
+        written_shape = %shape(&o.desc),
+        "a view read from title memory meets a texture the host writes, of another shape: what the host wrote is not what it shows"
+    );
+}
+
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.

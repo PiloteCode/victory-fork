@@ -738,8 +738,10 @@ pub(crate) struct HostList {
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// grown to the largest indirect execution recorded on the list, and
+    /// whether the list leaves it in the indirect argument state where it
+    /// stands now (`scratch_read`), rather than in the common state.
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4406,6 +4408,20 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        // The scratch buffer of indirect arguments ends the list in the
+        // common state, where the next list that uses it takes it from.
+        if let Some((scratch, _, read)) = &mut *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner())
+            && std::mem::take(read)
+        {
+            // SAFETY: an open list and a live buffer in that state.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    scratch,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )])
+            };
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -4430,6 +4446,11 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        // Whatever was recorded since: a list that ran was closed, which
+        // left the scratch buffer of indirect arguments in the common state.
+        if let Some((_, _, read)) = &mut *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()) {
+            *read = false;
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5015,27 +5036,53 @@ impl HostList {
     /// clamped indirect arguments, reused across executions and resets of the
     /// list. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    /// Also whether the buffer stands in the indirect argument state, where
+    /// the list's last indirect execution left it ([`HostList::scratch_read`]),
+    /// rather than in the common state.
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, bool)> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        if let Some((buffer, cap, read)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            return Some((buffer.clone(), *read));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, false));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        // The old one is read by nothing recorded after this, whatever its
+        // state.
+        if let Some((old_buf, _, _)) = old {
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, false))
+    }
+
+    /// An indirect execution read its arguments from the scratch buffer,
+    /// which stays in the indirect argument state: the draws that follow
+    /// read it there with no change of state, the next pass that bounds
+    /// arguments into it changes it from there, and [`HostList::close`]
+    /// gives it back to the common state.
+    ///
+    /// Each change of state between two indirect executions stops the card
+    /// until everything before it is done. With one or two of them around
+    /// each of the title's 5,000 one-record executions a frame they cost
+    /// more than the draws: on an RTX 5090, 5,000 small dispatches each
+    /// behind its own bounding pass and changes of state ran in 20-50 ms,
+    /// in 0.6-1.3 ms with one bounding pass and two changes per 64 of them
+    /// (2026-11-25).
+    pub(crate) fn scratch_read(&self, scratch: &ID3D12Resource) {
+        if let Some((current, _, read)) = &mut *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner())
+            && current.as_raw() == scratch.as_raw()
+        {
+            *read = true;
+        }
     }
 
     /// Keeps `object` alive until the list is reset.

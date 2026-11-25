@@ -251,8 +251,14 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let (c, budget, (dst, read)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, count, spec, false).then_some(dst)
+}
+
+/// The state the scratch buffer stands in: indirect arguments where an
+/// indirect execution left it ([`done`]), else common.
+fn scratch_state(read: bool) -> D3D12_RESOURCE_STATES {
+    if read { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON }
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -271,10 +277,13 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let (c, budget, (dst, read)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    record_clamp_as(c, &list.list, &dst, scratch_state(read), budget, src, None, spec, true).then_some(dst)
 }
 
+/// [`record_clamp_as`] of records not clamped ahead, into a scratch buffer
+/// in the common state.
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -284,16 +293,17 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, D3D12_RESOURCE_STATE_COMMON, budget, src, count, spec, false)
 }
 
-/// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]).
+/// The clamp into `dst`, which stands in state `from`; `ahead`: the
+/// records are a window clamped ahead of their draws ([`bound_ahead`]).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
+    from: D3D12_RESOURCE_STATES,
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -347,7 +357,9 @@ fn record_clamp_as(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // transitions `from -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT` (`from`:
+    // common, or indirect arguments where the last command read it, which
+    // the change to unordered access also orders this pass's writes after).
     // The two waits for every earlier shader write ([`waits`]).
     // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the
     // waits out whatever [`waits`] says (the state changes stay).
@@ -359,11 +371,7 @@ fn record_clamp_as(
     let waits = waits();
     let first = [
         uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        transition(dst, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
     let second = [
         uav_barrier(),
@@ -411,11 +419,17 @@ fn waits() -> bool {
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
+/// the scratch buffer stays in the indirect argument state, with no change
+/// of state between this command and the next (`HostList::scratch_read`).
+/// It went back to the common state here, a change of state after each of
+/// the title's 5,000 one-record commands a frame, each of which stops the
+/// card until everything before it is done.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
+    list.scratch_read(scratch);
 }
 
+/// Returns the scratch buffer to the common state (the tests' lists).
+#[cfg(test)]
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {
@@ -1018,6 +1032,7 @@ void main() {
                 &warp.clamp,
                 &warp.list,
                 &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
                 budget_gpu,
                 (&src_buf, 0),
                 None,

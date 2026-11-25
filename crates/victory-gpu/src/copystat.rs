@@ -127,6 +127,18 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Indirect commands by how their records were bounded: read from a
+    /// window clamped before (no pass of ours), the first of a window (one
+    /// record: the step is not known yet), a window grown, and those no
+    /// window can take: dispatches, a count buffer, more than one record,
+    /// shaders that store to buffers.
+    IndirectWindowHit,
+    IndirectWindowFirst,
+    IndirectWindowGrown,
+    IndirectNotWindowedDispatch,
+    IndirectNotWindowedCount,
+    IndirectNotWindowedMany,
+    IndirectNotWindowedStores,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1241,6 +1253,18 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    tracing::info!(
+        "  indirect commands per frame: {:.0} read from a window bounded before, {:.0} first of a window, {:.0} \
+         grew a window; no window: {:.0} dispatches, {:.0} with a count buffer, {:.0} of several records, \
+         {:.0} whose shaders store",
+        c[C::IndirectWindowHit as usize],
+        c[C::IndirectWindowFirst as usize],
+        c[C::IndirectWindowGrown as usize],
+        c[C::IndirectNotWindowedDispatch as usize],
+        c[C::IndirectNotWindowedCount as usize],
+        c[C::IndirectNotWindowedMany as usize],
+        c[C::IndirectNotWindowedStores as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

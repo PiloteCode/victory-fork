@@ -2370,6 +2370,30 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let why = if !windows() {
+                None
+            } else if hit.is_some() {
+                Some(C::IndirectWindowHit)
+            } else if kind == DISPATCH {
+                Some(C::IndirectNotWindowedDispatch)
+            } else if count.is_some() {
+                Some(C::IndirectNotWindowedCount)
+            } else if max != 1 {
+                Some(C::IndirectNotWindowedMany)
+            } else if !windowed {
+                Some(C::IndirectNotWindowedStores)
+            } else if self.window.as_ref().is_some_and(|w| same(w)) {
+                Some(C::IndirectWindowGrown)
+            } else {
+                Some(C::IndirectWindowFirst)
+            };
+            if let Some(why) = why {
+                add(why, 1);
+            }
+        }
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -2580,6 +2604,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
+                #[cfg(feature = "diagnostics")]
+                crate::resource::note_unaliased(*resource as This);
                 crate::texture::upload(list, *resource as This, t);
             }
             // A depth texture shaders also write: what they wrote, first.
