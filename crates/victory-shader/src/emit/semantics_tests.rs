@@ -555,6 +555,12 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// Runs probes on the hardware adapter and WARP; returns the failures
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
+    check_each(probes).into_iter().map(|(f, _)| f).collect()
+}
+
+/// [`check`]'s failures, each with whether only the card is off: WARP gives the model's
+/// results and the hardware adapter does not (a driver's rewrite of what the program says).
+fn check_each(probes: &[Probe]) -> Vec<(String, bool)> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
         .into_iter()
@@ -570,7 +576,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{what}: not lowered: {e}");
-                failures.push(format!("{what}: not lowered: {e}"));
+                failures.push((format!("{what}: not lowered: {e}"), false));
                 continue;
             }
         };
@@ -578,7 +584,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
             && let Err(e) = val.validate(&mut shader.dxil.clone())
         {
             eprintln!("{what}: invalid DXIL: {e}");
-            failures.push(format!("{what}: invalid DXIL: {e}"));
+            failures.push((format!("{what}: invalid DXIL: {e}"), false));
             continue;
         }
         let mut results: Vec<(&str, Vec<[u32; 4]>)> = Vec::new();
@@ -588,7 +594,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
                 Err(e) => {
                     // A removed device takes the rest with it: make a new one.
                     eprintln!("{what}: {label}: {e}");
-                    failures.push(format!("{what}: {label}: {e}"));
+                    failures.push((format!("{what}: {label}: {e}"), false));
                     *h = Host::new(*warp).expect("the device again");
                 }
             }
@@ -658,7 +664,10 @@ fn check(probes: &[Probe]) -> Vec<String> {
             }
         }
         if wrong.iter().any(|&n| n > 0) || apart > 0 {
-            failures.push(format!("{summary}\n{}", bad.join("\n")));
+            let card_only = p.model.is_some()
+                && results.iter().any(|(l, _)| *l == "hardware")
+                && results.iter().zip(&wrong).all(|((l, _), &n)| *l == "hardware" || n == 0);
+            failures.push((format!("{summary}\n{}", bad.join("\n")), card_only));
         }
     }
     failures
@@ -1311,10 +1320,15 @@ fn a_legacy_square_is_the_consoles() {
 
 /// The legacy multiply's shorter forms (`legacy.rs`): the product alone where every zero
 /// meets a finite value of the right sign (`VICTORY_LEGACY_PLAIN`), and the forms that add
-/// +0 (`VICTORY_LEGACY_ZERO`): `(x + 0) * k`, `(0 - x) * -k` and `x * y + 0`. Each against
-/// the console's results over zeros, infinities, NaNs, denormals, products that underflow and
-/// overflow, in `v_mul_legacy_f32`, `v_mac_legacy_f32` and `v_mad_legacy_f32`, with the
-/// switches on (and checked to change the program) and with both off.
+/// +0 (`VICTORY_LEGACY_ZERO`): `(x + 0) * k` and `x * y + 0`. Each against the console's
+/// results over zeros, infinities, NaNs, denormals, products that underflow and overflow, in
+/// `v_mul_legacy_f32`, `v_mac_legacy_f32` and `v_mad_legacy_f32`, with the switches on (and
+/// checked to change the program where a form applies) and with both off.
+///
+/// The forms of a switch that is off by default (`VICTORY_LEGACY_ZERO`) are run on their own:
+/// where only the card is off (WARP gives the console's results), the mismatch is reported on
+/// stderr (and in `VICTORY_SEMANTICS_REPORT`), not failed, as a measurement of the driver. A
+/// mismatch of the default forms, or WARP's, fails.
 #[test]
 fn legacy_short_forms_are_the_consoles() {
     use super::lower::legacy::{TEST_PLAIN, TEST_SHORT, TEST_ZERO};
@@ -1330,16 +1344,25 @@ fn legacy_short_forms_are_the_consoles() {
     let mut constants: Vec<(Vec<u32>, u32)> = inline.iter().map(|&(c, k)| (vec![u32::from(c)], k)).collect();
     constants.extend(literal.iter().map(|&k| (vec![255, k], k)));
     let mut probes = Vec::new();
+    // The probes no short form applies to (a negative constant times any value: `legacy.rs`).
+    let mut long = Vec::new();
     for (src, k) in &constants {
         let k = *k;
         let lit: Vec<u32> = src.get(1).copied().into_iter().collect();
         // v_mul_legacy_f32 v5, k, v1
         let mut body = vec![vop2(0x07, 5, src[0] as u16, 1)];
         body.extend(&lit);
+        let negative = k >> 31 != 0;
+        if negative {
+            long.push(body.clone());
+        }
         probes.push(probe(body, unary(F32_EDGES), F32, move |i| vec![mul_legacy(k, i[0])]));
         // v_mov_b32 v5, v3; v_mac_legacy_f32 v5, k, v1
         let mut body = vec![vop1(0x01, 5, v(3)), vop2(0x06, 5, src[0] as u16, 1)];
         body.extend(&lit);
+        if negative {
+            long.push(body.clone());
+        }
         let abc = triples(F32_EDGES, &[0], F32_THIRD);
         probes.push(probe(body, abc, F32, move |i| vec![mad_legacy(k, i[0], i[2])]));
         // v_cvt_f32_u32 v6, v1; v_mul_legacy_f32 v5, k, v6 (a converted integer)
@@ -1380,25 +1403,47 @@ fn legacy_short_forms_are_the_consoles() {
         let x = med3(i[0], 0, 0x3F80_0000);
         vec![mul_legacy(mul_legacy(x, x), mad(x, 0xC000_0000, 0x4080_0000))]
     }));
-    // Each probe's program changes with the switches (a short form is taken), and gives the
-    // console's results with them and without.
+    // Each probe's program changes with the switches where a short form applies, and gives
+    // the console's results with them and without.
     let before = TEST_SHORT.get();
-    set(true, true);
+    let lowered = |p: &Probe, plain: bool, zero: bool| {
+        set(plain, zero);
+        lower_program(&program(&p.body, false)).expect("lowered").dxil
+    };
+    let mut zero_form = Vec::new();
     for p in &probes {
-        let on = lower_program(&program(&p.body, false)).expect("lowered").dxil;
-        set(false, false);
-        let off = lower_program(&program(&p.body, false)).expect("lowered").dxil;
-        set(true, true);
-        assert_ne!(on, off, "{}: a short form", disassembly(&p.body, false));
+        let (on, default, off) = (lowered(p, true, true), lowered(p, true, false), lowered(p, false, false));
+        let what = disassembly(&p.body, false);
+        if long.contains(&p.body) {
+            assert_eq!(on, off, "{what}: no short form");
+        } else {
+            assert_ne!(on, off, "{what}: a short form");
+        }
+        zero_form.push(on != default);
     }
+    TEST_PLAIN.set(None);
+    TEST_ZERO.set(None);
     assert!(TEST_SHORT.get() > before);
-    for (plain, zero) in [(true, false), (true, true), (false, false)] {
+    assert!(zero_form.contains(&true), "VICTORY_LEGACY_ZERO changes some probe");
+    for (plain, zero) in [(true, false), (false, false)] {
         set(plain, zero);
         let failures = check(&probes);
         TEST_PLAIN.set(None);
         TEST_ZERO.set(None);
         assert_clean(failures);
     }
+    // VICTORY_LEGACY_ZERO's forms (off by default): the card's mismatches reported only.
+    let zero_forms: Vec<Probe> =
+        probes.into_iter().zip(zero_form).filter_map(|(p, z)| z.then_some(p)).collect();
+    set(true, true);
+    let failures = check_each(&zero_forms);
+    TEST_PLAIN.set(None);
+    TEST_ZERO.set(None);
+    let (card, other): (Vec<_>, Vec<_>) = failures.into_iter().partition(|(_, card)| *card);
+    for (f, _) in &card {
+        eprintln!("VICTORY_LEGACY_ZERO (off by default) differs from the console on the card only:\n{f}");
+    }
+    assert_clean(other.into_iter().map(|(f, _)| f).collect());
 }
 
 /// Minimum, maximum, median, and `v_max_f32 x, x clamp` (the title's
