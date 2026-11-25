@@ -178,6 +178,12 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the title address of the buffer or ray-tracing structure
+    /// view at each title slot, for shaders that take it out of a
+    /// descriptor they pick by an index they compute
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload buffer of two
+    /// dwords a slot, its GPU address and its mapping.
+    addresses: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1117,17 +1123,6 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
-/// What else the table of strides says of a typed buffer view of an integer
-/// format (`victory_shader::emit::VIEW_INTEGER`); 0 for any other view.
-fn view_kind(view: &View) -> u32 {
-    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
-    match view_elements(view) {
-        Some((0, false, 3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62)) => VIEW_INTEGER,
-        Some((0, false, 4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64)) => VIEW_INTEGER | VIEW_SIGNED,
-        _ => 0,
-    }
-}
-
 /// A buffer view's structure stride, whether it is raw, and its format;
 /// `None` if `view` is not a buffer view.
 fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
@@ -1342,13 +1337,19 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 const RAW_TWINS: u32 = 1 << 21;
 
 /// Whether view heaps keep a raw twin of every buffer view of the title's
-/// slots, which shaders read that pick buffers by an index they compute
-/// (`victory_shader::emit::raw_views` says why; `VICTORY_RAW_VIEWS=0`: they
-/// read the title's slots themselves, as before). Needs a host that takes
-/// heaps of 2^22 views.
+/// slots, for shaders that pick buffers by an index they compute. Not with
+/// this tree's translator: its shaders read the title's slots themselves,
+/// with the bytes per element from the table of strides
+/// (`victory_shader::emit::SLOT_STRIDES`), and read no twin. (The twins
+/// needed a host that takes heaps of 2^22 views, which NVIDIA's does not.)
 fn raw_twins() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEWS").is_none_or(|v| v != "0"))
+    false
+}
+
+/// Where the raw twins of the title's slots start in view heaps (0: there
+/// are none, [`raw_twins`]).
+fn raw_views() -> u32 {
+    0
 }
 
 /// Picks, once, the null slot at the end of every host view heap and tells
@@ -1382,9 +1383,6 @@ pub(crate) fn probe_view_limit() {
             made.is_ok()
         };
         let twins = raw_twins() && fits(2 * RAW_TWINS);
-        if twins {
-            victory_shader::emit::set_raw_views(RAW_TWINS);
-        }
         // (The twins lie past the null slot.)
         let views = if twins {
             RAW_TWINS
@@ -1466,7 +1464,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
+        let raw = if sampler { 0 } else { raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
@@ -1523,6 +1521,19 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let addresses = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "view addresses by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -1546,6 +1557,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            addresses,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::default(),
@@ -1720,6 +1732,12 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The table of view addresses by title slot (view heaps): its GPU
+    /// address and its buffer, for a list to hold.
+    pub(crate) fn addresses(&self) -> Option<(u64, &ID3D12Resource)> {
+        self.addresses.as_ref().map(|a| (a.1, &a.0))
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -2503,13 +2521,27 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
-        let kind = view.map_or(0, view_kind);
+        // (The stride alone: our translator's picked typed buffers read no
+        // format bits beside it.)
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+        }
+        if let Some((_, _, data)) = &self.addresses
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let address = view.and_then(view_address).unwrap_or(0);
+            // SAFETY: inside the mapping (two dwords a slot); a shader that
+            // reads while we write may see half of the new address, as a
+            // console shader may read a descriptor the CPU is writing.
+            unsafe {
+                let at = (*data as *mut u32).add(2 * index as usize);
+                at.write_volatile(address as u32);
+                at.add(1).write_volatile((address >> 32) as u32);
+            }
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -4753,20 +4785,16 @@ mod tests {
         assert_eq!(ranges.len(), 3);
     }
 
-    /// Typed buffer views of integer formats are marked in the table of
-    /// strides; float, normalized, raw and structured ones are not.
+    /// The table of strides holds a buffer view's bytes per element: a typed
+    /// view's format's, a structured view's stride, 1 for a raw view.
     #[test]
-    fn integer_typed_buffer_views_are_marked_in_the_table_of_strides() {
-        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    fn the_table_of_strides_holds_bytes_per_element() {
         // Format, dimension (buffer), first element, count, stride, counter, flags.
         let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
-        assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
-        assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
-        assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
-        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
-        assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
-        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
-        assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
+        assert_eq!(view_stride(&uav(12, 0, 0)), Some(8), "R16G16B16A16_UINT");
+        assert_eq!(view_stride(&uav(59, 0, 0)), Some(2), "R16_SINT");
+        assert_eq!(view_stride(&uav(39, 0, 1)), Some(1), "raw");
+        assert_eq!(view_stride(&uav(0, 16, 0)), Some(16), "structured");
     }
 
     /// What may stand for a texture that is not there yet: one of its kind in

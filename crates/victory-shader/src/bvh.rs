@@ -32,9 +32,10 @@
 //! Four child pointers at bytes 0-15 (`0xffff_ffff`: none), then four
 //! boxes, each minimum x y z, maximum x y z: 16-bit floats from byte 16
 //! (12 bytes a box), or 32-bit floats from byte 16 (24 bytes a box; bytes
-//! 112-127 are not read). The result is the pointers of the children whose
-//! box the ray enters before its extent, nearest entry first when the
-//! descriptor enables box sorting (bit 63), and `0xffff_ffff` for the rest.
+//! 112-127 are not read). The result is the pointers of the children that
+//! are there and whose box the ray enters before its extent, nearest entry
+//! first when the descriptor enables box sorting (bit 63), and
+//! `0xffff_ffff` for the rest.
 //!
 //! # Triangle nodes
 //!
@@ -64,9 +65,10 @@
 //! JCGT 2013), and agree with what the title's own structure
 //! builder writes and its trace programs read. Not known from either: how
 //! the console rounds, which of two boxes entered at the same distance it
-//! returns first, and what it returns for a ray exactly through an edge
-//! (here: a hit in both triangles of the edge) or for kinds 6 and 7 (here:
-//! a triangle miss; the title's programs do not read it).
+//! returns first, what it returns for a ray exactly through an edge (here:
+//! a hit in both triangles of the edge), for a child that is not there
+//! whose box the ray enters (here: a miss) or for kinds 6 and 7 (here: a
+//! triangle miss; the title's programs do not read it).
 
 /// The result dword for a box the ray misses, or a child that is not there.
 pub const NONE: u32 = 0xffff_ffff;
@@ -127,6 +129,18 @@ pub fn intersect(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4
         4 => boxes(&children(words), &boxes16(words), ray, sort),
         5 => boxes(&children(words), &boxes32(words), ray, sort),
         k @ 0..=3 => triangle(&triangle_vertices(words, k), ray).map(f32::to_bits),
+        _ => MISS.map(f32::to_bits),
+    }
+}
+
+/// What the instruction returns for a node of this `kind` when nothing
+/// the node holds is in the ray's way: no child for a box node (kinds 4
+/// and 5), [`MISS`] for the others. What [`intersect`] returns for a ray
+/// that misses every box or the triangle, without the node's words; the
+/// translation's `VICTORY_RT_MISS` returns it for every node.
+pub fn nothing_in_the_way(kind: u32) -> [u32; 4] {
+    match kind & 7 {
+        4 | 5 => [NONE; 4],
         _ => MISS.map(f32::to_bits),
     }
 }
@@ -196,11 +210,10 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off. A child that is not
-        // there may have inverted infinite bounds, which every ray enters at
-        // minus infinity: it would be first of the sorted children and end
-        // the walk before them (DexNom/VIctory bc3cd4b0).
-        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        // A child that is not there is a miss, whatever bytes its box
+        // holds; a box whose minimum x is NaN is switched off.
+        let there = children[n] != NONE && !b[0].is_nan();
+        if there && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -289,17 +302,6 @@ pub fn half_to_f32(h: u16) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    /// An empty slot's inverted infinite bounds do not come before the
-    /// children a ray enters (after DexNom/VIctory bc3cd4b0).
-    #[test]
-    fn an_empty_slot_is_never_entered() {
-        let inside = |x: f32| [x - 1.0, -1.0, -1.0, x + 1.0, 1.0, 1.0];
-        let (up, down) = (f32::INFINITY, f32::NEG_INFINITY);
-        let bounds = [inside(30.0), [up, up, up, down, down, down], inside(10.0), [up, up, up, down, down, down]];
-        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
-        assert_eq!(boxes(&[8, NONE, 16, NONE], &bounds, &ray, true), [16, 8, NONE, NONE]);
-    }
 
     /// The smallest 16-bit float not below `x` (`up`) or not above it.
     pub(crate) fn f32_to_half(x: f32, up: bool) -> u16 {
@@ -487,8 +489,43 @@ pub(crate) mod tests {
             [UNIT, UNIT, [f32::NAN, -1.0, -1.0, 1.0, 1.0, 1.0], OFF],
         );
         let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
-        // Child 1 is hit but is not there: its pointer is what "none" is.
+        // Child 1's box is entered, but child 1 is not there: a miss.
         assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
+    }
+
+    /// A node whose children that are not there have boxes the ray
+    /// enters: the first before the one child's, the other two at the
+    /// ray's origin. (The card tests run it too.)
+    pub(crate) const MISSING_FIRST: ([u32; 4], [[f32; 6]; 4]) = (
+        [NONE, 8, NONE, NONE],
+        [
+            [-1.0, -1.0, 1.0, 1.0, 1.0, 2.0],
+            [-1.0, -1.0, 3.0, 1.0, 1.0, 4.0],
+            [0.0; 6],
+            [0.0; 6],
+        ],
+    );
+
+    /// The ray of [`MISSING_FIRST`]: from the origin along +z.
+    pub(crate) fn missing_first() -> Ray {
+        Ray::new([0.0; 3], [0.0, 0.0, 1.0], 10.0)
+    }
+
+    #[test]
+    fn a_child_that_is_not_there_is_a_miss_whatever_its_box() {
+        let (children, boxes) = MISSING_FIRST;
+        let ray = missing_first();
+        for (node, kind) in [(box32(children, boxes), 5), (box16(children, boxes), 4)] {
+            // Sorted: the child that is there (entered at 3), then the
+            // three that are not, their boxes entered at 0 and 1.
+            assert_eq!(
+                intersect(&node, kind, &ray, true),
+                [8, NONE, NONE, NONE],
+                "kind {kind}"
+            );
+            // Not sorted: child order.
+            assert_eq!(intersect(&node, kind, &ray, false), children, "kind {kind}");
+        }
     }
 
     #[test]
@@ -661,6 +698,39 @@ pub(crate) mod tests {
         // Triangle 1 = node vertices (1, 3, 2) = (b, d, c) as vertices 0, 1, 2.
         let got = triangle_vertices(&node, 1);
         assert_eq!(got, [b, d, c]);
+    }
+
+    #[test]
+    fn nothing_in_the_way_is_what_a_ray_that_misses_the_node_gets() {
+        // Boxes along +x, a ray along +y: it misses all four, in both
+        // widths, sorted or not.
+        let children = [0x105, 0x20c, 0x304, 0x400];
+        let boxes = [
+            moved(UNIT, [30.0, 0.0, 0.0]),
+            moved(UNIT, [10.0, 0.0, 0.0]),
+            moved(UNIT, [10.0, 5.0, 0.0]),
+            moved(UNIT, [20.0, 0.0, 0.0]),
+        ];
+        let ray = Ray::new([0.0, 20.0, 0.0], [0.0, 1.0, 0.0], 1000.0);
+        for (node, kind) in [(box32(children, boxes), 5), (box16(children, boxes), 4)] {
+            for sort in [true, false] {
+                assert_eq!(intersect(&node, kind, &ray, sort), nothing_in_the_way(kind));
+            }
+        }
+        // A triangle behind the ray, every triangle slot, and the kinds
+        // the instruction does not read.
+        let node = triangles(&TRIANGLE, 9);
+        let away = Ray::new([0.0; 3], [0.0, 0.0, -1.0], 100.0);
+        for k in 0..8 {
+            if k == 4 || k == 5 {
+                continue;
+            }
+            assert_eq!(intersect(&node, k, &away, true), nothing_in_the_way(k), "kind {k}");
+        }
+        // A box result holds no child, so a traversal pushes nothing; a
+        // triangle result's distance is never below any extent.
+        assert!(nothing_in_the_way(4).iter().all(|&c| c == NONE));
+        assert_eq!(f32::from_bits(nothing_in_the_way(0)[0]), f32::INFINITY);
     }
 
     #[test]

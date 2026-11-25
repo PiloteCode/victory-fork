@@ -47,52 +47,32 @@ fn build() -> [u8; 32] {
     crate::descriptor::host::probe_view_limit();
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
-        let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-            tracing::warn!(
-                limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
-            );
+        let limits = victory_shader::emit::loop_limits();
+        if limits != victory_shader::emit::DEFAULT_LOOP_LIMITS {
+            tracing::warn!(?limits, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop elsewhere");
         }
         let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
-        bytes.extend_from_slice(&limit.to_le_bytes());
-        // Which group barriers wait is part of the translation too.
-        bytes.push(victory_shader::emit::group_sync());
-        // So are the switches that pick the form of a wave64 program:
-        // without them here a run with `VICTORY_WAVE_WIDE=0` was
-        // served the translations an earlier run of the same
-        // executable had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_HELPER_OWN",
-            "VICTORY_FIRSTLANE_OWN",
-            "VICTORY_FIRST_HALF",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_MESH_OUTPUT_STRICT",
-            "VICTORY_BVH_FENCES",
-            "VICTORY_BVH_BOUNDS",
-        ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
-        }
-        // And which clean-up passes ran over the translated code.
-        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // The translator's own fingerprint: its sources, the value of every
+        // `VICTORY_*` switch it reads (listed from its sources when it is
+        // built, so a new switch joins the key by itself), the host facts the
+        // device gave it (widest wave, view heap limit), the loop limits,
+        // barrier waits and clean-up passes.
+        bytes.extend_from_slice(&victory_shader::emit::translation_fingerprint());
         bytes
     });
     let mut hash = blake3::Hasher::new();
     hash.update(fixed);
-    for value in victory_shader::emit::host_settings() {
-        hash.update(&value.to_le_bytes());
-    }
     *hash.finalize().as_bytes()
+}
+
+/// Opens the host and reads the same adapter facts as the title does,
+/// before the offline warm-up (`victory translate --warm`) builds its keys.
+pub fn prepare_warm() -> Result<(), String> {
+    if crate::host::host().is_none() {
+        return Err("shader cache warm-up could not open the host D3D12 adapter".into());
+    }
+    crate::descriptor::host::probe_view_limit();
+    Ok(())
 }
 
 /// What tells one set of translations from another ([`build`]).
@@ -118,6 +98,23 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
+        None => translate(container),
+    }
+}
+
+/// The translation of a console compute program for dispatches by thread
+/// counts whose last groups are cut short
+/// (`victory_shader::emit::translate_thread_limited`), from the cache when
+/// there is one, under a key of its own.
+pub(crate) fn host_shader_thread_limited(container: &[u8]) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| victory_shader::emit::translate_thread_limited(c).map_err(|e| e.to_string());
+    match CACHE.get() {
+        Some(cache) => {
+            let mut key = blake3::Hasher::new();
+            key.update(&build());
+            key.update(b"thread counts\0");
+            cached(cache, key.finalize().as_bytes(), container, translate)
+        }
         None => translate(container),
     }
 }

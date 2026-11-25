@@ -69,7 +69,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -274,7 +274,7 @@ impl Memory {
             return None;
         }
         // SAFETY: an entry of the directory.
-        ((unsafe { self.entry(page).read() } & !MEMORY_READ_ONLY) as usize).checked_sub(1)
+        (unsafe { self.entry(page).read() } as usize).checked_sub(1)
     }
 
     /// Whether `page` can be given a place: in the directory, not turned down
@@ -842,9 +842,12 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
     asked
 }
 
-/// [`fill`] of a page stores by address do not reach.
+/// [`fill`] of a page stores by address do not reach. This tree's
+/// translator has no mark for such a page in the directory (its programs
+/// store wherever an entry points): the page is entered as any other, and
+/// what its copy is declared written as stays the caller's choice.
 fn close(entry: *mut u32, n: usize, offset: u64) {
-    fill(entry, n | MEMORY_READ_ONLY as usize, offset);
+    fill(entry, n, offset);
 }
 
 /// The offset first: a shader that sees the number sees it too.

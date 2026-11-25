@@ -352,6 +352,9 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// While a dispatch by thread counts whose last groups are cut short is
+    /// bound and run ([`State::dispatch`]): the counts.
+    limits: Option<[u32; 3]>,
 }
 
 impl Drop for State {
@@ -1200,7 +1203,9 @@ impl State {
     }
 
     /// A user-data dword the host computes for a translated shader
-    /// (`victory_shader::emit::USER_MEMORY_BASE`, `USER_VIEW_ADDRESS`).
+    /// (`victory_shader::emit::USER_MEMORY_BASE`, `USER_VIEW_ADDRESS`,
+    /// `USER_VIEW_BIAS`, `USER_GROUP_BASE`, `USER_THREAD_LIMIT`,
+    /// `USER_STRUCTURES`).
     fn host_word(
         &self,
         compute: bool,
@@ -1209,20 +1214,24 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_GROUP_BASE, USER_MEMORY_BASE, USER_STRUCTURES, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
-        // All of every group, unless the dispatch says otherwise.
-        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
-            return 0;
+        if kind == USER_STRUCTURES {
+            // (0: the program's node tests answer no hit)
+            return u32::from(crate::pipeline::structures_walked());
         }
-        if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
-            return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
-                Some(&Root::View(address)) => (address >> 32) as u32,
-                _ => 0,
-            };
+        if kind == USER_THREAD_LIMIT {
+            // (no counts: every thread of every group runs)
+            return self.limits.map_or(u32::MAX, |l| l[dword.min(2) as usize]);
+        }
+        // A dispatch starts at group 0; one split into several sets each
+        // part's first group itself (`dispatch`, `execute_indirect`).
+        if kind == USER_GROUP_BASE {
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1580,6 +1589,37 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the view heap's table of view addresses.
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|h| h.addresses());
+                        match table {
+                            Some((gpu, buffer)) => {
+                                // The list may outlive the title's heap
+                                // object, which owns the table.
+                                const ONCE: usize = usize::MAX - 0x5f;
+                                if list.first_use(ONCE) {
+                                    list.keep(buffer);
+                                }
+                                // SAFETY: an open list; the list holds the table.
+                                unsafe {
+                                    if compute {
+                                        l.SetComputeRootShaderResourceView(param, gpu);
+                                    } else {
+                                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                                    }
+                                }
+                            }
+                            None => once!("a shader takes view addresses from a view heap that is not set"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -1643,6 +1683,25 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                #[cfg(feature = "diagnostics")]
+                if slot == victory_shader::emit::SLOT_LOOPS {
+                    // Ours: where the program counts lanes that reached a
+                    // loop's limit (`crate::loop_notes`).
+                    let Some(gpu) = crate::loop_notes::address(&stage.shader) else {
+                        once!("loop notes without their buffer: the draw is dropped");
+                        return false;
+                    };
+                    // SAFETY: an open list; the buffer lives as long as the
+                    // process.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -2640,7 +2699,41 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        // Counted in threads: whole groups of them. Where the last group along
+        // a dimension is cut short, the program runs in its form for that
+        // (`crate::pipeline::thread_limited_pipeline`), told the counts
+        // (`victory_shader::emit::USER_THREAD_LIMIT`, [`State::host_word`]):
+        // the threads past them leave at once, as the console launches none
+        // of them. Whole groups if it has no such form, but for the structure
+        // builder, whose stages rebuild trees in place and run all or none.
+        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
+            .then(|| p.stages.first().and_then(|s| s.translated().threads))
+            .flatten();
+        let threads = [x, y, z];
+        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        let cut = size.is_some_and(|size| (0..3).any(|d| !threads[d].is_multiple_of(size[d].max(1))));
+        if size.is_some() && !crate::pipeline::is_builder(self.pipeline as This) {
+            once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
+        }
+        let p = if cut {
+            match crate::pipeline::thread_limited_pipeline(self.pipeline as This) {
+                Some(limited) => {
+                    self.limits = Some(threads);
+                    limited
+                }
+                None if crate::pipeline::is_builder(self.pipeline as This) => {
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    crate::pipeline::builder_rests("a stage dispatched by thread counts has no form that runs only those threads");
+                    return;
+                }
+                None => p,
+            }
+        } else {
+            p
+        };
+        let bound = self.bind(list, p, true);
+        self.limits = None;
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2656,25 +2749,26 @@ impl State {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
             self.list_dropped_roots([x, y, z]);
         }
-        // Counted in threads: whole groups of them, and the program is told
-        // how many of the last one run, where it asks (its `bind` set that to
-        // all of them).
-        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
-            .then(|| p.stages.first().and_then(|s| s.translated().threads))
-            .flatten();
-        let threads = [x, y, z];
-        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
-        if size.is_some() {
-            if !crate::pipeline::is_builder(self.pipeline as This) {
-                once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
+        match group_base(p).filter(|_| x > MOST_GROUPS) {
+            // More groups in x than one host dispatch runs, for a program
+            // that counts them from a base: run as several, each told its
+            // first group (the next bind sets the user data again).
+            Some((param, offset)) => {
+                let mut first = 0;
+                while first < x {
+                    let n = (x - first).min(MOST_GROUPS);
+                    // SAFETY: an open list with everything set; the root
+                    // parameter holds the program's user data.
+                    unsafe {
+                        list.list.SetComputeRoot32BitConstant(param, first, offset);
+                        list.list.Dispatch(n, y, z);
+                    }
+                    first += n;
+                }
             }
-            if let Some((param, word)) = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X) {
-                // SAFETY: an open list; the root signature has the word.
-                unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
-            }
+            // SAFETY: an open list with everything set.
+            None => unsafe { list.list.Dispatch(x, y, z) },
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -3774,10 +3868,19 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        // A program that counts its groups in x from a base the host gives
+        // it: each record is clamped into several, each setting its first
+        // group, so a record of more groups than one host dispatch runs is
+        // run whole (`crate::indirect::SPLIT_DISPATCH`).
+        let split = if kind == DISPATCH { group_base(p) } else { None };
+        let clamped = if split.is_some() { crate::indirect::SPLIT_DISPATCH } else { kind };
+        let signature = match split {
+            Some((param, offset)) => split_signature(&p.root, param, offset),
+            None => matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten(),
+        };
+        let Some(signature) = signature else {
             why("no host signature");
             return false;
         };
@@ -3788,7 +3891,7 @@ impl State {
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            self.batched(list, &args, arguments, clamped)
         } else {
             None
         };
@@ -3855,7 +3958,7 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (clamped, step, records))
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -3898,14 +4001,20 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            match split {
+                // Every split record runs (the clamp emptied those past the
+                // title's count); the next draw or dispatch sets the user
+                // data the records changed again, as each does.
+                Some(_) => list.list.ExecuteIndirect(&signature, max * crate::indirect::SPLIT, &bounded, at, None, 0),
+                None => list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                ),
+            }
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
@@ -3951,6 +4060,70 @@ fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
     let (param, _) = stage.user_data?;
     let word = stage.translated().host.user_data.iter().find(|u| u.root == RootType::Other(kind))?;
     Some((param, word.index))
+}
+
+/// The most groups one host dispatch runs in a dimension.
+const MOST_GROUPS: u32 = 65535;
+
+/// For a compute pipeline whose program counts its groups in x from a base
+/// the host gives it (`victory_shader::emit::USER_GROUP_BASE`): the root
+/// parameter of the program's user data and the dword in it that holds
+/// the base. None for programs that do not read one (those with a spilled
+/// user-data table, and those that never read their group in x), and for
+/// any other pipeline.
+fn group_base(p: &HostPipeline) -> Option<(u32, u32)> {
+    compute_word(p, victory_shader::emit::USER_GROUP_BASE)
+}
+
+/// The host command signature for a split dispatch's records
+/// (`crate::indirect::SPLIT_DISPATCH`): one dword of root constants, the
+/// group base at dword `offset` of root parameter `param` of `root`, then
+/// the dispatch. Made once per root signature and place. The root signature
+/// is kept with it: a signature is found by the root signature's address,
+/// and D3D12 does not say that a command signature holds its root
+/// signature, so a root signature released and another made at its address
+/// would otherwise find one made for the first.
+fn split_signature(root: &ID3D12RootSignature, param: u32, offset: u32) -> Option<ID3D12CommandSignature> {
+    type Made = Vec<((usize, u32, u32), ID3D12RootSignature, ID3D12CommandSignature)>;
+    static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, param, offset);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, s)) = made.iter().find(|(k, _, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let arguments = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: offset,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: crate::indirect::SPLIT_STRIDE,
+        NumArgumentDescs: arguments.len() as u32,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a description of two arguments; the root signature is live
+    // and is the one the dispatches run with.
+    let result = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, root, &mut signature) };
+    if let Err(e) = result {
+        once!(error = %e, param, offset, "host command signature for split dispatches refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, root.clone(), signature.clone()));
+    Some(signature)
 }
 
 #[cfg(test)]

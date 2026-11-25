@@ -51,6 +51,20 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// Opens the host adapter for the offline warm-up (`victory translate
+/// --warm`), so that its translations are keyed on what a run's are: the
+/// widest wave and the view heap's limit the device tells the translator.
+pub fn prepare_shader_warm() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prepare_warm()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("no host".into())
+    }
+}
+
 /// The fork's offline warm-up (`victory translate --warm`), by
 /// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {

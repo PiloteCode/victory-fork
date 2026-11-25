@@ -66,6 +66,17 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Its range of the loop notes (`crate::loop_notes`), given out on its
+    /// first draw.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) loop_slot: OnceLock<u32>,
+    /// Translated for dispatches by thread counts whose last groups are cut
+    /// short ([`Shader::thread_limited`]).
+    #[cfg(windows)]
+    thread_limited: bool,
+    /// The same container in that form, made on first need.
+    #[cfg(windows)]
+    limited_twin: OnceLock<Arc<Shader>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -118,6 +129,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                loop_slot: OnceLock::new(),
+                #[cfg(windows)]
+                thread_limited: false,
+                #[cfg(windows)]
+                limited_twin: OnceLock::new(),
             })
         })
         .clone()
@@ -147,7 +164,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container, self.thread_limited);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -169,7 +186,14 @@ impl Shader {
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        thread_counts = self.thread_limited,
                         "shader translated"
+                    ),
+                    Err(e) if self.thread_limited => tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        error = %e,
+                        "shader does not translate for dispatches by thread counts; their cut-short groups run whole"
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
@@ -182,6 +206,31 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// The same container translated for dispatches by thread counts whose
+    /// last groups are cut short (`victory_shader::emit::translate_thread_limited`):
+    /// the console's `DispatchX` with `USE_THREAD_DIMENSIONS` launches no
+    /// thread past the counts, and the host runs whole groups.
+    pub(crate) fn thread_limited(self: &Arc<Self>) -> Arc<Shader> {
+        if self.thread_limited {
+            return self.clone();
+        }
+        self.limited_twin
+            .get_or_init(|| {
+                Arc::new(Shader {
+                    stage: self.stage,
+                    hash: self.hash.clone(),
+                    container: self.container.clone(),
+                    ambient: self.ambient,
+                    translated: OnceLock::new(),
+                    #[cfg(feature = "diagnostics")]
+                    loop_slot: OnceLock::new(),
+                    thread_limited: true,
+                    limited_twin: OnceLock::new(),
+                })
+            })
+            .clone()
+    }
 }
 
 #[cfg(windows)]
@@ -190,22 +239,26 @@ impl Shader {
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
         use victory_shader::{Container, FourCC};
         let c = Container::parse(&self.container).ok()?;
-        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+        let part = c.part(FourCC::DXIL)?;
         victory_shader::native_programs(part.data).ok()
     }
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], thread_limited: bool) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    let programs = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = if thread_limited {
+        crate::shader_cache::host_shader_thread_limited(container)?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -217,7 +270,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs | HwStage::Gs
             )
         })
         .map(|p| p.used)
@@ -340,6 +393,7 @@ pub(crate) fn builder_runs() -> bool {
     let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
     if !missing.is_empty() {
         b.off = b.pipelines.len();
+        BUILT.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             missing = missing.len(),
             of = b.pipelines.len(),
@@ -354,7 +408,30 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// The builder has run whole ([`builder_runs`]) and is not off: read at
+/// every draw and dispatch of a program that walks the structures
+/// ([`structures_walked`]), without the builder's lock.
+#[cfg(windows)]
+static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the programs that walk the title's ray-tracing structures may
+/// read their nodes: the structure builder runs ([`Builder`]). While it
+/// does not (before its first dispatch, without `VICTORY_BVH_BUILDER=1`, or
+/// once off), every node test of theirs answers no hit without reading
+/// memory (`victory_shader::emit::USER_STRUCTURES`): no box is entered and
+/// no triangle hit, so their rays see an empty scene instead of whatever
+/// bytes lie where the structures would be (with the builder off: dark
+/// tiles on sunlit hair, lit squares in shadow, the hair's light changing
+/// from run to run). `VICTORY_BVH_NO_HIT=0` lets them walk those bytes.
+#[cfg(windows)]
+pub(crate) fn structures_walked() -> bool {
+    static ANYWAY: OnceLock<bool> = OnceLock::new();
+    BUILT.load(std::sync::atomic::Ordering::Relaxed)
+        || *ANYWAY.get_or_init(|| std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "0"))
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -418,6 +495,11 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A compute pipeline's host pipeline for dispatches by thread counts
+    /// whose last groups are cut short ([`thread_limited_pipeline`]), made
+    /// on first need.
+    #[cfg(windows)]
+    limited: OnceLock<Option<host::HostPipeline>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -454,6 +536,33 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// The host pipeline of a compute pipeline for dispatches by thread counts
+/// whose last groups are cut short (the console's `DispatchX` with
+/// `USE_THREAD_DIMENSIONS`): its program translated so that the threads past
+/// the counts leave at once ([`Shader::thread_limited`]), told the counts
+/// (`victory_shader::emit::USER_THREAD_LIMIT`). Made on this thread at its
+/// first need: few programs are dispatched so (the ray-tracing structure
+/// builder's). `None` if it cannot be made (the program is in a form whose
+/// threads cannot leave alone, or the host refuses it); such a dispatch then
+/// runs whole groups.
+#[cfg(windows)]
+pub(crate) fn thread_limited_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    p.limited
+        .get_or_init(|| {
+            let shaders: Vec<Arc<Shader>> = p.shaders.iter().map(Shader::thread_limited).collect();
+            let made = host::HostPipeline::new(&shaders, None).filter(|h| h.compute);
+            if made.is_none() {
+                tracing::warn!(?shaders, "no host pipeline for dispatches by thread counts: their cut-short groups run whole");
+            }
+            made
+        })
+        .as_ref()
 }
 
 /// Host pipelines queued and not made yet.
@@ -585,6 +694,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        limited: OnceLock::new(),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

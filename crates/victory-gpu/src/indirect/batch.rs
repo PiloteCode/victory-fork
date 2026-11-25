@@ -43,6 +43,8 @@ RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
+// Records a split dispatch's (kind 3) becomes (`super::SPLIT`).
+static const uint SPLIT = 4u;
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
@@ -83,9 +85,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
             cost = record[0] * record[1];
-        } else if (kind == 2) {
+        } else if (kind == 2 || kind == 3) {
             uint3 g = uint3(record[0], record[1], record[2]);
-            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+            uint widest = kind == 3u ? 65535u * SPLIT : (g.x <= WIDEST ? WIDEST : 65535u);
+            g = min(g, uint3(widest, 65535u, 65535u));
             if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
                 g = uint3(0, 0, 0);
             }
@@ -108,7 +111,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && kind > 3) {
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
@@ -172,6 +175,18 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (kind > 1) {
             record[2] = 0;
         }
+    }
+    if (kind == 3) {
+        // A split dispatch's place holds SPLIT records of four words: record
+        // k runs the groups from k * 65,535 on, the base then the counts
+        // (none past the groups asked for).
+        for (uint k = 0; k < SPLIT; k++) {
+            uint first = k * 65535u;
+            uint gx = record[0] > first ? min(record[0] - first, 65535u) : 0u;
+            uint4 r = gx != 0u ? uint4(first, gx, record[1], record[2]) : uint4(first, 0u, 0u, 0u);
+            dst_args.Store4(job.z + k * 16u, r);
+        }
+        return;
     }
     for (uint s = 0; s < words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
@@ -239,7 +254,10 @@ impl Table {
             return Some(place(i));
         }
         let i = self.times.len() as u32;
-        if i == JOBS {
+        // A split dispatch's clamped records take two places (64 bytes): the
+        // second is a job that clamps nothing.
+        let places = if kind == super::SPLIT_DISPATCH { 2 } else { 1 };
+        if i + places > JOBS {
             return None;
         }
         self.times.push(1);
@@ -251,7 +269,16 @@ impl Table {
             to.add(1).write_volatile(offset);
             to.add(2).write_volatile(self.base + i * SLOT);
             to.add(3).write_volatile(0);
-            table.write_volatile(i + 1);
+            if places == 2 {
+                // (No words, charged for no execution: it stores nothing.)
+                self.times.push(TIMES);
+                let to = to.add(4);
+                to.write_volatile(0);
+                to.add(1).write_volatile(0);
+                to.add(2).write_volatile(self.base + (i + 1) * SLOT);
+                to.add(3).write_volatile(0);
+            }
+            table.write_volatile(i + places);
         }
         Some(place(i))
     }

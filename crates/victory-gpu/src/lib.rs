@@ -44,6 +44,8 @@ mod inplace;
 #[cfg(windows)]
 mod land;
 pub mod list;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod loop_notes;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

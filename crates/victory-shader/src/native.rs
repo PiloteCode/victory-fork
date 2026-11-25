@@ -58,10 +58,13 @@
 //!             u16 maximum primitives, u8 user SGPRs, u8 output topology
 //!             (2 triangles); code follows at E+0x45c
 //! record +0x4c u32 LDS bytes (`lds_byte_size`; mesh programs read it here)
+//! GS  E+0x27c u32 GS-VS ring dwords per invocation, E+0x284 u32 maximum
+//!             vertices, E+0x28c u32 dwords per vertex (four per register
+//!             of the output signature)
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! Merged stages keep their other stage data in another layout (not read).
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -120,18 +123,11 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
-const FSPX_VERSION: u32 = 1;
-const FSPX_HEADER: usize = 0x10;
-const FSPX_PACKET: u32 = 0;
-const FSPX_CODE: u32 = 6;
-const FSPX_METADATA: u32 = 7;
-const PACKET_THREADS: usize = 0x0c;
-const PACKET_FLAGS: usize = 0x12;
-const PACKET_WAVE32: u16 = 1 << 4;
-const PACKET_RSRC1: usize = 0x14;
-const PACKET_RSRC2: usize = 0x18;
-const FSPX_RECORDS: usize = 0x18;
-const FSPX_RECORD: usize = 32;
+const GS_SLOT_DWORDS: usize = 0x27c;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX_DWORDS: usize = 0x28c;
+/// D3D12's most vertices a geometry shader emits.
+const MAX_GS_VERTICES: u32 = 1024;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -177,9 +173,11 @@ pub struct NativeProgram {
 }
 
 impl NativeProgram {
-    /// The code with each render target's export patched for its full
-    /// 32-bit format, so exports carry the shader's values unconverted (as
-    /// the console does at pipeline creation for that format).
+    /// The code as the host runs it: each render target's export patched
+    /// for its full 32-bit format, so exports carry the shader's values
+    /// unconverted (as the console does at pipeline creation for that
+    /// format); a geometry program's start keeping every lane
+    /// ([`all_lanes`]).
     pub fn patched_code(&self) -> Vec<u8> {
         let mut code = self.code.clone();
         if let StageIo::Ps { patches, .. } = &self.io {
@@ -190,7 +188,46 @@ impl NativeProgram {
                 }
             }
         }
+        if self.stage == HwStage::Gs {
+            all_lanes(&mut code, self.wave64);
+        }
         code
+    }
+}
+
+/// A geometry program shares its hardware wave with the vertex program run
+/// before it (the ES half) and starts by narrowing EXEC to its own threads:
+/// `s_bfe_* sN, s3, lit(0x80008)` takes their count from bits 8-15 of the
+/// merged wave info, `s_bfm_b64 exec, sN, 0` makes the mask (a count of 64
+/// is all lanes after it). The host runs one invocation per primitive, each
+/// a live one, so that mask is every lane: the `s_bfm_b64` becomes
+/// `s_mov_b64 exec, -1` (one dword, as it was).
+fn all_lanes(code: &mut [u8], wave64: bool) {
+    use crate::gfx10::{Fields, Operand};
+    const EXEC: u8 = 126;
+    const S_MOV_B64_EXEC_ALL: u32 = 0xBEFE_04C1;
+    let Ok(list) = crate::gfx10::decode(code) else {
+        return;
+    };
+    for pair in list.windows(2) {
+        let [count, mask] = pair else { continue };
+        let (Fields::Sop { dst: Some(n), src: from, .. }, Fields::Sop { dst: Some(exec), src: of, .. }) =
+            (count.fields(wave64), mask.fields(wave64))
+        else {
+            continue;
+        };
+        let Operand::Scalar { code: n, .. } = n else {
+            continue;
+        };
+        let counts = matches!(count.name(), Some("s_bfe_i32" | "s_bfe_u32"))
+            && matches!(from[..], [Operand::Scalar { code: 3, .. }, Operand::Literal(0x0008_0008)]);
+        let masks = mask.name() == Some("s_bfm_b64")
+            && matches!(exec, Operand::Scalar { code: EXEC, .. })
+            && matches!(of[..], [Operand::Scalar { code, .. }, Operand::Const(128)] if code == n)
+            && mask.words.len() == 1;
+        if counts && masks {
+            code[mask.offset..mask.offset + 4].copy_from_slice(&S_MOV_B64_EXEC_ALL.to_le_bytes());
+        }
     }
 }
 
@@ -280,6 +317,19 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// A geometry program's output ring: each invocation writes the vertices it
+/// emits to a slot of its own in the GS-VS ring (in LDS on this console),
+/// vertex after vertex, register r of the output signature at dwords
+/// 4r..4r+3 of a vertex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeometryIo {
+    /// The most vertices an invocation emits.
+    pub max_vertices: u32,
+    /// Dwords per vertex in the ring.
+    pub vertex_dwords: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -421,12 +471,8 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data, or in an `ACCC` part's
-/// ([`fspx_program`]); empty for the PC layout.
+/// The native programs in a `DXIL` part's data; empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
-    if part.starts_with(b"FSPX") {
-        return Ok(vec![fspx_program(part)?]);
-    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
@@ -446,129 +492,6 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         out.extend(programs(&unpack(blob)?)?);
     }
     Ok(out)
-}
-
-/// The compute program of an `ACCC` part, which a container carries in place
-/// of `DXIL` when another compiler made the native code (the AMD
-/// FidelityFX upscaler's shaders). Layout as observed (offsets from "FSPX"):
-///
-/// ```text
-/// +0x00 "FSPX" u32 version (1), u32 entry count, u32 size; entries of 16 B
-///       from +0x10: u32 kind, u32 offset, u32 size, u32 0
-/// kind 0  pipeline registers, 0x1c B: +0x0c u16 x3 thread-group size,
-///         +0x12 u16 flags (bit 4 wave32), +0x14 COMPUTE_PGM_RSRC1,
-///         +0x18 COMPUTE_PGM_RSRC2
-/// kind 1  pipeline metadata (a hash); kind 6 the GFX10 code
-/// kind 7  program metadata: u32 0x403, u32 size - 0x14, u32 code dwords,
-///         u64 0, u8 0x40, u8 first user-data dword, u8 count of 0x41
-///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
-///   0x41  a resource the code reads: u8 resource type (as FSSM's used
-///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
-///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
-///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
-///         u32 -1, u32 0
-///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
-///         u8 resource kind (DXIL's), u8 0, u32 register
-///   0x43  the shader hash (16 B); the last record
-/// ```
-pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
-    if u32_at(part, 4)? != FSPX_VERSION {
-        return Err(Malformed("unknown FSPX version"));
-    }
-    let count = u32_at(part, 8)? as usize;
-    if count > MAX_XDAT_ENTRIES {
-        return Err(Malformed("implausible FSPX entry count"));
-    }
-    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
-        for i in 0..count {
-            let at = FSPX_HEADER + 16 * i;
-            if u32_at(part, at)? == kind {
-                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
-                return bytes(part, offset.into(), size.into())
-                    .ok_or(Malformed("FSPX entry out of bounds"));
-            }
-        }
-        Err(Malformed("FSPX entry missing"))
-    };
-    let packet = entry(FSPX_PACKET)?;
-    let code = entry(FSPX_CODE)?;
-    let meta = entry(FSPX_METADATA)?;
-    if u32_at(meta, 8)? as usize * 4 != code.len() {
-        return Err(Malformed("FSPX code size disagrees"));
-    }
-    let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
-    // VGPRs in granules of 4 (wave64) or 8 (wave32).
-    let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
-    let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
-    let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
-    let mut layout: Vec<RootParam> = Vec::new();
-    let mut used = Vec::new();
-    for e in meta
-        .get(FSPX_RECORDS..)
-        .unwrap_or(&[])
-        .as_chunks::<FSPX_RECORD>()
-        .0
-    {
-        match e[0] {
-            0x41 => {}
-            0x42 => continue,
-            0x43 => break,
-            _ => return Err(Malformed("unknown FSPX metadata record")),
-        }
-        let root = RootType::from_raw(e[5].into());
-        let u = UsedResource {
-            kind: match e[4] {
-                0 => ResourceType::Srv,
-                1 => ResourceType::Sampler,
-                2 => ResourceType::Cbv,
-                3 => ResourceType::Uav,
-                n => ResourceType::Other(n),
-            },
-            root,
-            table_offset_dwords: le32(e, 8),
-            lower_bound: le32(e, 12),
-            stride: 0,
-            dwords: e[20],
-            user_data: e[21],
-            slot: e[22],
-        };
-        let sgprs = match root {
-            RootType::Table => 1,
-            RootType::Descriptor => 2,
-            // The code holds its words; no user data.
-            RootType::ImmediateSampler => 0,
-            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
-        };
-        if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
-            layout.push(RootParam {
-                root,
-                table_offset_dwords: 0,
-                sgprs,
-                base_register: u.lower_bound,
-                user_data: u.user_data,
-                slot: u.slot,
-            });
-        }
-        used.push(u);
-    }
-    Ok(NativeProgram {
-        stage: HwStage::Cs,
-        wave64,
-        vgprs,
-        layout,
-        used,
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: u32_at(packet, PACKET_RSRC2)?,
-            threads: [threads(0)?, threads(1)?, threads(2)?],
-        }),
-        code: code.to_vec(),
-    })
-}
-
-fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
-    data.get(at..at + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .ok_or(Malformed("FSPX data out of bounds"))
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
@@ -726,6 +649,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::Gs => gs_io(stage_data),
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -799,21 +723,6 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     })
 }
 
-fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
-    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|e| VsOutput {
-            usage: Usage::from_raw(e[0]),
-            row: e[1],
-            param: e[2],
-            fp16: e[5] & 1 != 0,
-            pack2: e[5] & 2 != 0,
-        })
-        .collect())
-}
-
 fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
         .as_chunks::<5>()
@@ -830,7 +739,25 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     Ok(StageIo::Vs { inputs, outputs })
 }
 
+/// The output table of vertex or mesh stage data.
+fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|e| VsOutput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            param: e[2],
+            fp16: e[5] & 1 != 0,
+            pack2: e[5] & 2 != 0,
+        })
+        .collect())
+}
+
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
+    // Mesh stage data has no vertex inputs: what sits where a vertex stage
+    // keeps their count is not read (official VIctory #1366, 4e155a36).
     let outputs = vs_outputs(data)?;
     let info = data
         .get(MS_INFO..MS_INFO + 8)
@@ -845,6 +772,25 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
         topology: info[7],
         lds_bytes,
     }))
+}
+
+/// A geometry program's ring layout; none (its I/O is then not raised) when
+/// the words are not a layout: a slot of `max_vertices` vertices of whole
+/// registers.
+fn gs_io(data: &[u8]) -> StageIo {
+    let word = |at| u32_at(data, at).unwrap_or(0);
+    let (slot, max_vertices, vertex_dwords) = (word(GS_SLOT_DWORDS), word(GS_MAX_VERTICES), word(GS_VERTEX_DWORDS));
+    let plausible = (1..=MAX_GS_VERTICES).contains(&max_vertices)
+        && (1..=4 * MAX_SEMANTICS).contains(&vertex_dwords)
+        && vertex_dwords.is_multiple_of(4)
+        && slot == max_vertices * vertex_dwords;
+    if !plausible {
+        return StageIo::None;
+    }
+    StageIo::Gs(GeometryIo {
+        max_vertices,
+        vertex_dwords,
+    })
 }
 
 /// For entries already sized by `as_chunks`.
@@ -1131,6 +1077,7 @@ mod tests {
         );
     }
 
+    /// Official VIctory #1366 (4e155a36).
     #[test]
     fn mesh_stage_io_ignores_unused_vs_input_count() {
         let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
@@ -1222,6 +1169,59 @@ mod tests {
         let at = FSSM_HEADER + slot(HwStage::Ls);
         bad_record[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_record))])).is_err());
+    }
+
+    /// A geometry program's start narrows EXEC to its threads; the host keeps
+    /// every lane, and only that mask changes.
+    #[test]
+    fn a_geometry_program_keeps_every_lane() {
+        let words: [u32; 6] = [
+            0x9400_FF03, // s_bfe_i32 s0, s3, lit(0x80008)
+            0x0008_0008,
+            0x92FE_8000, // s_bfm_b64 exec, s0, 0
+            0xBF06_C000, // s_cmp_eq_u32 s0, 64
+            0x85FE_7EC1, // s_cselect_b64 exec, -1, exec
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = |stage| NativeProgram {
+            stage,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::None,
+            code: code.clone(),
+        };
+        let patched = program(HwStage::Gs).patched_code();
+        let mut want = code.clone();
+        want[8..12].copy_from_slice(&0xBEFE_04C1u32.to_le_bytes()); // s_mov_b64 exec, -1
+        assert_eq!(patched, want);
+        // (another stage's code, or another count, is left alone)
+        assert_eq!(program(HwStage::Vs).patched_code(), code);
+        let mut other = program(HwStage::Gs);
+        other.code[4..8].copy_from_slice(&0x0008_0000u32.to_le_bytes());
+        assert_eq!(other.patched_code(), other.code);
+    }
+
+    /// A geometry program's ring layout from its stage data; none for words
+    /// that are no layout.
+    #[test]
+    fn a_geometry_programs_ring_layout() {
+        let mut data = vec![0u8; GS_VERTEX_DWORDS + 4];
+        for (at, v) in [(GS_SLOT_DWORDS, 60u32), (GS_MAX_VERTICES, 3), (GS_VERTEX_DWORDS, 20)] {
+            data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(
+            gs_io(&data),
+            StageIo::Gs(GeometryIo {
+                max_vertices: 3,
+                vertex_dwords: 20
+            })
+        );
+        data[GS_SLOT_DWORDS..GS_SLOT_DWORDS + 4].copy_from_slice(&59u32.to_le_bytes());
+        assert_eq!(gs_io(&data), StageIo::None);
+        assert_eq!(gs_io(&[]), StageIo::None);
     }
 
     #[test]
