@@ -652,10 +652,54 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Whether a list's texture uploads go into its prelude
+/// (`VICTORY_PRELUDE_UPLOADS=1`; off by default: each is recorded where
+/// the list first uses the texture, as before).
+///
+/// In the list each upload was its copies and, at the texture's use right
+/// after, a change of state from copy destination to shader resource:
+/// the pass over textures picked by index uploads hundreds a frame while
+/// the world streams in, one after the other, each copy waited for by the
+/// barrier behind it (the timing run of the gameplay: 900 to 4,000
+/// uploads a frame at 30 to 55 microseconds each). The copies take what
+/// the staging buffers hold at submission either way, and the card never
+/// writes these textures (the title fills them): in the prelude they are
+/// one barrier to the copy state for all, the copies with nothing between
+/// them, and one barrier to the states the list first uses them in.
+pub(crate) fn prelude_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_UPLOADS").is_some_and(|v| v == "1"))
+}
+
+/// Records the copies of `staging` into `texture` (in the copy
+/// destination state) in `list`, a list's prelude ([`prelude_uploads`]).
+///
+/// # Safety
+/// An open list; live resources.
+pub(crate) unsafe fn record_upload(list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, staging: &Staging) {
+    for (i, footprint) in staging.footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+        };
+        // SAFETY: as the caller vouches; both locations name live resources.
+        unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+}
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
+/// destination state (in the list's prelude with [`prelude_uploads`]:
+/// the list then finds it in the state it first uses it in).
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     let host_written = HOST_WRITTEN
         .lock()
@@ -711,10 +755,21 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
+    // In the list's prelude (`prelude_uploads`): the list goes on with the
+    // texture as its prelude leaves it, in the state its next use asks.
+    let in_list = match prelude_uploads().then(|| crate::resource::host_copy(resource)).flatten() {
+        Some(copy) => {
+            list.prelude_upload(copy, staging.clone());
+            false
+        }
+        None => {
+            crate::list::ensure_state(list, resource, COPY_DEST);
+            true
+        }
+    };
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
-    for (i, footprint) in staging.footprints.iter().enumerate() {
+    for (i, footprint) in staging.footprints.iter().enumerate().filter(|_| in_list) {
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;

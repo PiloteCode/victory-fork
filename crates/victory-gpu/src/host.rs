@@ -992,7 +992,7 @@ fn lazy_prelude() -> bool {
 const STAMPS: u32 = 4096;
 
 /// Of [`STAMPS`], those of the list's own commands; the two after them
-/// time its prelude when the prelude runs clamps of ours.
+/// time its prelude when the prelude runs uploads or clamps of ours.
 #[cfg(feature = "diagnostics")]
 const LIST_STAMPS: u32 = STAMPS - 2;
 
@@ -2121,6 +2121,9 @@ struct Deferred {
     /// (`crate::indirect::early`), and the rings they write.
     early: Vec<crate::indirect::Early>,
     early_rings: Vec<ID3D12Resource>,
+    /// Texture uploads for the list's prelude (`crate::texture::prelude_uploads`):
+    /// the host copy and its staging buffer.
+    early_uploads: Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::texture::Staging>)>,
     /// The ranges of title memory the list's shaders may write as declared
     /// so far (`Step::GpuWrite`, whatever host copy: copies of the same
     /// bytes count alike), each once (the world's passes declare the same
@@ -5639,11 +5642,15 @@ impl HostList {
                 (ms(ticks), notes[i].0.chars().take(300).collect())
             })
             .collect();
-        // The prelude, when it ran clamps of ours (`crate::indirect::early`),
-        // as one command.
-        let clamps = self.deferred().early.len();
-        if clamps > 0 {
-            times.push((ms(early[1].saturating_sub(early[0])), format!("prelude (ours): {clamps} clamps")));
+        // The prelude, when it ran uploads or clamps of ours
+        // (`crate::texture::prelude_uploads`, `crate::indirect::early`), as
+        // one command.
+        let (uploads, clamps) = {
+            let deferred = self.deferred();
+            (deferred.early_uploads.len(), deferred.early.len())
+        };
+        if uploads + clamps > 0 {
+            times.push((ms(early[1].saturating_sub(early[0])), format!("prelude (ours): {uploads} texture uploads, {clamps} clamps")));
         }
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
@@ -6005,16 +6012,34 @@ impl HostList {
                 }
             }
         }
+        // The list's texture uploads (`crate::texture::prelude_uploads`) and
+        // clamps of indirect records it has not written
+        // (`crate::indirect::early`), at every submission of the list. An
+        // uploaded texture goes to the copy state with the twins' copies,
+        // and from there to the state the list starts with (back to its
+        // real state if the list does not use it after the upload).
+        let deferred = self.deferred();
+        for (texture, _) in &deferred.early_uploads {
+            let key = std::sync::Arc::as_ptr(texture) as usize;
+            if copying.contains_key(&key) {
+                continue;
+            }
+            let real = texture.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(&texture.texture, host_state(real), host_state(COPY_DEST)));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(&texture.texture, host_state(COPY_DEST), host_state(real)));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        // The clamps of indirect records the list has not written
-        // (`crate::indirect::early`), at every submission of the list.
-        let deferred = self.deferred();
-        let ours = !deferred.early.is_empty();
+        let ours = !deferred.early.is_empty() || !deferred.early_uploads.is_empty();
         if barriers.is_empty() && syncs.is_empty() && !ours {
             return None;
         }
@@ -6025,12 +6050,13 @@ impl HostList {
         else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // Diagnostics: the timing run times the prelude, with its clamps.
+        // Diagnostics: the timing run times the prelude, with its uploads
+        // and clamps.
         #[cfg(feature = "diagnostics")]
         let stamps = self.stamps().filter(|_| ours);
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live; the clamps' buffers are kept by the
-        // list.
+        // for); the textures are live; the clamps' and uploads' buffers are
+        // kept by the list.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -6043,6 +6069,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (texture, staging) in &deferred.early_uploads {
+                    crate::texture::record_upload(list, &texture.texture, staging);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -6280,6 +6309,17 @@ impl HostList {
     /// ([`HostList::defer_gpu_write`]).
     pub(crate) fn writes_declared(&self, (from, to): (usize, usize)) -> bool {
         self.deferred().written.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    /// An upload of `staging` into the host texture `copy` for the list's
+    /// prelude (`crate::texture::prelude_uploads`): recorded there at each
+    /// submission of the list until it is reset.
+    pub(crate) fn prelude_upload(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        staging: std::sync::Arc<crate::texture::Staging>,
+    ) {
+        self.deferred().early_uploads.push((copy, staging));
     }
 
     /// A clamp of indirect records into `ring` for the list's prelude
