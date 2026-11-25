@@ -3254,7 +3254,9 @@ pub(crate) use fill_ahead::wrote as shaders_write;
 /// statistics' "waiting for the submission lock" (which runs from the call
 /// to the start of preparing: settles, the descriptor sync and the sweep
 /// are in it) each hold several of these parts together; here each is on
-/// its own, and they add up to the time spent inside.
+/// its own, and they add up to the time spent inside but for the noting of
+/// ranges to refresh (a list's refresh steps, not timed one by one: the
+/// refreshes themselves are, where they are flushed).
 #[cfg(feature = "diagnostics")]
 mod submit_parts {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -7885,14 +7887,18 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            // (A refresh step only notes its range for the next flush, whose
+            // time is counted there: some 21,000 a frame, not timed one by
+            // one.)
             #[cfg(feature = "diagnostics")]
-            let _part = submit_parts::Step::new(match step {
-                Step::Copy(..) | Step::Fill(..) => submit_parts::FILLS,
-                Step::Refresh(..) => submit_parts::REFRESH,
-                Step::Run(_) | Step::Host(_) => submit_parts::RUNS,
-                Step::GpuWrite(..) => submit_parts::WRITES,
-                Step::Texture(_) => submit_parts::TEXTURES,
-            });
+            let _part = match step {
+                Step::Refresh(..) => None,
+                Step::Copy(..) | Step::Fill(..) => Some(submit_parts::FILLS),
+                Step::Run(_) | Step::Host(_) => Some(submit_parts::RUNS),
+                Step::GpuWrite(..) => Some(submit_parts::WRITES),
+                Step::Texture(_) => Some(submit_parts::TEXTURES),
+            }
+            .map(submit_parts::Step::new);
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
