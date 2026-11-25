@@ -707,7 +707,14 @@ fn parts_line(frames: f64) {
         .iter()
         .map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames)
         .collect();
+    let indexed = crate::draw::TABLE_INDEXED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames;
     if !host::sync_switched() && sync_wide() < 2 {
+        if crate::draw::table_indexed() {
+            tracing::info!(
+                "root-indexed table entries outside fresh tables per frame: {indexed:.0}, made at their draw \
+                 (VICTORY_TABLE_INDEXED=1)"
+            );
+        }
         return;
     }
     let ms = |i: usize| s[i] / 1000.0;
@@ -723,7 +730,8 @@ fn parts_line(frames: f64) {
          {:.0} older views, {:.0} no view; of those left to draws and due, {:.0} made by a draw, {:.0} mirrored after all, \
          {:.0} changed again, {:.2} ms; constant buffer views whose mirror would only write the null their host slot \
          holds, passed over (VICTORY_SYNC_NULL_SKIP {}): {:.0} changed, {:.0} left to draws and due; jobs \
-         (VICTORY_SYNC_WIDE) {}",
+         (VICTORY_SYNC_WIDE) {}; root-indexed table entries outside fresh tables {:.0} (VICTORY_TABLE_INDEXED=1 \
+         makes them at their draw: {})",
         s[host::S_READ_BYTES] / crate::watch::PAGE as f64,
         s[host::S_READ_BYTES] / 1e6,
         ms(host::S_READ_US),
@@ -759,6 +767,8 @@ fn parts_line(frames: f64) {
         s[host::S_NULL_SKIPPED],
         s[host::S_LEFT_NULL_SKIPPED],
         sync_wide(),
+        indexed,
+        if crate::draw::table_indexed() { "on" } else { "off" },
     );
 }
 
