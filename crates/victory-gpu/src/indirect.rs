@@ -3107,7 +3107,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         assert_eq!(memory[8..12], [job(1, 10, 2), 64, 4096 + SLOT, 0]);
         assert_eq!(job(1, 10, 2), 1 | 10 << 4 | 3 << 8 | 2 << 16);
         // Not a copy of the pass, not on 4 bytes, past 32 bits, not a kind.
-        for (id, offset, kind) in [(8, 64, 10), (7, 66, 10), (7, 1 << 32, 10), (7, u64::from(u32::MAX) & !3, 10), (7, 64, 3)] {
+        for (id, offset, kind) in [(8, 64, 10), (7, 66, 10), (7, 1 << 32, 10), (7, u64::from(u32::MAX) & !3, 10), (7, 64, 4)] {
             assert_eq!(t.place(id, offset, kind), None);
         }
         // Read more often than one job may be charged for: another job.
@@ -3122,6 +3122,29 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         assert_eq!(t.place(7, 1024, 1), None, "full");
         assert_eq!(t.place(7, 1024 + 16 * 5, 0), Some(4096 + 5 * u64::from(SLOT)));
         assert_eq!((memory[0], memory[TABLE as usize / 4]), (JOBS, 0xffff_ffff));
+    }
+
+    /// A split dispatch's job takes two places (its four clamped records of
+    /// 16 bytes), the second a job that clamps nothing; it is charged for
+    /// every execution that reads it, as any other.
+    #[test]
+    fn batch_tables_give_split_dispatches_two_places() {
+        use batch::{JOBS, SLOT, TABLE, Table, job};
+        let mut memory = vec![0xffff_ffffu32; TABLE as usize / 4 + 1];
+        // SAFETY: the vector holds the table and outlives its use.
+        let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 0, [7, 0, 0, 0]) };
+        assert_eq!(t.place(7, 64, SPLIT_DISPATCH), Some(0));
+        assert_eq!(t.place(7, 64, 2), Some(2 * u64::from(SLOT)), "past both places");
+        assert_eq!(t.place(7, 64, SPLIT_DISPATCH), Some(0), "the same record again");
+        assert_eq!(memory[0], 3);
+        assert_eq!(memory[4..8], [job(0, SPLIT_DISPATCH, 2), 64, 0, 0]);
+        assert_eq!(memory[8..12], [0, 0, SLOT, 0]);
+        // No room for two places in the last one.
+        for i in 3..u64::from(JOBS) - 1 {
+            assert!(t.place(7, 1024 + 16 * i, 0).is_some());
+        }
+        assert_eq!(t.place(7, 4, SPLIT_DISPATCH), None, "one place left");
+        assert!(t.place(7, 8, 0).is_some());
     }
 
     /// A batch clamps records exactly as the clamp of one execution does, of
