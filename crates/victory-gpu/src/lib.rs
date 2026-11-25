@@ -18,6 +18,8 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod barrier;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod bvhtrace;
 #[cfg(all(windows, feature = "diagnostics"))]
