@@ -45,6 +45,9 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The size the buffer was made with ([`size_class`]): it goes back to
+    /// the spare ones under it ([`give_back`]).
+    class: u64,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -387,7 +390,75 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // The lists that recorded its copies held it until they were reset,
+        // after they ran: nothing reads it any more.
+        give_back(&self.buffer, self.data, self.class);
     }
+}
+
+/// Upload buffers of staging let go, for the staging of textures to come:
+/// buffer, mapping, size class; the oldest first.
+///
+/// A texture streamed in was staged in an upload buffer made for it, and
+/// the buffer was let go once the texture was uploaded: some 500 buffers a
+/// second (260 MB) at the opening cutscenes, each made and mapped by the
+/// driver on the thread that records the frame.
+struct Spare(ID3D12Resource, usize, u64);
+
+// SAFETY: D3D12 objects are free-threaded; the mapping is plain memory
+// nothing else uses while the buffer is spare.
+unsafe impl Send for Spare {}
+
+static SPARE: Mutex<std::collections::VecDeque<Spare>> = Mutex::new(std::collections::VecDeque::new());
+static SPARE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bytes of spare upload buffers kept at most: `VICTORY_STAGING_SPARE_MB`
+/// (1024 by default; 0 makes a buffer for each staging, as before).
+fn spare_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_SPARE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// The size of upload buffer made for `bytes` of staging: rounded up to an
+/// eighth of the power of two above it (64 KiB at least), so that a buffer
+/// let go fits textures of about the same size (at most a quarter more).
+fn size_class(bytes: u64) -> u64 {
+    let step = (bytes.max(1).next_power_of_two() / 8).max(64 << 10);
+    bytes.max(1).next_multiple_of(step)
+}
+
+/// A spare upload buffer of size `class`, the latest let go, if any.
+fn take_spare(class: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let at = spare.iter().rposition(|s| s.2 == class)?;
+    let Spare(buffer, data, _) = spare.remove(at)?;
+    SPARE_BYTES.fetch_sub(class, std::sync::atomic::Ordering::Relaxed);
+    Some((buffer, data as *mut u8))
+}
+
+/// Keeps a staging buffer let go for a later staging, within
+/// [`spare_limit`]: the oldest spare ones go to make room.
+fn give_back(buffer: &ID3D12Resource, data: *mut u8, class: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let limit = spare_limit();
+    if class > limit / 4 {
+        return;
+    }
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    while SPARE_BYTES.load(Relaxed) + class > limit {
+        let Some(Spare(_, _, size)) = spare.pop_front() else {
+            break;
+        };
+        SPARE_BYTES.fetch_sub(size, Relaxed);
+    }
+    spare.push_back(Spare(buffer.clone(), data as usize, class));
+    SPARE_BYTES.fetch_add(class, Relaxed);
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -406,12 +477,23 @@ pub(crate) fn memory() -> [u64; 3] {
 /// Staging buffers let go as idle since the start, and their bytes.
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// For the memory line: staging buffers let go as idle, and their bytes.
+/// For the memory line: staging buffers let go as idle, and their bytes;
+/// staging that took a spare upload buffer, the spare ones now, their bytes.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn let_go() -> [u64; 2] {
+pub(crate) fn let_go() -> [u64; 5] {
     use std::sync::atomic::Ordering::Relaxed;
-    [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    [
+        LET_GO[0].load(Relaxed),
+        LET_GO[1].load(Relaxed),
+        STAGING_REUSED.load(Relaxed),
+        spare,
+        SPARE_BYTES.load(Relaxed),
+    ]
 }
+
+/// Staging that took a spare upload buffer ([`take_spare`]).
+static STAGING_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
@@ -1027,7 +1109,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let class = size_class(total);
+    let (buffer, data) = match take_spare(class) {
+        Some((buffer, data)) => {
+            // What the texture before left there: zeros, as in a new one
+            // (a texture all unmapped yet is uploaded as it is).
+            // SAFETY: the buffer's mapping, `class` >= `total` bytes.
+            unsafe { std::ptr::write_bytes(data, 0, total as usize) };
+            STAGING_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (buffer, data)
+        }
+        None => host.upload_buffer(class)?,
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1047,6 +1140,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         bytes: total,
+        class,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),

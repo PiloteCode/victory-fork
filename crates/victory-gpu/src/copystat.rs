@@ -756,12 +756,15 @@ fn log_memory() {
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
-         asked for in each",
+         asked for in each; staging upload buffers taken from spare ones: {} ({} spare now, {:.0} MB)",
         windows[0],
         mb(windows[1]),
         stagings[0],
         mb(stagings[1]),
         mb(windows[2]),
+        stagings[2],
+        stagings[3],
+        mb(stagings[4]),
     );
     tracing::info!(
         "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \
