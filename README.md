@@ -1,4 +1,4 @@
-# VIctory fork (work in progress)
+﻿# VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
@@ -24,7 +24,7 @@ developer or publisher.
 
 ## Status of this fork (2026-11-25)
 
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
+**Not playable yet: about 4.5 frames per second on an RTX 5090 (2.5 to 4 on an RTX 4070 before the second pass below), and shadowed areas are dark.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -60,10 +60,42 @@ Speed and memory:
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
+Each speed switch is described in a comment where it is read.
+
+### Second pass (2026-11-25, Intel i9-14900KF, NVIDIA RTX 5090 32 GB, 128 GB RAM)
+
+Measured with diagnostics builds, scripted keys and the same scenes, five
+minutes a run; "frame" is the median time per frame of the lines with 500
+draws or more.
+
+| Change | What it fixed | Measured |
+|--------|---------------|----------|
+| Range lock for reads of title memory in place (`watch.rs`, `xmem.rs`) | one lock over all title memory: while the world streamed in, texture refreshes waited 1-6.7 s a frame for the runtime's remappings | waits in the opening cutscene 439 ms â†’ 0.7 ms a frame line |
+| Shader cache keyed by the translator (`build.rs`, `shader_cache.rs`) | every rebuild retranslated all ~3,000 shaders | a rebuild that leaves the translator alone keeps them |
+| 3/4 of the processors make pipelines (`pipeline/make.rs`) | 8 of 32 threads | the first run's backlog clears sooner |
+| On by default: relay, wide snapshots/compares/refreshes/merges, card copies from 1 MiB (`=0` turns each off) | prepare, card and copy-back ran one after another | gameplay frame 408 â†’ 232 ms |
+| Indirect windows on by default, scratch buffer left read between draws (`draw.rs`, `indirect.rs`, `host.rs`) | a change of state around each of 5,000 one-record indirect draws stopped the card each time | card 131/129 â†’ 95/103 ms, frame 240/238 â†’ 221/218 ms |
+| Shader translation fixes (agent, `victory-shader`) | 110 programs did not translate (puddles, terrain samplers, ped cut-outs, decals...) | 16 left; 25,576 of 25,758 pass translation, validation and pipeline creation |
+
+Together: the opening of the gameplay went from 487 ms to about 218 ms a
+frame (2 â†’ 4.5 fps), the opening cutscene's streaming from a median of 590 ms
+(and seconds-long frames) to about 260 ms.
+
+Tried and left off, with numbers: title memory in place (`VICTORY_INPLACE=1`:
+358 ms, `=2`: 677 ms; the card reading system memory is slower), 512 lists in
+the air (248 ms; the wait moves to reads of title memory), no waits around
+the indirect clamp (no change), skipping the ray-tracing passes (35 ms saved
+but the indirect light they already give is lost: rooms go black).
+
+Still open: 24 compute programs need 64-lane waves, which NVIDIA cards do
+not run (screen tracing tiles, particles, alpha transmission; also the
+ray-tracing structure builder, so shadows stay dark); rectangles of an older
+picture in the opening cutscene; ~100 ms of card time a frame in translated
+shaders; the copy-back's fetches wait behind later work on the queue (about
+100 ms a frame on the relay thread).
+
+To run it: `Lancer GTA6 (VIctory).bat` next to the game's files builds the
+release and starts the title.
 
 ### Known problems
 
@@ -112,9 +144,9 @@ What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
+| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | â€“ |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
+| Network | Offline by design: the title cannot reach the network | â€“ |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
@@ -131,7 +163,7 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
 The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
+Check **Committed** under **Task Manager â†’ Performance â†’ Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
