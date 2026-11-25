@@ -1867,31 +1867,78 @@ impl HostHeap {
         // made and brought up to date once more by the pass over buffer
         // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
         // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
+        let changed = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            self.copied_changed(&mut copied, index, record, crate::frame::current())
+        };
+        if changed {
+            self.mirror(index, handle, false);
+        }
+        changed
+    }
+
+    /// [`HostHeap::mirror_copied`] for the records of title slots `first`,
+    /// `first + 1`, ... as the caller read them, `step` bytes each in
+    /// `records`, slot `index` being at `handle(index)`: the fingerprints
+    /// are looked at under one taking of their lock (taken for each slot,
+    /// that was 150,000 to 490,000 times a frame), and the slots whose
+    /// record changed are mirrored after it, in order. How many were.
+    /// The same slots are mirrored as one by one: what `mirror` does to a
+    /// slot is never what the look at another one reads.
+    pub(crate) fn mirror_copied_run(&self, first: u32, records: &[u8], step: usize, handle: impl Fn(u32) -> u64) -> u64 {
+        let frame = crate::frame::current();
+        let changed: Vec<u32> = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            records
+                .chunks_exact(step.max(1))
+                .zip(first..self.count)
+                .filter(|&(record, index)| self.copied_changed(&mut copied, index, record, frame))
+                .map(|(_, index)| index)
+                .collect()
+        };
+        for &index in &changed {
+            self.mirror(index, handle(index), false);
+        }
+        changed.len() as u64
+    }
+
+    /// The look of [`HostHeap::mirror_copied`] at one slot, its caller
+    /// holding the fingerprints (`copied`, made): whether title slot `index`
+    /// holding `record` is to be mirrored, its fingerprint noted if so.
+    fn copied_changed(&self, copied: &mut [u64], index: u32, record: &[u8], frame: u64) -> bool {
+        // A slot draws read through a table lately is left to its draws,
+        // as the passes over slots picked by index leave it
+        // (`texture_slots_remapped`, `slots_written_under`): the title
+        // writes its per-draw tables into the same heap every frame, and
+        // each draw makes what its table shows in a slot of its own. Those
+        // were most of the 26,000 to 43,000 records a frame this pass
+        // mirrored in run 200 and in the play session after it, each then
+        // made and brought up to date once more by the pass over buffer
+        // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
+        // are mirrored too, as in run 200.
+        if !sync_tables() && self.tabled_lately(index, frame) {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
-        let n = record.len();
         // Never 0, which is "never looked at". (A multiply-and-fold over
         // the record's words: BLAKE3 here was most of the 35 to 42 ms a
         // frame this pass took over some 250,000 to 300,000 records, run
         // 200.)
         let print = record_print(record) | 1;
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
-            let Some(last) = copied.get_mut(index as usize) else {
-                return false;
-            };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
-                return false;
-            }
-            *last = print;
+        let Some(last) = copied.get_mut(index as usize) else {
+            return false;
+        };
+        // A slot never looked at that holds nothing: as it was.
+        if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+            return false;
         }
-        self.mirror(index, handle, false);
+        *last = print;
         true
     }
 
