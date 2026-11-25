@@ -54,6 +54,8 @@ What did it, on top of the list below:
   mirrored before every submission (pull request #305 by Flyander, after
   upstream VIctory 86a5ed6). Measured here: about 40,000 records a frame
   that no call had announced; their host slots were empty or stale.
+  The host slot and its fingerprint use the same captured record, even if
+  the guest slot changes after the page was read.
 - A buffer view that does not start on an element of its buffer's host
   copy gets a copy of its own bytes instead of being refused (after
   upstream 86a5ed6): 3 to 6 such views a frame.
@@ -652,6 +654,10 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight, on every queue |
 | `VICTORY_HANG_WATCH=0` | no watch of the card's progress (by default a send to the host queue the card stays on for 500 ms or more is logged with its lists' pipelines) |
+| `VICTORY_EARLY_PIPELINES=0` | start a host pipeline when a draw or dispatch first requests it. Keeps the learned list, shader cache, and driver pipeline library for comparing startup scheduling across runs |
+| `VICTORY_VIEW_SET=0` | the guards' checks of view memory walk every block of a range, as before (by default they are answered from the view blocks that are not clean, and a block found uncommitted in a placeholder is parked until the runtime maps it; `VICTORY_PARK_EPOCH=<n>`: submissions between looks at parked blocks that are no placeholder, 32) |
+| `VICTORY_CENSUS=1` | every 10 s (`VICTORY_CENSUS_SECONDS=<s>`) a census of the card copies of title buffers: the reservation each lies in with the flags the title asked for, bytes sent up and fetched back a frame; and the host resources made a frame, by kind |
+| `VICTORY_SKIP_WC_BACK=1`, `VICTORY_SKIP_WC_COMPARE=1` | experiments, off: what shaders wrote to card copies of write-combining title memory is not fetched back (`_COMPARE`: those copies are not hashed or compared either); right only if the title's processor never reads what the card wrote there |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_MESH_LINK=0` | a mesh pipeline whose mesh program's outputs pass 32 KiB is made of the shared translations, as before, not of the pair linked for it (or, without a pixel program, of the mesh program with its system values only) |

@@ -13,6 +13,13 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+/// The source bytes needed for a desktop CBV upload. Allocation and
+/// descriptor creation apply their own 256-byte rounding.
+#[cfg(any(windows, test))]
+pub(crate) fn constant_staging_bytes(size: u32) -> u32 {
+    size.min(64 * 1024)
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -28,10 +35,10 @@ const HEAP_IIDS: [Iid; 4] = [
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapDesc {
-    kind: u32,
-    count: u32,
-    flags: u32,
-    nodes: u32,
+    pub(crate) kind: u32,
+    pub(crate) count: u32,
+    pub(crate) flags: u32,
+    pub(crate) nodes: u32,
 }
 
 /// Newer titles (the title) pass the description followed by
@@ -350,6 +357,10 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
@@ -953,10 +964,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => View::Constant(u64::from(lo) | u64::from(hi) << 32, size),
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1169,11 +1181,13 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(heap(this).desc) };
     }
+    out
 }
 /// The same address for the CPU and the GPU start.
 extern "system" fn start(this: This) -> u64 {
@@ -1196,6 +1210,21 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn constant_buffer_staging_uses_only_the_host_addressable_prefix() {
+        for (size, expected) in [
+            (0, 0),
+            (255, 255),
+            (65_535, 65_535),
+            (65_536, 65_536),
+            (65_537, 65_536),
+            (2_785_536, 65_536),
+            (u32::MAX, 65_536),
+        ] {
+            assert_eq!(constant_staging_bytes(size), expected, "guest CBV size {size}");
+        }
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
@@ -1523,5 +1552,44 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn heap_get_desc_returns_its_output_pointer() {
+        let desc = HeapDesc {
+            kind: 1,
+            count: 16,
+            flags: 0,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let mut out = std::mem::MaybeUninit::<HeapDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_desc = slot::<GetDesc>(h, 0x40);
+        assert_eq!(get_desc(h, out.as_mut_ptr()), out.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { out.assume_init() };
+        assert_eq!(
+            (read.kind, read.count, read.flags, read.nodes),
+            (desc.kind, desc.count, desc.flags, desc.nodes)
+        );
+        assert!(get_desc(h, std::ptr::null_mut()).is_null());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    #[test]
+    fn null_cbv_overwrites_previous_descriptor() {
+        let null = std::ptr::null();
+        let slot = [0u64; 4];
+        let at = slot.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 0, 256, 0], at);
+        assert_eq!(view(at), Some(View::Constant(0x1000, 256)));
+        create_cbv(null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Constant(0, 0)));
     }
 }

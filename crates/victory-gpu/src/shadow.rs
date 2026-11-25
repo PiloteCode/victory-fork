@@ -167,7 +167,8 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
-/// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
+/// (on by default, `VICTORY_CARD_ROOM_FOR_BUFFERS=0` turns it off; see
+/// below).
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
 /// its 95 within two seconds, right before the first world frame), and
@@ -2258,6 +2259,11 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// Where the title buffer starts (`crate::census`).
+    pub(crate) fn title_start(&self) -> u64 {
+        self.start
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -3612,6 +3618,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
+                crate::census::copy_made(key.0, len);
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
