@@ -142,8 +142,40 @@ pub(crate) enum C {
     /// Changes of state recorded for title textures before their use
     /// (`crate::list::ensure_state`), each its own barrier.
     StateChanges,
+    /// `watch::writes` kernel askings that failed (the range is not
+    /// write-watched: view memory or not watchable).
+    WatchFailed,
+    /// `watch::writes` askings not made because the range's first block is
+    /// already known to be guarded view memory (no kernel call).
+    WatchKnownView,
+    /// Clamps of indirect records (no window hit) by where the records
+    /// come from: no shader the list recorded before the command may write
+    /// them (as declared: the card had them when the list began), or one
+    /// may; draws and mesh dispatches, then compute dispatches.
+    ClampFromBefore,
+    ClampWrittenInList,
+    ClampDispatchFromBefore,
+    ClampDispatchWrittenInList,
+    /// Clamps recorded into lists' preludes (`crate::indirect::early`).
+    IndirectEarly,
+    /// Clamps of an indirect dispatch's record a short step after the
+    /// record the list's last clamped dispatch read (the same copy).
+    ClampDispatchWalks,
+    /// Large descriptor tables made afresh at the longest length shaders
+    /// read them to, past what the draw asked for; and draws that took one
+    /// made for a longer read (`crate::draw`, `VICTORY_TABLE_LONGEST`).
+    TablesLonger,
+    TablesPrefix,
+    /// Tables refused without a search: the frame had used up its failed
+    /// searches (`VICTORY_DYNAMIC_WALKS`).
+    DynamicWalksCapped,
+    /// Lists cut so that the clamps of the indirect draws after the cut
+    /// run in the new part's prelude (`VICTORY_HOIST_CLAMPS`).
+    HoistCuts,
 }
-const COUNTERS: usize = 80;
+/// One past the last counter (it was a number kept by hand: 84 for 86
+/// counters had the last two index past the array).
+const COUNTERS: usize = C::HoistCuts as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -241,6 +273,49 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
     }
 }
 
+/// The title's barrier groups since the last line by what their barriers
+/// say (diagnostics): (kind, sync before, sync after, access before, access
+/// after) and how many, read as the PC's enhanced barrier groups (16 bytes:
+/// kind 0 global, 1 texture, 2 buffer; the count; the barriers).
+type GroupKinds = HashMap<(u32, u32, u32, u32, u32), u64>;
+static GROUP_KINDS: Mutex<Option<GroupKinds>> = Mutex::new(None);
+
+/// Tallies the barriers of `count` groups at `groups` ([`GROUP_KINDS`]).
+///
+/// # Safety
+/// `groups` points at `count` groups as the title passes them.
+pub(crate) unsafe fn barrier_groups_seen(groups: *const u8, count: u32) {
+    if groups.is_null() {
+        return;
+    }
+    let mut map = GROUP_KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    for g in 0..count.min(64) as usize {
+        // SAFETY: as the caller vouches.
+        let (kind, n, at) = unsafe {
+            let group = groups.add(g * 16);
+            (group.cast::<u32>().read_unaligned(), group.add(4).cast::<u32>().read_unaligned(), group.add(8).cast::<*const u8>().read_unaligned())
+        };
+        let size = match kind {
+            0 => 16,
+            1 => 64,
+            2 => 40,
+            _ => {
+                *map.entry((kind, n, 0, 0, 0)).or_insert(0) += 1;
+                continue;
+            }
+        };
+        if at.is_null() {
+            continue;
+        }
+        for b in 0..n.min(256) as usize {
+            // SAFETY: as the caller vouches: `n` barriers of the kind's size.
+            let w = |k: usize| unsafe { at.add(b * size + 4 * k).cast::<u32>().read_unaligned() };
+            *map.entry((kind, w(0), w(1), w(2), w(3))).or_insert(0) += 1;
+        }
+    }
+}
+
 /// Whether an experiment on barriers is on (`VICTORY_BARRIER_TEST`): bit 0
 /// for `groups` (the title's barrier groups record no wait for earlier
 /// shader writes), bit 1 for `indirect` (the pass that bounds an indirect
@@ -324,18 +399,19 @@ const BIG: usize = 32 << 20;
 
 /// A block of [`BIG`] bytes or more was made at `at`, or released there.
 fn big(at: *mut u8, size: usize, made: bool) {
+    use std::sync::atomic::Ordering::{Acquire, Release};
     if size < BIG {
         return;
     }
     for (place, bytes) in BIG_AT.iter().zip(&BIG_BYTES) {
         if made {
-            if place.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok() {
-                bytes.store(size as u64, Relaxed);
+            if place.compare_exchange(0, at as usize, Acquire, Relaxed).is_ok() {
+                bytes.store(size as u64, Release);
                 return;
             }
-        } else if place.load(Relaxed) == at as usize {
+        } else if place.load(Acquire) == at as usize {
             bytes.store(0, Relaxed);
-            place.store(0, Relaxed);
+            place.store(0, Release);
             return;
         }
     }
@@ -343,7 +419,8 @@ fn big(at: *mut u8, size: usize, made: bool) {
 
 /// The sizes of our own big blocks alive, largest first, in MB.
 fn big_blocks() -> String {
-    let mut sizes: Vec<u64> = BIG_BYTES.iter().map(|b| b.load(Relaxed)).filter(|&b| b != 0).collect();
+    use std::sync::atomic::Ordering::Acquire;
+    let mut sizes: Vec<u64> = BIG_BYTES.iter().map(|b| b.load(Acquire)).filter(|&b| b != 0).collect();
     sizes.sort_unstable_by(|a, b| b.cmp(a));
     let text: Vec<String> = sizes.iter().map(|b| format!("{:.2}", *b as f64 / (1 << 20) as f64)).collect();
     if text.is_empty() { "none".into() } else { text.join(", ") }
@@ -384,13 +461,17 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        // Unregister `at` before `System.realloc` can free it and let another
+        // thread reuse that virtual address.
+        big(at, layout.size(), false);
         // SAFETY: the caller's contract, passed on.
         let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
         if !moved.is_null() {
             own(layout.size(), false);
             own(size, true);
-            big(at, layout.size(), false);
             big(moved, size, true);
+        } else {
+            big(at, layout.size(), true);
         }
         moved
     }
@@ -451,6 +532,38 @@ mod own_tests {
         assert!(super::big_blocks().contains("48.00"));
         drop(block);
         assert!(!listed(at));
+    }
+
+    /// Reallocating a big block updates its tracked address and size cleanly,
+    /// including growing across `BIG` and shrinking below `BIG`.
+    #[test]
+    fn big_block_realloc_tracks_new_address_and_size() {
+        use std::sync::atomic::Ordering::Acquire;
+        let listed = |at: usize, size: usize| {
+            super::BIG_AT
+                .iter()
+                .zip(&super::BIG_BYTES)
+                .any(|(place, bytes)| place.load(Acquire) == at && bytes.load(Acquire) == size as u64)
+        };
+        let mut block = Vec::<u8>::with_capacity(34 << 20);
+        let first_at = block.as_ptr() as usize;
+        let first_cap = block.capacity();
+        assert!(listed(first_at, first_cap));
+
+        block.reserve_exact(40 << 20);
+        let second_at = block.as_ptr() as usize;
+        let second_cap = block.capacity();
+        assert!(listed(second_at, second_cap));
+        if second_at != first_at {
+            assert!(!listed(first_at, first_cap));
+        }
+
+        block.clear();
+        block.shrink_to(1 << 20);
+        let small_at = block.as_ptr() as usize;
+        assert!(!listed(second_at, second_cap));
+        assert!(!listed(small_at, block.capacity()));
+        drop(block);
     }
 
     /// A big block shows in the counters while it lives (other tests
@@ -705,6 +818,11 @@ fn log_memory() {
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
+    // Everything the system says of the two memory groups, beside the
+    // budget and use the lines below print.
+    if let Some(h) = crate::host::host() {
+        h.log_video_memory("with the memory line");
+    }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
@@ -753,6 +871,22 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    let targets = crate::resource::targets_census();
+    tracing::info!(
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        targets[0],
+        mb(targets[1]),
+        targets[10],
+        mb(targets[11]),
+        targets[2],
+        mb(targets[3]),
+        targets[4],
+        mb(targets[5]),
+        targets[6],
+        mb(targets[7]),
+        targets[8],
+        mb(targets[9]),
+    );
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
@@ -795,6 +929,10 @@ fn log_memory() {
         mb(made[3]),
         made[4],
         mb(made[5]),
+    );
+    tracing::info!(
+        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
+        crate::resource::placed_filler_twins()
     );
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own
@@ -971,6 +1109,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -984,6 +1125,12 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1130,6 +1277,21 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    tracing::info!(
+        "  descriptor tables per frame: {:.0} made at a longer read than asked (VICTORY_TABLE_LONGEST), {:.0} draws \
+         took one made for a longer read, {:.0} refused without a search (VICTORY_DYNAMIC_WALKS); {:.0} lists cut \
+         for hoisted clamps (VICTORY_HOIST_CLAMPS)",
+        c[C::TablesLonger as usize],
+        c[C::TablesPrefix as usize],
+        c[C::DynamicWalksCapped as usize],
+        c[C::HoistCuts as usize],
+    );
+    let [together, written, mapped] =
+        [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
+         {written} views noted written by a write through another, {mapped} ranges opened because a view of them was mapped"
+    );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
     // recording thread did.
@@ -1243,7 +1405,17 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    // `VICTORY_GPU_TIMING_LINES=<n>` (or `VICTORY_GPU_TIMING_TOP=<n>`, the same): the heaviest
+    // n kinds, forty by default (every kind with a large n: the card's time of each translated
+    // program, the light ones too).
+    static TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let top = *TOP.get_or_init(|| {
+        ["VICTORY_GPU_TIMING_LINES", "VICTORY_GPU_TIMING_TOP"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()))
+            .unwrap_or(40)
+    });
+    for (what, (n, us, longest)) in by.into_iter().take(top) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
@@ -1251,6 +1423,14 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
+    tracing::info!(
+        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
+         out of the submissions' askings ahead: {:.0}",
+        c[C::WatchFailed as usize],
+        c[C::WatchKnownView as usize],
+        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+    );
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
@@ -1272,6 +1452,19 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectNotWindowedMany as usize],
         c[C::IndirectNotWindowedStores as usize],
     );
+    tracing::info!(
+        "  indirect clamps per frame by their records: draws {:.0} with records no shader of the list wrote before \
+         them, {:.0} with records it may have written; dispatches {:.0} and {:.0} ({:.0} of them a short step \
+         after the last dispatch's record); {:.0} clamped in lists' preludes (VICTORY_INDIRECT_EARLY=0 turns \
+         that off: now {})",
+        c[C::ClampFromBefore as usize],
+        c[C::ClampWrittenInList as usize],
+        c[C::ClampDispatchFromBefore as usize],
+        c[C::ClampDispatchWrittenInList as usize],
+        c[C::ClampDispatchWalks as usize],
+        c[C::IndirectEarly as usize],
+        if crate::indirect::early() { "on" } else { "off" },
+    );
     tracing::info!("  changes of state of title textures before their use, per frame: {:.0}", c[C::StateChanges as usize]);
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
@@ -1286,6 +1479,19 @@ pub(crate) fn log(frames: f64) {
             (len as u64 * n) as f64 / 1e6 / frames,
             written as f64 / 1e6 / frames
         );
+    }
+    {
+        let kinds = GROUP_KINDS.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut kinds: Vec<_> = kinds.into_iter().flatten().collect();
+        kinds.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        let text: Vec<String> = kinds
+            .iter()
+            .take(16)
+            .map(|((kind, sb, sa, ab, aa), n)| {
+                format!("{:.0}x {} sync {sb:#x}->{sa:#x} access {ab:#x}->{aa:#x}", *n as f64 / frames, ["global", "texture", "buffer"].get(*kind as usize).unwrap_or(&"?"))
+            })
+            .collect();
+        tracing::info!("  the title's barriers per frame by what they say (kind, sync, access): {}", text.join("; "));
     }
     let mut submitters = std::mem::take(&mut *SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner()));
     submitters.sort_by_key(|s| std::cmp::Reverse(s.1.submissions));

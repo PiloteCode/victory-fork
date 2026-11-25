@@ -47,7 +47,82 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+        || TIMED_FRAMES
+            .iter()
+            .any(|f| in_timed_run(f.load(std::sync::atomic::Ordering::Relaxed), n))
+}
+
+/// `VICTORY_CAPTURE_SECONDS` (comma-separated): at the first present at
+/// least that many seconds after the world's first frame (the frame of 500
+/// draws or more; `VICTORY_CAPTURE_WORLD` must be set), the next
+/// [`TIMED_RUN`] frames are listed as those of `VICTORY_CAPTURE_FRAMES` are.
+/// The opening cutscene keeps time with its sound, not with frames: a shot
+/// that came at frame 2,979 of one run came at frame 2,393 of a slower one,
+/// 296 and 278 seconds after the world's first frame.
+fn seconds() -> &'static [f64] {
+    static LIST: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let list = std::env::var("VICTORY_CAPTURE_SECONDS").unwrap_or_default();
+        let mut s: Vec<f64> = list.split(',').filter_map(|f| f.trim().parse().ok()).collect();
+        s.sort_by(f64::total_cmp);
+        s
+    })
+}
+
+/// The frames in a row that one of [`seconds`] lists. An operation goes to
+/// the listing of the frame after the last one presented when it is
+/// recorded, and the title records several frames' lists on its threads
+/// around a present: a frame's passes can land in its neighbours'
+/// listings. In wave 3's general test no listed frame held all of one
+/// frame's lighting: the gameplay's 3,341 had the shadow tile
+/// classification but no final gather, 3,419 the final gather but no
+/// classification, 3,434, 3,447 and 3,458 the screen probes' ray tracing
+/// but not the final gather that follows it, and 3,593 none of these
+/// (wave 1's 5,953 and 5,957 held all of them). Three listings in a row
+/// hold the middle frame whole as long as its passes land no further than
+/// its neighbours' listings.
+const TIMED_RUN: u64 = 3;
+
+/// Whether frame `n` is one of the run that begins at `first` (`u64::MAX`:
+/// a slot no time has given a frame yet).
+fn in_timed_run(first: u64, n: u64) -> bool {
+    first != u64::MAX && n.wrapping_sub(first) < TIMED_RUN
+}
+
+/// The first frames of the runs [`seconds`] lists, a ring read without a
+/// lock (every operation recorded asks [`listed`]).
+static TIMED_FRAMES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 4];
+
+/// When the world's first frame was presented, and how many of [`seconds`]
+/// have been given a frame.
+static TIMED: std::sync::Mutex<(Option<std::time::Instant>, usize)> = std::sync::Mutex::new((None, 0));
+
+/// At the present of `frame`: the next [`TIMED_RUN`] frames are listed if
+/// this is the first present past one of [`seconds`] after the world's
+/// first frame.
+fn timed_frames(frame: u64) {
+    let wanted = seconds();
+    if wanted.is_empty() || WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
+        return;
+    }
+    let mut timed = TIMED.lock().unwrap_or_else(|e| e.into_inner());
+    let since = timed.0.get_or_insert_with(std::time::Instant::now).elapsed().as_secs_f64();
+    let given = timed.1;
+    while timed.1 < wanted.len() && wanted[timed.1] <= since {
+        timed.1 += 1;
+    }
+    if timed.1 > given {
+        TIMED_FRAMES[given % TIMED_FRAMES.len()].store(frame + 1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            first = frame + 1,
+            last = frame + TIMED_RUN,
+            seconds = since,
+            "frames listed by their time after the world's first frame"
+        );
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -120,6 +195,22 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
+/// Every how many world frames a picture is saved with
+/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
+///
+/// A saved frame is read back at once and written as a PNG inside the
+/// present: run 225's frame log has every saved frame of the cell at 371 ms
+/// against a usual 136 (the present's own copy and show 137 ms instead of
+/// 2, and 123 ms more waiting for the card). At every 8th frame that was
+/// the regular dip of every test run, and a fifth of its time. A run that
+/// measures speed asks for 64 or more.
+fn world_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
+    })
+}
+
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -140,6 +231,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 "));
         }
     }
+    timed_frames(frame);
 }
 
 /// Whether frame `n` is saved.
@@ -151,7 +243,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -184,11 +276,10 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    chunk(
-        &mut png,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
-    );
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
@@ -345,6 +436,40 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_DUMP_TARGETS` as a comma-separated list of `<w>x<h>` or
+/// `<w>x<h>f<format>` (the host texture's format, as the file name has it):
+/// only the targets of those sizes (and formats) are saved. Any other value
+/// saves them all. A frame of the opening writes hundreds of targets; saving
+/// them all took 15 to 20 s a frame, and the cutscene, which keeps time
+/// with its sound, went on without the frames in between.
+fn dump_sizes() -> &'static [(u64, u32, Option<i32>)] {
+    static LIST: std::sync::OnceLock<Vec<(u64, u32, Option<i32>)>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| parse_dump_sizes(&std::env::var("VICTORY_DUMP_TARGETS").unwrap_or_default()))
+}
+
+/// The sizes (and formats) of a `VICTORY_DUMP_TARGETS` list; what is not
+/// one is left out.
+fn parse_dump_sizes(list: &str) -> Vec<(u64, u32, Option<i32>)> {
+    list.split(',')
+        .filter_map(|item| {
+            let (w, rest) = item.trim().split_once('x')?;
+            let (h, format) = match rest.split_once('f') {
+                Some((h, f)) => (h, Some(f.parse().ok()?)),
+                None => (rest, None),
+            };
+            Some((w.parse().ok()?, h.parse().ok()?, format))
+        })
+        .collect()
+}
+
+/// Whether a target of `width` x `height` in `format` is saved.
+fn dump_wanted(sizes: &[(u64, u32, Option<i32>)], width: u64, height: u32, format: i32) -> bool {
+    sizes.is_empty()
+        || sizes
+            .iter()
+            .any(|&(w, h, f)| w == width && h == height && f.is_none_or(|f| f == format))
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
@@ -367,7 +492,10 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1
+            || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || !dump_wanted(dump_sizes(), d.Width, d.Height, d.Format.0)
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -790,14 +918,12 @@ pub(crate) fn probe(
     }
 }
 
-/// Whether every pixel [`probe`] read is (near) black.
-pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
+/// The brightest channel of the pixels [`probe`] read (the copies have run).
+fn level(buffer: &ID3D12Resource) -> Option<u8> {
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (every submission is waited for).
+    // SAFETY: the copies have run; the mapping spans the grid's slots.
     unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return false;
-        }
+        buffer.Map(0, None, Some(&mut data)).ok()?;
         let bytes =
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
         let level = bytes
@@ -806,27 +932,201 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             .max()
             .unwrap_or(0);
         buffer.Unmap(0, None);
-        let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-        if levels.len() == 12 {
-            levels.pop_front();
-        }
-        levels.push_back(level);
-        level < 8
+        Some(level)
     }
 }
 
-/// The brightest probed channel of the last frames, oldest first: a fade
-/// darkens over several, a glitch drops at once.
-static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
+/// A presented frame's probe on its way back: the frame, the readback buffer
+/// [`probe`] recorded into (none for a format it does not read), and the
+/// flight whose copy list fills it (0: one that was waited for).
+struct Pending {
+    frame: u64,
+    buffer: Option<ID3D12Resource>,
+    flight: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the buffer is mapped by
+// whichever thread lands the probe, after its copy has run.
+unsafe impl Send for Pending {}
+
+/// Probes of every presented frame, oldest first, until their flight has run.
+static PENDING: std::sync::Mutex<std::collections::VecDeque<Pending>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
-pub(crate) fn recent_levels() -> Vec<u8> {
-    let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-    levels.iter().copied().collect()
+/// What the present of a frame names, for the black-frame log: the title
+/// resource and its state, the draws run since the last present, and the
+/// draws traced (debug logging of `victory_gpu::draw` only).
+static INFO: std::sync::Mutex<std::collections::VecDeque<(u64, String, Vec<String>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// The probed levels of the last frames ([`Levels`]).
+static LEVELS: std::sync::Mutex<Levels> = std::sync::Mutex::new(Levels {
+    seen: std::collections::VecDeque::new(),
+    after: None,
+});
+
+/// The brightest probed channel of each of the last frames, by frame number,
+/// oldest first; and a black frame whose next frames are still to be logged.
+struct Levels {
+    seen: std::collections::VecDeque<(u64, u8)>,
+    after: Option<u64>,
+}
+
+/// Frames a black frame's log shows before it, and after it.
+const BEFORE: usize = 12;
+const AFTER: u64 = 6;
+
+/// Notes, at the present of `frame` and before it is probed, what it
+/// presents ([`INFO`]).
+pub(crate) fn frame_info(frame: u64, what: String, traced: Vec<String>) {
+    let mut info = INFO.lock().unwrap_or_else(|e| e.into_inner());
+    if info.len() >= 64 {
+        info.pop_front();
+    }
+    info.push_back((frame, what, traced));
+}
+
+/// The probe of presented frame `frame`, recorded into the copy list of
+/// flight `flight` (0: a list that was waited for).
+pub(crate) fn probed(frame: u64, buffer: Option<ID3D12Resource>, flight: u64) {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    // A probe that never lands (a flight that never finishes) is not kept
+    // forever.
+    if pending.len() >= 256 {
+        pending.pop_front();
+    }
+    pending.push_back(Pending { frame, buffer, flight });
+}
+
+/// Lands the probes whose flights have run (`finished`: the last flight
+/// finished), in frame order: a probe waits behind an earlier one still in
+/// the air. Each frame's level goes to [`frame_level`].
+pub(crate) fn land_probes(finished: u64) {
+    loop {
+        let next = {
+            let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            match pending.front() {
+                Some(p) if p.flight <= finished => pending.pop_front(),
+                _ => None,
+            }
+        };
+        let Some(p) = next else { break };
+        if let Some(level) = p.buffer.as_ref().and_then(level) {
+            frame_level(p.frame, level);
+        }
+    }
+}
+
+/// How the frames before a black one went to black, from their levels
+/// (oldest first, without the black one): "fade" when each of the last
+/// three is darker than the one before and the last is below half the
+/// brightest of the last six (a fade of the title's over frames: at about
+/// five frames a second the cutscene's fades take 4 to 6 frames, 255 down
+/// to 79 then black in one run), "drop" when it fell at once from a lit
+/// frame, "dark" when the frames before were already dim.
+pub(crate) fn how_black(before: &[u8]) -> &'static str {
+    let tail = &before[before.len().saturating_sub(6)..];
+    let last3 = &tail[tail.len().saturating_sub(3)..];
+    let brightest = tail.iter().copied().max().unwrap_or(0);
+    let fading = last3.len() == 3
+        && last3.windows(2).all(|w| w[1] < w[0])
+        && u32::from(*last3.last().unwrap_or(&0)) * 2 < u32::from(brightest);
+    match before.last() {
+        _ if fading => "fade",
+        Some(&last) if last >= 64 => "drop",
+        _ => "dark",
+    }
+}
+
+/// The level of presented frame `frame`: logs a frame that is black (all
+/// probed channels below 8) after one that was not, with the levels of the
+/// frames before it and what it presented, and six frames on, the levels
+/// after it (a fade stays dark, a frame dropped once is lit again).
+fn frame_level(frame: u64, level: u8) {
+    let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
+    let lit_before = levels.seen.back().is_some_and(|&(f, l)| f + 1 == frame && l >= 8);
+    if levels.seen.len() == BEFORE {
+        levels.seen.pop_front();
+    }
+    levels.seen.push_back((frame, level));
+    if level < 8 && lit_before {
+        let before: Vec<u8> = levels.seen.iter().map(|&(_, l)| l).collect();
+        let (what, traced) = INFO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(f, ..)| *f == frame)
+            .map(|(_, what, traced)| (what.clone(), traced.clone()))
+            .unwrap_or_default();
+        tracing::warn!(
+            frame,
+            how = how_black(&before[..before.len() - 1]),
+            levels = ?before,
+            "a black frame after a frame that was not: {what}"
+        );
+        for d in traced {
+            tracing::warn!("black frame {frame}: {d}");
+        }
+        levels.after = Some(frame);
+    }
+    if let Some(black) = levels.after
+        && frame >= black + AFTER
+    {
+        let after: Vec<u8> = levels.seen.iter().filter(|&&(f, _)| f >= black).map(|&(_, l)| l).collect();
+        let dark = after.iter().take_while(|&&l| l < 8).count();
+        tracing::warn!(
+            frame = black,
+            levels = ?after,
+            black_frames = dark,
+            "levels from the black frame on: {}",
+            if dark == 1 { "lit again at once (one frame dropped)" } else { "dark for several frames (a fade or a cut through black)" }
+        );
+        levels.after = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A fade darkens frame by frame; a drop falls from a lit frame at once.
+    #[test]
+    fn black_frames_are_told_apart_by_the_frames_before() {
+        assert_eq!(super::how_black(&[200, 180, 120, 60, 20]), "fade");
+        // The opening cutscene's fade of one run (frame 2156): 255, then
+        // five frames down to 79, then black.
+        assert_eq!(super::how_black(&[229, 254, 255, 181, 159, 157, 91, 79]), "fade");
+        // From the menu straight to black (frame 1674 of that run).
+        assert_eq!(super::how_black(&[96, 105, 113, 113, 121, 129]), "drop");
+        assert_eq!(super::how_black(&[200, 210, 205, 199]), "drop");
+        assert_eq!(super::how_black(&[30, 31, 30, 29]), "dark");
+        // Darker each frame but not by much: not a fade.
+        assert_eq!(super::how_black(&[200, 199, 198, 197]), "drop");
+    }
+
+    /// A time lists the next three frames: neither the one presented then
+    /// nor the fourth; an empty slot lists none.
+    #[test]
+    fn a_time_lists_three_frames_in_a_row() {
+        let listed: Vec<u64> = (98..105).filter(|&n| super::in_timed_run(100, n)).collect();
+        assert_eq!(listed, [100, 101, 102]);
+        assert!(!(0..5).any(|n| super::in_timed_run(u64::MAX, n)));
+        assert!(!super::in_timed_run(u64::MAX, u64::MAX));
+    }
+
+    /// A list of sizes keeps those targets (a format, when given, too); a
+    /// value that is no list keeps them all.
+    #[test]
+    fn dump_sizes_pick_targets() {
+        let sizes = super::parse_dump_sizes("1280x720, 2560x1440f10,junk,64xq");
+        assert_eq!(sizes, [(1280, 720, None), (2560, 1440, Some(10))]);
+        assert!(super::dump_wanted(&sizes, 1280, 720, 26));
+        assert!(super::dump_wanted(&sizes, 2560, 1440, 10));
+        assert!(!super::dump_wanted(&sizes, 2560, 1440, 19));
+        assert!(!super::dump_wanted(&sizes, 640, 360, 10));
+        let all = super::parse_dump_sizes("1");
+        assert!(all.is_empty());
+        assert!(super::dump_wanted(&all, 640, 360, 10));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

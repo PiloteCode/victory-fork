@@ -419,16 +419,33 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
         }
-        if let Fields::Sop { src, .. } = &inst.fields {
+        if let Fields::Sop { dst, src, .. } = &inst.fields {
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
             }
-            // a dword of a 64-bit sum moved to the register the code reads it from
-            // (`s_mov_b32 s20, s18` after `v_readlane_b32 s18, v2, 0`)
-            if matches!(name, "s_mov_b32" | "s_mov_b64")
+            // A scalar copied: what its source holds (a dword of a 64-bit sum read from a lane
+            // and moved to the register the code reads it from, `s_mov_b32 s20, s18` after
+            // `v_readlane_b32 s18, v2, 0`; a value from before the section; a constant).
+            if name == "s_mov_b32"
+                && let (Some(Operand::Scalar { code: dc, .. }), Some(s0)) = (dst, src.first())
+                && *dc != NULL
+                && let Some(w) = inst.write(Reg::S(*dc))
+            {
+                let sym = match *s0 {
+                    Operand::Scalar { code, .. } if code != NULL => inst
+                        .read(Reg::S(code))
+                        .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
+                    Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+                    Operand::Literal(x) => Sym::K(x),
+                    _ => Sym::Unknown,
+                };
+                uni.insert(w, sym);
+            }
+            // both dwords of a 64-bit sum moved at once
+            if name == "s_mov_b64"
                 && inst.reads.len() == inst.writes.len()
                 && inst
                     .reads
@@ -439,7 +456,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     let s = uni[&r.1];
                     uni.insert(w.1, s);
                 }
-                continue;
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);

@@ -103,10 +103,20 @@ fn native_with(body: &[u32], wave64: bool, threads: u32, lds: u32) -> NativeProg
 
 /// `program()` for a host of 32-lane waves, with the branches closing `wide` taken wave-wide.
 fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
+    lowered_on(native, p, wide, 32)
+}
+
+/// [`lowered`] for a host whose waves have at most `host_wave` lanes.
+fn lowered_on(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+    host_wave: u32,
+) -> Result<HostShader, ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
-    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
     let lowered = lower::lower(&lower::Parts {
         native,
         p,
@@ -211,6 +221,76 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     // (the high half is lane 0's term's: zero)
     assert_eq!(out[0][0], u32::from(tree), "tree {tree:#x}, in a row {in_a_row:#x}");
     eprintln!("ran on the hardware device: the sum {tree:#x} of the console's tree");
+}
+
+/// The console's 16-bit wave sum where the lanes at or past s0 have left the program (a
+/// thread past the end of the data): on the console they add +0, and after each step of the
+/// tree they hold their run's partial sum all the same. On a host of 64-lane waves (AMD) the
+/// lanes that are here read each partner run's sum from a lane of it that is here.
+#[test]
+fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
+    let mut words = vec![
+        0x7DA8_0000, // v_cmpx_gt_u32 exec, s0, v0: the lanes below s0 stay
+        0, // s_cbranch_execz to the end (filled in below)
+        0x340C_0085, // v_lshlrev_b32 v6, 5, v0
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0x4A0E_0F06, // v_add_nc_u32 v7, v6, v7
+        0x4A0E_0F00, // v_add_nc_u32 v7, v0, v7
+        0x4A0E_0EFF,
+        0x0000_3C00, // v_add_nc_u32 v7, 0x3c00, v7
+    ];
+    words.extend(super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }));
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    // past every word after it, to the program's end
+    words[1] = 0xBF88_0000 | (words.len() as u32 - 2);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let wide = |h: u16| {
+        if h == 0 {
+            0.0
+        } else {
+            f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13)
+        }
+    };
+    let narrow = |f: f32| {
+        if f == 0.0 {
+            return 0;
+        }
+        let b = f.to_bits();
+        let h = ((b >> 23) - 112) << 10 | (b >> 13 & 0x3FF);
+        let rest = b & 0x1FFF;
+        (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
+    };
+    let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = false;
+    for stay in [64u32, 63, 40, 33, 32, 17, 5, 1] {
+        let terms: Vec<u16> = (0..64u32)
+            .map(|t| if t < stay { (0x3C00 + 37 * t) as u16 } else { 0 })
+            .collect();
+        let mut tree = terms.clone();
+        while tree.len() > 1 {
+            tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
+        }
+        let Some(got) = on_the_card(&shader, [stay, 0]) else {
+            return;
+        };
+        ran = true;
+        // (the high half is lane 0's term's: zero)
+        assert_eq!(got, u32::from(tree[0]), "{stay} lanes stay: got {got:#x}, the console's tree {:#x}", tree[0]);
+    }
+    if ran {
+        eprintln!("ran on the hardware device: the console's tree with lanes gone, in every case");
+    }
 }
 
 /// One `v_add_f16` whose exact result lies between two halves: 1 + 3/1024 (0x3C03) plus 2
@@ -469,8 +549,9 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
 /// `WaveActiveMax` (s0 not 0) or `WaveActiveMin`, and the two reductions share their end:
 /// each arm saves EXEC and reduces up to the read of lane 32, the join reads lane 0 and
 /// restores EXEC (`deferred_tiled:CS_WaterTransmittanceOpticalDepthProcessing`, 0xb3c-0xbe0).
-/// Neither block holds a whole section, and `v_permlanex16_b32` stopped the translation; with
-/// the join's code in each arm ([`ir::whole_sections`]) each section is whole.
+/// Neither block holds a whole section; `v_permlanex16_b32` lowered on its own reads the lanes
+/// the host has, so the translation is the one with the join's code in each arm
+/// ([`ir::whole_sections`]), where each section is whole.
 #[test]
 fn two_reductions_that_share_their_end_translate_as_two_sections() {
     // an arm: save EXEC, the identity `init`, then `op` over the wave up to lane 32's read
@@ -526,16 +607,16 @@ fn two_reductions_that_share_their_end_translate_as_two_sections() {
     let io = io::raise(&p, &native).expect("io::raise");
     let bytes = crate::dxbc::build(&[]);
     let c = super::Container::parse(&bytes).expect("container");
+    let st_q = structure::structure(&q).expect("structure");
+    let io_q = io::raise(&q, &native).expect("io::raise");
+    let res_q = resource::track(&q, &native.layout, native.stage, Some(&st_q)).expect("track");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
-    let split = super::emit_any(&c, &native, &p, &st, &io, &res);
+    let joined = super::emit_any(&c, &native, &q, &st_q, &io_q, &res_q);
     let shader = super::emit(&c, &native, &p, &st, &io, &res);
     lower::TEST_HOST_WAVE.set(was);
-    assert!(
-        matches!(&split, Err(ShaderError::Unsupported { what, .. }) if *what == "v_permlanex16_b32"),
-        "{:?}",
-        split.err()
-    );
     let shader = shader.expect("emit");
+    let joined = joined.expect("the joined sections");
+    assert!(shader.dxil == joined.dxil, "the split sections' translation was taken");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -953,6 +1034,75 @@ fn paired_lanes_or_a_wave_inside_a_lane_branch() {
     eprintln!("ran on the hardware device: the OR of both halves in every case");
 }
 
+/// One console wave of 64 threads, thread t holding the bit `1 << (t >> 1)`: the threads below
+/// s0 OR theirs over the wave inside `if (t < s0) { ... }` ([`super::wave::WAVE_OR_V7_TO_S7`]
+/// into s7, which holds 0x77 before), and every thread stores s7 after the branch: the wave's
+/// OR, or 0x77 when no thread took the branch and the wave skipped it. A wave-wide value used
+/// past a per-lane branch, as the title's tile classification and light clustering programs
+/// use theirs: no form in two host waves takes it (they would meet inside the branch, and the
+/// skip cannot be left out: s7 would no longer keep 0x77), and the approximate form, each host
+/// wave a wave of its own, gives each half its own OR, 0x77 to the upper half while s0 <= 32.
+/// The title's 39 such programs ran approximate; [`super::emit`] now gives the paired form.
+#[test]
+fn a_wave_value_used_past_a_lane_branch_takes_the_paired_form_not_an_approximate_one() {
+    let mut w = vec![
+        sop1(0x03, 7, LIT), // s_mov_b32 s7, 0x77
+        0x77,
+        vop1(0x01, 5, k(1)),    // v_mov_b32 v5, 1
+        vop2(0x16, 6, k(1), 0), // v_lshrrev_b32 v6, 1, v0
+        vop2(0x1A, 7, v(6), 5), // v_lshlrev_b32 v7, v6, v5
+        vopc(0xC4, 0, 0),       // v_cmp_gt_u32 vcc, s0, v0
+        sop1(0x24, 12, VCC),    // s_and_saveexec_b64 s[12:13], vcc
+        sopp(0x08, 20),         // s_cbranch_execz past the OR
+    ];
+    w.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    w.extend([
+        sop1(0x04, EXEC, 12), // s_mov_b64 exec, s[12:13]
+        vop1(0x01, 8, 7),     // v_mov_b32 v8, s7
+    ]);
+    w.extend(stores([8, 7, 6, 0]));
+    let native = native_with(&w, true, 64, 0);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let pairs = super::paired(&c, &native, &p, &io, &res);
+    let chosen = super::emit(&c, &native, &p, &st, &io, &res);
+    // (as before: the paired form only where no other form takes the program)
+    let off = super::TEST_PAIRS.replace(Some(false));
+    let approximate = super::emit(&c, &native, &p, &st, &io, &res);
+    super::TEST_PAIRS.set(off);
+    lower::TEST_HOST_WAVE.set(was);
+    let (pairs, wave) = pairs.expect("the paired form");
+    assert_eq!(wave, Some(32));
+    let (chosen, approximate) = (chosen.expect("emit"), approximate.expect("an approximate form"));
+    assert!(chosen.dxil == pairs.dxil, "emit's choice is not the paired form");
+    assert!(approximate.dxil != pairs.dxil, "without the paired form, emit gives it anyway");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = chosen.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // the console: every thread stores the OR of the threads below s0, or 0x77 with none
+    let want = |s0: u32| -> Vec<u32> {
+        let or = (0..64u32).filter(|&t| t < s0).fold(0u32, |m, t| m | 1 << (t >> 1));
+        let s7 = if s0 == 0 { 0x77 } else { or };
+        (0..64u32).flat_map(|t| [s7, 1 << (t >> 1), t >> 1, t]).collect()
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for s0 in [64u32, 40, 33, 32, 10, 1, 0] {
+        let Some(got) = run_paired(&chosen, [s0, 0, 0, 0], 256) else { return };
+        same_as_console(&got, &want(s0));
+    }
+    // each half on its own: with s0 = 10 the upper half took no branch and kept 0x77
+    let Some(halves) = run_paired(&approximate, [10, 0, 0, 0], 256) else { return };
+    assert_eq!((want(10)[0], want(10)[4 * 40]), (0x1F, 0x1F));
+    assert_eq!((halves[0], halves[4 * 40]), (0x1F, 0x77), "the approximate form's lanes 0 and 40");
+    eprintln!("ran on the hardware device: the wave's OR past the branch in every lane, not each half's");
+}
+
 /// [`half_sum_program`] in the paired form: each half's tree over its 32 lanes, then the two
 /// halves' sums, the console's last addition.
 #[test]
@@ -963,4 +1113,124 @@ fn paired_lanes_sum_halves_as_the_consoles_tree() {
     let Some(got) = on_the_card(&shader, [0, 0]) else { return };
     assert_eq!(got, u32::from(tree));
     eprintln!("ran on the hardware device: the sum {tree:#x} of the console's tree");
+}
+
+/// The lens-flare scans' allocation (`lens_flares:CS_ScanMip1`, 0x5c0-0x61c): in a branch
+/// of the lanes below s0, the first lane adds the wave's count times a size (s1) to a
+/// counter, and each lane takes base + below × size with `v_mad_u32_u24`. That is the
+/// idiom a host wave may run alone ([`super::idiom::wave_local`]): each half reserves its own
+/// count's slots. The same with the count where the base goes is not.
+#[test]
+fn an_allocation_in_units_of_a_size_is_the_idiom() {
+    let program = |base: u32| -> Vec<u8> {
+        let words = [
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0016, // s_cbranch_execz past the allocation
+            0xBE82_047E, // s_mov_b64 s[2:3], exec
+            0xBE84_147E, // s_ff1_i32_b64 s4, exec
+            0xD765_0004,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v4, -1, 0
+            0xD766_0004,
+            0x0002_08C1, // v_mbcnt_hi_u32_b32 v4, -1, v4: the lane
+            0xBE86_047E, // s_mov_b64 s[6:7], exec
+            0x7DA4_0804, // v_cmpx_eq_u32 exec, s4, v4: the first lane
+            0xBE82_1002, // s_bcnt1_i32_b64 s2, s[2:3]: the count
+            0x7E02_0201, // v_mov_b32 v1, s1: the size
+            0x160A_0202, // v_mul_u32_u24 v5, s2, v1
+            0x7E16_0280, // v_mov_b32 v11, 0
+            0xE0C8_6000,
+            0x8002_050B, // buffer_atomic_add v5, v11, s[8:11], 0 idxen glc
+            0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+            0xD765_0004,
+            0x0001_007E, // v_mbcnt_lo_u32_b32 v4, exec_lo, 0
+            0xD766_0004,
+            0x0002_087F, // v_mbcnt_hi_u32_b32 v4, exec_hi, v4: the lanes below
+            0x7E0A_0505, // v_readfirstlane_b32 s5, v5: the base
+            0xD543_0006,
+            0x0002_0304 | base << 18, // v_mad_u32_u24 v6, v4, v1, s<base>
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ];
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    };
+    let idiom = |code: &[u8]| {
+        let p = ir::build(code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        super::idiom::wave_local(&p, &st)
+    };
+    assert_eq!(idiom(&program(5)), Ok(()));
+    assert!(idiom(&program(2)).is_err(), "the count as the base");
+}
+
+/// An `s_cbranch_execz` guarding a loop whose exit is `v_cmp_eq_u32` + `s_cbranch_vccz`
+/// must not be stripped by `ir::without_skips`: when no lane enters the loop (`EXEC == 0`),
+/// `v_cmp` always writes 0 to `vcc`, so `s_cbranch_vccz` loops until the synthetic loop limit
+/// and aborts the shader before the store after the loop runs.
+#[test]
+fn without_skips_keeps_execz_guard_over_vcc_loop() {
+    // Same CFG as a wave-wide light loop guarded by `s_cbranch_execz`:
+    //   if (tid < s0) {
+    //       loop { v5 += 1; if (v5 == 3) break; }   // v_cmp_eq + s_cbranch_vccz latch
+    //   }
+    //   store(7 + v5)
+    let words = [
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0  (active iff tid < s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0005, // s_cbranch_execz +5 -> after_loop
+        // loop:
+        0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+        0x7D84_0A83, // v_cmp_eq_u32 vcc, 3, v5
+        0xBF86_0001, // s_cbranch_vccz +1 -> latch
+        0xBF82_0001, // s_branch +1 -> after_loop
+        // latch:
+        0xBF82_FFFB, // s_branch -5 -> loop
+        // after_loop:
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7DA4_0001, // v_cmpx_eq_u32 exec, s1, v0 (only lane s1 stores)
+        0x4A00_0A87, // v_add_nc_u32 v0, 7, v5
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let stripped = ir::without_skips(&p, true);
+    assert!(
+        stripped.is_none(),
+        "without_skips must keep s_cbranch_execz guarding a vcc loop"
+    );
+    let p_run = stripped.as_ref().unwrap_or(&p);
+    let wide_blocks: HashSet<usize> = (0..p_run.blocks.len())
+        .filter(|&b| {
+            p_run.blocks[b]
+                .insts
+                .last()
+                .is_some_and(|i| matches!(i.name(), "s_cbranch_execz" | "s_cbranch_vccz"))
+        })
+        .collect();
+    assert_eq!(wide_blocks.len(), 2, "expected execz skip and vccz loop branch");
+    // Check both per-lane lowering and wave-wide lowering (as in `widen` when the loop body
+    // contains cross-lane work).
+    let cases = [
+        // (s0 = active count, s1 = lane that stores, expected value)
+        (0u32, 0u32, 7u32), // empty wave skips loop -> v5 stays 0 -> stores 7
+        (10, 0, 10),        // active lane runs 3 iterations -> stores 10
+        (10, 35, 7),        // inactive lane in second host wave -> stores 7
+        (64, 63, 10),       // full wave runs 3 iterations -> stores 10
+    ];
+    for (label, wide) in [("per-lane", HashSet::new()), ("wave-wide", wide_blocks)] {
+        let shader = lowered(&native, p_run, &wide).expect("lower");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (below, lane, expected) in cases {
+            let Some(got) = on_the_card(&shader, [below, lane]) else { return };
+            assert_eq!(got, expected, "{label}: s0 = {below}, lane {lane}");
+        }
+    }
 }

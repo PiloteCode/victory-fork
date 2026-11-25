@@ -296,7 +296,14 @@ struct SocketAddress {
     len: i32,
 }
 
-/// Every candidate must be loopback.
+/// The most candidates `WSAConnectByList` takes. Each must be loopback and
+/// the host tries them one after another, so a real list is a handful; a
+/// count beyond this is taken for a bad structure rather than read.
+const MAX_CONNECT_CANDIDATES: usize = 64;
+
+/// Every candidate must be loopback. A count below zero or above
+/// [`MAX_CONNECT_CANDIDATES`] fails with `WSAEINVAL`, without the host
+/// seeing a list we have not vetted entry by entry.
 pub extern "system" fn WSAConnectByList(
     s: Socket,
     list: *const u8,
@@ -308,15 +315,25 @@ pub extern "system" fn WSAConnectByList(
     reserved: *mut c_void,
 ) -> i32 {
     if !list.is_null() {
-        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
-        let entries = unsafe {
-            let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
-            std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
+        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`, which starts with its count.
+        let count = unsafe { list.cast::<i32>().read_unaligned() };
+        let Some(count) = usize::try_from(count)
+            .ok()
+            .filter(|&n| n <= MAX_CONNECT_CANDIDATES)
+        else {
+            once(
+                "network connect refused",
+                format!("a list of {count} addresses"),
+            );
+            wsa_error(WSAEINVAL);
+            return 0;
         };
-        if !entries
-            .iter()
-            .all(|e| reachable("network connect blocked", e.addr, e.len))
-        {
+        let reachable_entry = |i: usize| {
+            // SAFETY: `count` entries follow the count, and `i < count`.
+            let e = unsafe { list.add(8).cast::<SocketAddress>().add(i).read_unaligned() };
+            reachable("network connect blocked", e.addr, e.len)
+        };
+        if !(0..count).all(reachable_entry) {
             return 0;
         }
     }
@@ -537,6 +554,14 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
+fn blocked_lookup(result: *mut *mut c_void) -> i32 {
+    if !result.is_null() {
+        // SAFETY: a non-null result points to the caller's output slot.
+        unsafe { result.write(std::ptr::null_mut()) };
+    }
+    WSAHOST_NOT_FOUND
+}
+
 pub extern "system" fn getaddrinfo(
     node: *const c_char,
     service: *const c_char,
@@ -544,7 +569,7 @@ pub extern "system" fn getaddrinfo(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(narrow(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -558,7 +583,7 @@ pub extern "system" fn GetAddrInfoW(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(wide(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -578,7 +603,7 @@ pub extern "system" fn GetAddrInfoExA(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(narrow(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -598,7 +623,7 @@ pub extern "system" fn GetAddrInfoExW(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(wide(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -894,6 +919,120 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    /// A `SOCKET_ADDRESS_LIST` holding `N` entries, whatever `count` says.
+    #[repr(C)]
+    struct AddressList<const N: usize> {
+        count: i32,
+        entries: [SocketAddress; N],
+    }
+
+    fn address_list<const N: usize>(count: i32, addrs: &[[u8; 16]; N]) -> AddressList<N> {
+        AddressList {
+            count,
+            entries: std::array::from_fn(|i| SocketAddress {
+                addr: addrs[i].as_ptr(),
+                len: 16,
+            }),
+        }
+    }
+
+    #[test]
+    fn connect_by_list_vets_a_bounded_list() {
+        // Also starts Winsock for the raw calls below.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let null = std::ptr::null_mut::<c_void>();
+        let by_list = |s, list: *const u8| {
+            WSAConnectByList(
+                s,
+                list,
+                null.cast(),
+                null,
+                null.cast(),
+                null,
+                std::ptr::null(),
+                null,
+            )
+        };
+        let s = socket(2, 1, 6);
+        assert_ne!(s, INVALID_SOCKET);
+
+        // More candidates than the limit, every one of them loopback.
+        let many = [v4(HOME, port); MAX_CONNECT_CANDIDATES + 1];
+        let list = address_list(many.len() as i32, &many);
+        assert_eq!(by_list(s, (&raw const list).cast()), 0);
+        assert_eq!(last_error(), WSAEINVAL);
+
+        // A count past the entries present, or below zero: refused before
+        // anything after the count is read.
+        let home = [v4(HOME, port)];
+        for count in [i32::MAX, -1] {
+            let list = address_list(count, &home);
+            assert_eq!(by_list(s, (&raw const list).cast()), 0, "count {count}");
+            assert_eq!(last_error(), WSAEINVAL, "count {count}");
+        }
+
+        // One candidate off the machine is enough to refuse the list.
+        let mixed = [v4(HOME, port), v4(AWAY, 80)];
+        let list = address_list(2, &mixed);
+        assert_eq!(by_list(s, (&raw const list).cast()), 0);
+        assert_eq!(last_error(), WSAENETUNREACH);
+
+        // A loopback list reaches the host and connects.
+        let list = address_list(1, &home);
+        assert_eq!(by_list(s, (&raw const list).cast()), 1);
+        listener.accept().unwrap();
+        close(s);
+    }
+
+    #[test]
+    fn blocked_name_lookups_clear_the_result() {
+        let ansi = c"blocked.invalid".as_ptr();
+        let wide: Vec<u16> = "blocked.invalid\0".encode_utf16().collect();
+        let wide = wide.as_ptr();
+        let null = std::ptr::null();
+        let null_mut = std::ptr::null_mut();
+        let check = |lookup: &dyn Fn(*mut *mut c_void) -> i32| {
+            let mut result = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(lookup(&mut result), WSAHOST_NOT_FOUND);
+            assert!(result.is_null());
+            assert_eq!(lookup(std::ptr::null_mut()), WSAHOST_NOT_FOUND);
+        };
+        check(&|result| getaddrinfo(ansi, std::ptr::null(), null, result));
+        check(&|result| GetAddrInfoW(wide, std::ptr::null(), null, result));
+        check(&|result| {
+            GetAddrInfoExA(
+                ansi,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+        check(&|result| {
+            GetAddrInfoExW(
+                wide,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+    }
 
     #[test]
     fn only_loopback_is_reachable() {

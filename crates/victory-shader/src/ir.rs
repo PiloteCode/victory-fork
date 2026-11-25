@@ -123,6 +123,27 @@ impl Inst {
     }
 }
 
+thread_local! {
+    /// See [`with_shared_slots`].
+    static SHARED_SLOTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with programs built so that a register pair parked in two lanes of a VGPR moves
+/// as a pair wherever its save or restore comes together, also where the lower lane holds a
+/// single scalar at other times ([`unspill`] otherwise moves every half alone then). Each
+/// save and restore keeps its meaning either way (a pair move is the two moves at once, where
+/// nothing in between sees the difference); what changes is that a parked lane mask then comes
+/// back as the mask it is. `PS_VoxelizeVisiblity` parks a lane mask in lanes 3 and 4 of v56 and
+/// later a single scalar in lane 3: its mask came back as two scalars, a mask the
+/// structurisation cannot see into ("an opaque lane mask"). A retry ([`crate::emit::emit`]),
+/// so that the programs that translate as they are keep their form.
+pub fn with_shared_slots<R>(f: impl FnOnce() -> R) -> R {
+    let was = SHARED_SLOTS.replace(true);
+    let r = f();
+    SHARED_SLOTS.set(was);
+    r
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
@@ -245,7 +266,9 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// A register pair parked in two neighbouring lanes (a lane mask, a 64-bit
 /// address) moves as a pair (`s_mov_b64`) when every save and every restore
 /// of the two lanes come together, so a parked lane mask comes back as the
-/// mask it is; otherwise its halves come back as two scalars.
+/// mask it is; otherwise its halves come back as two scalars (with
+/// [`with_shared_slots`], the saves and restores that come together still
+/// move as pairs).
 fn unspill(
     list: &mut [gfx10::Instruction],
     leaders: &[usize],
@@ -386,6 +409,9 @@ fn unspill(
         }
     };
     let mut pairs: Vec<(u8, u32)> = Vec::new();
+    // ([`with_shared_slots`]) the upper lanes' parks that move with a lower one
+    let mut taken: Vec<usize> = Vec::new();
+    let shared = SHARED_SLOTS.get();
     for &(reg, lane) in &slots {
         if !wave64 || pairs.iter().any(|&(r, l)| r == reg && l + 1 == lane) || !slots.contains(&(reg, lane + 1)) {
             continue;
@@ -396,8 +422,12 @@ fn unspill(
         let mut distinct: Vec<usize> = partners.iter().flatten().copied().collect();
         distinct.sort_unstable();
         distinct.dedup();
-        if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len() {
+        let found = partners.iter().flatten().count();
+        if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len()
+            || shared && found > 0 && distinct.len() == found
+        {
             pairs.push((reg, lane));
+            taken.extend(distinct);
         }
     }
     // Codes for the parked scalars: the trap temporaries (108..=123), then
@@ -450,7 +480,8 @@ fn unspill(
             continue;
         };
         let Some(slot) = code_of(reg, lane) else { return Vec::new() };
-        if pairs.contains(&(reg, lane)) {
+        let alone = shared && (pairs.contains(&(reg, lane)) && partner(i).is_none() || lane > 0 && pairs.contains(&(reg, lane - 1)) && !taken.contains(&i));
+        if pairs.contains(&(reg, lane)) && !alone {
             let Some(j) = partner(i) else { return Vec::new() };
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
@@ -458,7 +489,7 @@ fn unspill(
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((at, Some((true, dst, src))));
             edits.push((gone, None));
-        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
+        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) && !alone {
             // the upper half of a pair: moved with the lower
         } else {
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
@@ -832,6 +863,103 @@ pub(crate) fn whole_sections(p: &Program) -> Option<Program> {
     Some(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// Whether `goal` is reachable from `start` while staying inside `region`.
+fn reaches_within(p: &Program, region: &[bool], start: usize, goal: usize) -> bool {
+    if !region[start] {
+        return false;
+    }
+    let mut seen = vec![false; p.blocks.len()];
+    let mut stack = vec![start];
+    seen[start] = true;
+    while let Some(u) = stack.pop() {
+        if u == goal {
+            return true;
+        }
+        for s in p.blocks[u].exit.successors() {
+            if region[s] && !seen[s] {
+                seen[s] = true;
+                stack.push(s);
+            }
+        }
+    }
+    false
+}
+
+/// All blocks reachable from `start`.
+fn reachable_from(p: &Program, start: usize) -> Vec<bool> {
+    let mut seen = vec![false; p.blocks.len()];
+    let mut stack = vec![start];
+    seen[start] = true;
+    while let Some(u) = stack.pop() {
+        for s in p.blocks[u].exit.successors() {
+            if !seen[s] {
+                seen[s] = true;
+                stack.push(s);
+            }
+        }
+    }
+    seen
+}
+
+/// Whether `last` (`s_cbranch_scc0` / `s_cbranch_scc1`) tests an `SCC` value
+/// written in `block` by a mask AND with `EXEC` or `VCC` (so `SCC == 0`
+/// whenever `EXEC == 0`).
+fn scc_zero_under_empty_exec(block: &Block, last: &Inst) -> bool {
+    let Some(scc) = last.read(Reg::Scc) else {
+        return false;
+    };
+    let Some(def) = block.insts.iter().rev().find(|i| i.write(Reg::Scc) == Some(scc)) else {
+        return false;
+    };
+    match def.name() {
+        "s_and_b32" | "s_and_b64" | "s_and_saveexec_b32" | "s_and_saveexec_b64" => {
+            def.read(Reg::S(EXEC)).is_some() || def.read(Reg::S(VCC)).is_some()
+        }
+        "s_andn2_b32" | "s_andn2_b64" => matches!(
+            &def.fields,
+            crate::gfx10::Fields::Sop { src, .. }
+                if matches!(
+                    src.first(),
+                    Some(crate::gfx10::Operand::Scalar { code, .. })
+                        if *code == EXEC || *code == VCC
+                )
+        ),
+        _ => false,
+    }
+}
+
+/// Whether `region` contains a loop that an empty wave (`EXEC == 0`) cannot
+/// leave: a block in `region` ending in a mask branch whose zero-mask edge
+/// stays on a cycle within `region`. Removing a preceding `s_cbranch_execz`
+/// lets `EXEC == 0` enter that loop and spin until the synthetic loop limit
+/// fires (aborting the shader, or hanging the GPU when the loop carries
+/// wave-wide group barriers).
+fn has_empty_exec_loop(p: &Program, region: &[bool]) -> bool {
+    for (x, block) in p.blocks.iter().enumerate() {
+        if !region[x] {
+            continue;
+        }
+        let Exit::Branch { taken, not_taken } = block.exit else {
+            continue;
+        };
+        let Some(last) = block.insts.last() else {
+            continue;
+        };
+        let zero_edge = match last.name() {
+            // Under EXEC == 0, `v_cmp*` writes VCC = 0 and EXEC is 0.
+            "s_cbranch_vccz" | "s_cbranch_execz" => taken,
+            "s_cbranch_vccnz" | "s_cbranch_execnz" => not_taken,
+            "s_cbranch_scc0" if scc_zero_under_empty_exec(block, last) => taken,
+            "s_cbranch_scc1" if scc_zero_under_empty_exec(block, last) => not_taken,
+            _ => continue,
+        };
+        if reaches_within(p, region, zero_edge, x) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
@@ -852,7 +980,10 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        if ends(taken)
+            && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && !has_empty_exec_loop(p, &reachable_from(p, not_taken))
+        {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
             any = true;
@@ -996,6 +1127,11 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
             return None;
         }
+        // A loop inside the region whose exit requires a non-zero lane mask
+        // cannot terminate when EXEC == 0 falls through.
+        if has_empty_exec_loop(p, &inside) {
+            return None;
+        }
         Some(inside)
     };
     let mut blocks = p.blocks.clone();
@@ -1007,7 +1143,8 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
+        let early_out = ends(taken) && !has_empty_exec_loop(p, &reachable_from(p, not_taken));
+        if early_out || skipped(b, taken, not_taken).is_some() {
             blocks[b].insts.pop();
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
@@ -2103,5 +2240,127 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    /// `PS_VoxelizeVisiblity`'s parking (0xa18-0xa38, 0xe44-0xe4c, 0x2df8, 0x3184): a lane
+    /// mask parked in lanes 3 and 4 of v56 and taken back to make EXEC, later a single scalar
+    /// parked in lane 3. Built as it is, the mask comes back as two scalars, which the
+    /// structurisation cannot see into; with [`with_shared_slots`] it comes back as the pair
+    /// it is, and EXEC as the compare's lanes.
+    #[test]
+    fn a_mask_parked_in_lanes_another_scalar_shares_comes_back_whole_with_shared_slots() {
+        let writelane = |lane: u32, s: u32| [0xD761_0038, s | (128 + lane) << 9]; // v_writelane_b32 v56, s, lane
+        let readlane = |s: u32, lane: u32| [0xD760_0000 | s, (256 + 56) | (128 + lane) << 9]; // v_readlane_b32 s, v56, lane
+        let mut w = vec![
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBEA2_046A, // s_mov_b64 s[34:35], vcc
+        ];
+        w.extend(writelane(3, 34));
+        w.extend(writelane(4, 35));
+        w.push(0xBEA2_0480); // s_mov_b64 s[34:35], 0
+        w.extend(readlane(34, 3));
+        w.extend(readlane(35, 4));
+        let restore = 4 * (w.len() - 4) as u64; // (the first restore's offset)
+        w.extend([
+            0xBE82_2422, // s_and_saveexec_b64 s[2:3], s[34:35]
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        ]);
+        w.extend(writelane(3, 1));
+        w.push(0xBE81_0380); // s_mov_b32 s1, 0
+        w.extend(readlane(1, 3));
+        w.push(S_ENDPGM);
+        let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let at = |p: &Program| {
+            let i = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.machine.offset as u64 == restore).expect("the restore");
+            i.name()
+        };
+        let alone = build(&code, true, 64).unwrap();
+        assert_eq!(at(&alone), "s_mov_b32");
+        let shared = with_shared_slots(|| build(&code, true, 64)).unwrap();
+        assert_eq!(at(&shared), "s_mov_b64");
+        let opaque = |p: &Program| {
+            let st = crate::structure::structure(p).unwrap();
+            let v1 = p.blocks.iter().enumerate().flat_map(|(b, blk)| blk.insts.iter().enumerate().map(move |(i, inst)| (b, i, inst)));
+            let (b, i, _) = v1.into_iter().find(|(_, _, inst)| inst.name() == "v_mov_b32").expect("the guarded move");
+            let guard = st.guards[b][i].expect("a guard");
+            st.bools.support(guard).iter().any(|a| matches!(a, crate::structure::Atom::Opaque(_)))
+        };
+        assert!(opaque(&alone), "two scalars make an opaque mask");
+        assert!(!opaque(&shared), "the pair is the compare's mask");
+    }
+
+    #[test]
+    fn without_skips_keeps_execz_over_vcc_loops_and_strips_scalar_loops() {
+        // 1. `s_cbranch_execz` over a `v_cmp_eq_u32` + `s_cbranch_vccz` loop: must be kept.
+        let vccz_loop = build_words(
+            &[
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0003, // s_cbranch_execz +3 -> after
+                0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+                0x7D84_0A83, // v_cmp_eq_u32 vcc, 3, v5
+                0xBF86_FFFD, // s_cbranch_vccz -3 -> loop
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_skips(&vccz_loop, false).is_none());
+        assert!(without_skips(&vccz_loop, true).is_none());
+
+        // 2. `s_cbranch_execz` over a `s_cbranch_vccnz` exit loop (zero edge stays in loop): kept.
+        let vccnz_exit = build_words(
+            &[
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz +4 -> after
+                0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+                0x7D84_0A83, // v_cmp_eq_u32 vcc, 3, v5
+                0xBF87_0001, // s_cbranch_vccnz +1 -> after
+                0xBF82_FFFC, // s_branch -4 -> loop
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_skips(&vccnz_exit, false).is_none());
+        assert!(without_skips(&vccnz_exit, true).is_none());
+
+        // 3. `s_cbranch_execz` early-out (`-> s_endpgm`) before a `s_cbranch_vccz` loop: kept.
+        let early_out_vccz = build_words(
+            &[
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0003, // s_cbranch_execz +3 -> endpgm
+                0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+                0x7D84_0A83, // v_cmp_eq_u32 vcc, 3, v5
+                0xBF86_FFFD, // s_cbranch_vccz -3 -> loop
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_early_outs(&early_out_vccz).is_none());
+        assert!(without_skips(&early_out_vccz, true).is_none());
+
+        // 4. `s_cbranch_execz` over a fixed scalar loop (SCC from `s_cmp_lg_u32`): still stripped.
+        let scalar_loop = build_words(
+            &[
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz +4 -> after
+                0xBE84_0380, // s_mov_b32 s4, 0
+                0x8004_8104, // s_add_u32 s4, s4, 1
+                0xBF07_8404, // s_cmp_lg_u32 s4, 4
+                0xBF85_FFFD, // s_cbranch_scc1 -3 -> loop
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_skips(&scalar_loop, true).is_some());
     }
 }

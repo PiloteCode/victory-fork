@@ -11,6 +11,7 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+pub mod bink;
 mod host;
 pub mod modules;
 mod registry;
@@ -119,5 +120,31 @@ mod tests {
             ),
             Some(Provenance::Hle)
         );
+    }
+
+    // #510: the RPC runtime's GUID calls are ours, so the DLL itself stays
+    // outside the host policy (its own `ws2_32` imports would be a network
+    // path `modules::net` never sees).
+    #[test]
+    fn the_rpc_runtime_is_implemented_here() {
+        let r = HleResolver::new(HostPolicy::none());
+        for call in [
+            "UuidCreate",
+            "UuidCreateSequential",
+            "UuidFromStringA",
+            "UuidFromStringW",
+            "UuidToStringA",
+            "UuidToStringW",
+            "RpcStringFreeA",
+            "RpcStringFreeW",
+        ] {
+            assert_eq!(
+                r.classify("rpcrt4.dll", &name(call)),
+                Some(Provenance::Hle),
+                "{call}"
+            );
+        }
+        // A call we do not implement is not passed to the host either.
+        assert_eq!(r.classify("rpcrt4.dll", &name("RpcServerRegisterIf")), None);
     }
 }

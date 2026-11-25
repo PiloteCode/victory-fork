@@ -8,7 +8,9 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+mod translate_diff;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -81,9 +83,32 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// With the list (implied): each emitted program's line names a
+        /// hash of its DXIL (`dxil=` and 16 hex digits of its BLAKE3,
+        /// before validation), for `translate-diff`.
         #[arg(long)]
-        jobs: Option<usize>,
+        hashes: bool,
+        /// Worker threads, at least 1 (default: every logical core).
+        #[arg(long)]
+        jobs: Option<NonZeroUsize>,
+        /// Warm the run's shader cache: a file of shader hashes (the 16
+        /// hex digits a run's log names a shader by, anywhere in a line);
+        /// the containers with those hashes are translated into the
+        /// cache for the detected adapter. Set `VICTORY_HOST_WAVE` and
+        /// `VICTORY_VIEW_LIMIT` to warm for a different host.
+        #[arg(long)]
+        warm: Option<PathBuf>,
+    },
+    /// Compare two `translate --list` outputs (two builds over the same
+    /// shaders): the programs one validates and the other does not, with
+    /// the other's reasons, and with `--hashes` lists, the programs both
+    /// validate whose DXIL differs.
+    TranslateDiff {
+        old: PathBuf,
+        new: PathBuf,
+        /// Also name each program (container hash and stage).
+        #[arg(long)]
+        keys: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -151,18 +176,30 @@ fn main() -> Result<()> {
             validate,
             pipelines,
             list,
+            hashes,
             jobs,
+            warm,
         } => {
+            let view_limit = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok());
+            let host_wave = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok());
+            if warm.is_some() && (view_limit.is_none() || host_wave.is_none()) {
+                victory_hle::modules::d3d12x::prepare_shader_warm().map_err(anyhow::Error::msg)?;
+            }
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = view_limit {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = host_wave {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            let jobs = jobs.map(NonZeroUsize::get);
+            if let Some(file) = warm {
+                return translate::warm(paths, &file, jobs);
+            }
+            translate::run(paths, validate, pipelines, list, hashes, jobs)
         }
+        Command::TranslateDiff { old, new, keys } => translate_diff::run(&old, &new, keys),
         Command::Run {
             exe,
             unimplemented,
@@ -170,7 +207,14 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            if code != 0 {
+                // Preserve all 32 bits of the Windows process status.
+                std::process::exit(code as i32);
+            }
+            Ok(())
+        }
         Command::Config => show_config(),
     }
 }
@@ -219,4 +263,25 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jobs(args: &[&str]) -> Result<Option<usize>, clap::Error> {
+        let all = [&["victory", "translate", "shaders"][..], args].concat();
+        match Cli::try_parse_from(all)?.command {
+            Command::Translate { jobs, .. } => Ok(jobs.map(NonZeroUsize::get)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn translate_jobs_must_be_at_least_one() {
+        let zero = jobs(&["--jobs", "0"]).expect_err("--jobs 0 is refused");
+        assert_eq!(zero.kind(), clap::error::ErrorKind::ValueValidation);
+        assert_eq!(jobs(&["--jobs", "1"]).unwrap(), Some(1));
+        assert_eq!(jobs(&[]).unwrap(), None);
+    }
 }

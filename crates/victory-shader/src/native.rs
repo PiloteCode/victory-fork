@@ -58,10 +58,13 @@
 //!             u16 maximum primitives, u8 user SGPRs, u8 output topology
 //!             (2 triangles); code follows at E+0x45c
 //! record +0x4c u32 LDS bytes (`lds_byte_size`; mesh programs read it here)
+//! GS  E+0x27c u32 GS-VS ring dwords per invocation, E+0x284 u32 maximum
+//!             vertices, E+0x28c u32 dwords per vertex (four per register
+//!             of the output signature)
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! Merged stages keep their other stage data in another layout (not read).
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -120,6 +123,11 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+const GS_SLOT_DWORDS: usize = 0x27c;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX_DWORDS: usize = 0x28c;
+/// D3D12's most vertices a geometry shader emits.
+const MAX_GS_VERTICES: u32 = 1024;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -165,9 +173,11 @@ pub struct NativeProgram {
 }
 
 impl NativeProgram {
-    /// The code with each render target's export patched for its full
-    /// 32-bit format, so exports carry the shader's values unconverted (as
-    /// the console does at pipeline creation for that format).
+    /// The code as the host runs it: each render target's export patched
+    /// for its full 32-bit format, so exports carry the shader's values
+    /// unconverted (as the console does at pipeline creation for that
+    /// format); a geometry program's start keeping every lane
+    /// ([`all_lanes`]).
     pub fn patched_code(&self) -> Vec<u8> {
         let mut code = self.code.clone();
         if let StageIo::Ps { patches, .. } = &self.io {
@@ -178,7 +188,46 @@ impl NativeProgram {
                 }
             }
         }
+        if self.stage == HwStage::Gs {
+            all_lanes(&mut code, self.wave64);
+        }
         code
+    }
+}
+
+/// A geometry program shares its hardware wave with the vertex program run
+/// before it (the ES half) and starts by narrowing EXEC to its own threads:
+/// `s_bfe_* sN, s3, lit(0x80008)` takes their count from bits 8-15 of the
+/// merged wave info, `s_bfm_b64 exec, sN, 0` makes the mask (a count of 64
+/// is all lanes after it). The host runs one invocation per primitive, each
+/// a live one, so that mask is every lane: the `s_bfm_b64` becomes
+/// `s_mov_b64 exec, -1` (one dword, as it was).
+fn all_lanes(code: &mut [u8], wave64: bool) {
+    use crate::gfx10::{Fields, Operand};
+    const EXEC: u8 = 126;
+    const S_MOV_B64_EXEC_ALL: u32 = 0xBEFE_04C1;
+    let Ok(list) = crate::gfx10::decode(code) else {
+        return;
+    };
+    for pair in list.windows(2) {
+        let [count, mask] = pair else { continue };
+        let (Fields::Sop { dst: Some(n), src: from, .. }, Fields::Sop { dst: Some(exec), src: of, .. }) =
+            (count.fields(wave64), mask.fields(wave64))
+        else {
+            continue;
+        };
+        let Operand::Scalar { code: n, .. } = n else {
+            continue;
+        };
+        let counts = matches!(count.name(), Some("s_bfe_i32" | "s_bfe_u32"))
+            && matches!(from[..], [Operand::Scalar { code: 3, .. }, Operand::Literal(0x0008_0008)]);
+        let masks = mask.name() == Some("s_bfm_b64")
+            && matches!(exec, Operand::Scalar { code: EXEC, .. })
+            && matches!(of[..], [Operand::Scalar { code, .. }, Operand::Const(128)] if code == n)
+            && mask.words.len() == 1;
+        if counts && masks {
+            code[mask.offset..mask.offset + 4].copy_from_slice(&S_MOV_B64_EXEC_ALL.to_le_bytes());
+        }
     }
 }
 
@@ -268,6 +317,19 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// A geometry program's output ring: each invocation writes the vertices it
+/// emits to a slot of its own in the GS-VS ring (in LDS on this console),
+/// vertex after vertex, register r of the output signature at dwords
+/// 4r..4r+3 of a vertex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeometryIo {
+    /// The most vertices an invocation emits.
+    pub max_vertices: u32,
+    /// Dwords per vertex in the ring.
+    pub vertex_dwords: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -446,12 +508,61 @@ fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     }
     let stream =
         bytes(blob, XBCH_HEADER as u64, packed).ok_or(Malformed("XBCH stream out of bounds"))?;
-    let out = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(stream, unpacked as usize)
-        .map_err(|_| Malformed("XBCH stream does not inflate to its stated size"))?;
-    if out.len() as u64 != unpacked {
-        return Err(Malformed("XBCH stream does not inflate to its stated size"));
-    }
+    let out = inflate_zlib_exact(stream, unpacked as usize)
+        .ok_or(Malformed("XBCH stream does not inflate to its stated size"))?;
     Ok(out)
+}
+
+/// Inflates a zlib stream incrementally up to `expected` bytes, rejecting
+/// truncated, corrupt, under-filled, or oversized streams without eagerly
+/// allocating the full declared size up front.
+fn inflate_zlib_exact(source: &[u8], expected: usize) -> Option<Vec<u8>> {
+    let mut state = zlib_rs::Inflate::new(true, 15);
+    let mut out = Vec::new();
+    let (mut in_pos, mut out_pos) = (0usize, 0usize);
+    loop {
+        if out_pos == expected {
+            let mut extra = [0u8; 1];
+            let status = state
+                .decompress(
+                    &source[in_pos..],
+                    &mut extra,
+                    zlib_rs::InflateFlush::NoFlush,
+                )
+                .ok()?;
+            return (status == zlib_rs::Status::StreamEnd
+                && state.total_out() as usize == expected)
+                .then_some(out);
+        }
+        if out_pos == out.len() {
+            let next_len = if out.is_empty() {
+                expected.min(source.len().saturating_mul(4).max(4096))
+            } else {
+                out.len().saturating_mul(2).min(expected)
+            };
+            out.resize(next_len, 0);
+        }
+        let status = state
+            .decompress(
+                &source[in_pos..],
+                &mut out[out_pos..],
+                zlib_rs::InflateFlush::NoFlush,
+            )
+            .ok()?;
+        let next_in = state.total_in() as usize;
+        let next_out = state.total_out() as usize;
+        match status {
+            zlib_rs::Status::StreamEnd => {
+                out.truncate(next_out);
+                return (next_out == expected).then_some(out);
+            }
+            zlib_rs::Status::Ok if next_in != in_pos || next_out != out_pos => {
+                in_pos = next_in;
+                out_pos = next_out;
+            }
+            zlib_rs::Status::Ok | zlib_rs::Status::BufError => return None,
+        }
+    }
 }
 
 fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
@@ -538,6 +649,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::Gs => gs_io(stage_data),
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -657,6 +769,25 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
     }))
 }
 
+/// A geometry program's ring layout; none (its I/O is then not raised) when
+/// the words are not a layout: a slot of `max_vertices` vertices of whole
+/// registers.
+fn gs_io(data: &[u8]) -> StageIo {
+    let word = |at| u32_at(data, at).unwrap_or(0);
+    let (slot, max_vertices, vertex_dwords) = (word(GS_SLOT_DWORDS), word(GS_MAX_VERTICES), word(GS_VERTEX_DWORDS));
+    let plausible = (1..=MAX_GS_VERTICES).contains(&max_vertices)
+        && (1..=4 * MAX_SEMANTICS).contains(&vertex_dwords)
+        && vertex_dwords.is_multiple_of(4)
+        && slot == max_vertices * vertex_dwords;
+    if !plausible {
+        return StageIo::None;
+    }
+    StageIo::Gs(GeometryIo {
+        max_vertices,
+        vertex_dwords,
+    })
+}
+
 /// For entries already sized by `as_chunks`.
 fn le32(entry: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(entry[at..at + 4].try_into().unwrap())
@@ -729,12 +860,15 @@ mod tests {
     }
 
     fn xbch(unpacked: &[u8]) -> Vec<u8> {
-        let stream = miniz_oxide::deflate::compress_to_vec_zlib(unpacked, 6);
+        let mut buf = vec![0u8; zlib_rs::compress_bound(unpacked.len())];
+        let (stream, rc) =
+            zlib_rs::compress_slice(&mut buf, unpacked, zlib_rs::DeflateConfig::new(6));
+        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
         let mut out = b"XBCH".to_vec();
         out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
         out.extend_from_slice(&(stream.len() as u64).to_le_bytes());
         out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
-        out.extend_from_slice(&stream);
+        out.extend_from_slice(stream);
         out
     }
 
@@ -1019,5 +1153,86 @@ mod tests {
         let at = FSSM_HEADER + slot(HwStage::Ls);
         bad_record[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_record))])).is_err());
+    }
+
+    /// A geometry program's start narrows EXEC to its threads; the host keeps
+    /// every lane, and only that mask changes.
+    #[test]
+    fn a_geometry_program_keeps_every_lane() {
+        let words: [u32; 6] = [
+            0x9400_FF03, // s_bfe_i32 s0, s3, lit(0x80008)
+            0x0008_0008,
+            0x92FE_8000, // s_bfm_b64 exec, s0, 0
+            0xBF06_C000, // s_cmp_eq_u32 s0, 64
+            0x85FE_7EC1, // s_cselect_b64 exec, -1, exec
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = |stage| NativeProgram {
+            stage,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::None,
+            code: code.clone(),
+        };
+        let patched = program(HwStage::Gs).patched_code();
+        let mut want = code.clone();
+        want[8..12].copy_from_slice(&0xBEFE_04C1u32.to_le_bytes()); // s_mov_b64 exec, -1
+        assert_eq!(patched, want);
+        // (another stage's code, or another count, is left alone)
+        assert_eq!(program(HwStage::Vs).patched_code(), code);
+        let mut other = program(HwStage::Gs);
+        other.code[4..8].copy_from_slice(&0x0008_0000u32.to_le_bytes());
+        assert_eq!(other.patched_code(), other.code);
+    }
+
+    /// A geometry program's ring layout from its stage data; none for words
+    /// that are no layout.
+    #[test]
+    fn a_geometry_programs_ring_layout() {
+        let mut data = vec![0u8; GS_VERTEX_DWORDS + 4];
+        for (at, v) in [(GS_SLOT_DWORDS, 60u32), (GS_MAX_VERTICES, 3), (GS_VERTEX_DWORDS, 20)] {
+            data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(
+            gs_io(&data),
+            StageIo::Gs(GeometryIo {
+                max_vertices: 3,
+                vertex_dwords: 20
+            })
+        );
+        data[GS_SLOT_DWORDS..GS_SLOT_DWORDS + 4].copy_from_slice(&59u32.to_le_bytes());
+        assert_eq!(gs_io(&data), StageIo::None);
+        assert_eq!(gs_io(&[]), StageIo::None);
+    }
+
+    #[test]
+    fn rejects_truncated_oversized_and_bad_checksum_xbch_streams() {
+        let plain = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let good = xbch(&plain);
+        assert_eq!(unpack(&good).unwrap(), plain);
+
+        // Truncated zlib stream (drop last byte, update packed length).
+        let mut truncated = good[..good.len() - 1].to_vec();
+        let new_packed = (truncated.len() - XBCH_HEADER) as u64;
+        truncated[8..16].copy_from_slice(&new_packed.to_le_bytes());
+        assert!(unpack(&truncated).is_err());
+
+        // Stated unpacked size smaller than the inflated output.
+        let mut oversized = good.clone();
+        oversized[16..24].copy_from_slice(&((plain.len() - 1) as u64).to_le_bytes());
+        assert!(unpack(&oversized).is_err());
+
+        // Stated unpacked size larger than the inflated output.
+        let mut underfilled = good.clone();
+        underfilled[16..24].copy_from_slice(&((plain.len() + 1) as u64).to_le_bytes());
+        assert!(unpack(&underfilled).is_err());
+
+        // Corrupt Adler-32 trailer.
+        let mut bad_adler = good.clone();
+        *bad_adler.last_mut().unwrap() ^= 1;
+        assert!(unpack(&bad_adler).is_err());
     }
 }
