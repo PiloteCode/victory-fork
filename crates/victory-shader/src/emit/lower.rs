@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
+use super::bitcode::facts::Made;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
@@ -24,6 +25,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+
+/// The legacy multiply as the product alone where exact, a child module so it shares the
+/// emitter's state.
+#[path = "legacy.rs"]
+pub(super) mod legacy;
 
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
@@ -3446,7 +3452,9 @@ impl<'a> Lower<'a> {
         let op = if max { Bin::And } else { Bin::Or };
         let sign = self.s.m.bin(c, op, ia, ib);
         let signed = self.as_float(sign);
-        self.s.m.select(c, zeros, signed, r)
+        let r = self.s.m.select(c, zeros, signed, r);
+        self.s.m.made(r, Made::MaxMin(max, a, b));
+        r
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
@@ -3579,7 +3587,9 @@ impl<'a> Lower<'a> {
         let nan_3 = self.is_nan_f32(third);
         let nan_ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
         let nan = self.s.m.bin(c, Bin::Or, nan_ab, nan_3);
-        self.s.m.select(c, nan, least, median)
+        let r = self.s.m.select(c, nan, least, median);
+        self.s.m.made(r, Made::Med3(a, b, third));
+        r
     }
 
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
@@ -3637,15 +3647,20 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 × anything = 0`, as in D3D9 (the product alone where exact: `legacy.rs`).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
+        if let Some(r) = self.legacy_short(a, b) {
+            return r;
+        }
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
-        self.s.m.select(c, z, zero, m)
+        let r = self.s.m.select(c, z, zero, m);
+        self.s.m.made(r, Made::Legacy(a, b));
+        r
     }
 
     /// Flushes f32 subnormals to signed zero, keeping all other values and
