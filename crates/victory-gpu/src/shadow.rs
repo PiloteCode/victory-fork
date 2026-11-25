@@ -2824,6 +2824,8 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            #[cfg(feature = "diagnostics")]
+            self.merge_refused("not write-watched", from, to, 0);
             return true;
         }
         let base = start / PAGE;
@@ -2836,6 +2838,8 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                #[cfg(feature = "diagnostics")]
+                self.merge_refused("the journal cannot say", a, e, 0);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2871,6 +2875,8 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
+                        #[cfg(feature = "diagnostics")]
+                        self.merge_refused("more changed runs than may go up one by one", lo, hi, runs.len());
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -2882,6 +2888,8 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        #[cfg(feature = "diagnostics")]
+                        self.merge_refused("no snapshot", lo, hi, 0);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -2911,6 +2919,29 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// Diagnostics: [`Shadow::merge_under_writes`] leaves `[from, to)` (title
+    /// addresses) to a settle, for `why` (`runs`: the changed runs of the
+    /// page it stopped at). The first 32 and every 256th after, with the
+    /// copy.
+    #[cfg(feature = "diagnostics")]
+    fn merge_refused(&self, why: &str, from: usize, to: usize, runs: usize) {
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        if n >= 32 && !n.is_multiple_of(256) {
+            return;
+        }
+        tracing::info!(
+            n,
+            why,
+            at = format_args!("{from:#x}"),
+            len = format_args!("{:#x}", to - from),
+            runs,
+            copy = format_args!("{:#x}+{:#x}", self.start, self.len),
+            card = self.card.is_some(),
+            "title bytes under flights' shader writes left to a settle"
+        );
     }
 
     /// At submission: copies what changed of `[address, address + len)`
