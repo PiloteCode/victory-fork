@@ -16,7 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -91,6 +91,78 @@ unsafe impl Send for Staging {}
 unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Every staging state, grouped by the address where its texture's title
+/// memory starts. [`STAGING`] is keyed by resource, which cannot answer
+/// "which textures lie in this memory range?"; this index can, so a remap
+/// does not have to scan every staged texture.
+///
+/// Several textures can start at the same address (for example two
+/// formats viewing the same memory), hence the `Vec`. Entries are `Weak`
+/// so the index never keeps a staging buffer alive on its own; entries
+/// whose staging state is gone are removed by [`prune_address_index`].
+static STAGED_BY_ADDRESS: Mutex<std::collections::BTreeMap<usize, Vec<Weak<Staging>>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The size in bytes of the largest texture ever staged. A texture that
+/// overlaps some memory range cannot start more than this many bytes
+/// before the range, which bounds the search in [`remapped`].
+static LARGEST_STAGED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Adds a newly made staging state to [`STAGED_BY_ADDRESS`].
+fn add_to_address_index(staging: &Arc<Staging>) {
+    let (start, bytes) = staging.memory();
+    LARGEST_STAGED_BYTES.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    let mut index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = index.entry(start).or_default();
+    // A texture staged here before may have been let go since.
+    entries.retain(|entry| entry.strong_count() > 0);
+    entries.push(Arc::downgrade(staging));
+}
+
+/// Removes entries of [`STAGED_BY_ADDRESS`] whose staging state was let go.
+fn prune_address_index() {
+    let mut index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    index.retain(|_, entries| {
+        entries.retain(|entry| entry.strong_count() > 0);
+        !entries.is_empty()
+    });
+}
+
+/// Called when the runtime maps or unmaps title memory `[at, at + len)`.
+///
+/// A texture in that range may now show completely different bytes, but
+/// its staging state still says "uploaded and unchanged". In that state
+/// [`upload`] skips the copy and only schedules a check, so the first list
+/// that samples the texture after the remap reads the old texels, and the
+/// new ones only arrive one list later (#574).
+///
+/// Marking the texture dirty makes its next [`upload`] record the copy.
+/// The check that runs when that list is submitted reads the new memory
+/// into the staging buffer before the copy executes, so the very first
+/// list after the remap sees the new texels.
+pub(crate) fn remapped(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let earliest_start = at.saturating_sub(LARGEST_STAGED_BYTES.load(Relaxed));
+    let index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    // Textures that start before `end`, and are not so far below `at`
+    // that they cannot reach it...
+    let candidates = index
+        .range(earliest_start..end)
+        .flat_map(|(_, entries)| entries.iter().filter_map(Weak::upgrade));
+    for staging in candidates {
+        // ...of which only those whose memory actually reaches past `at`
+        // overlap the remapped range.
+        let (start, bytes) = staging.memory();
+        if start.saturating_add(bytes) > at {
+            staging.dirty.store(true, Relaxed);
+        }
+    }
+}
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -559,6 +631,7 @@ pub(crate) fn let_go_idle() {
         keep
     });
     if went > 0 {
+        prune_address_index();
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
 }
@@ -1255,8 +1328,10 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.bytes);
+            // SAFETY: `subresource_len` clamps `len` to `self.bytes - footprint.Offset`,
+            // keeping the slice strictly inside the mapped staging buffer even when
+            // `GetCopyableFootprints` omits trailing row-pitch padding on the final row.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -1274,6 +1349,18 @@ impl Staging {
             }
         }
     }
+}
+
+/// Bytes available in the staging buffer for a subresource at `offset`.
+/// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
+/// final row of the final subresource, so `pitch * rows * depth` can exceed
+/// `total - offset`.
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+    let padded = pitch
+        .saturating_mul(rows as usize)
+        .saturating_mul(depth as usize);
+    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(remaining)
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -1393,7 +1480,10 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
-    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
+    let Some(end_incl) = at.checked_add(len - 1) else {
+        return (0, 1);
+    };
+    let (first, last) = (at / KERNEL_PAGE, end_incl / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
     // SAFETY: plain data.
@@ -1428,19 +1518,34 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     (there, of)
 }
 
+fn is_readable_commit(
+    info: &windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION,
+) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+    info.State == MEM_COMMIT
+        && info.Protect != 0
+        && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
+}
+
 fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 || !is_readable_commit(&info) {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
     }
     true
 }
@@ -1452,12 +1557,14 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
-    let end = start.saturating_add(len);
+    let Some(end) = start.checked_add(len) else {
+        return 0;
+    };
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
@@ -1498,7 +1605,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if is_readable_commit(&info) {
             there += (next - p) as u64;
         }
         p = next;
@@ -1599,7 +1706,53 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
+    add_to_address_index(&s);
     Some(s)
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// After a remap of the memory under a texture that was already
+    /// uploaded, the texture must be uploaded again (#574). A remap of
+    /// unrelated memory, or of an empty range, must leave it alone.
+    #[test]
+    fn a_remap_under_a_staged_texture_makes_it_upload_again() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE_RUN: usize = 0x1_0000;
+        // Two 64 KiB runs: the texture lives in the first, the second is
+        // memory next to it that no texture uses.
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE_RUN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!base.is_null());
+        let texture_start = base as usize;
+        // Resource description words of a linear 4x4 RGBA8 texture with one
+        // mip level, the shape the issue used to reproduce the bug.
+        let description = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(texture_start as u64, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            super::staging(resource, host_texture)
+        });
+        // `None` means there is no GPU to make the host texture on: nothing
+        // to check then.
+        if let Some(staging) = staged {
+            // The state after a submitted list uploaded the texture.
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+
+            super::remapped(texture_start + PAGE_RUN, PAGE_RUN);
+            super::remapped(texture_start, 0);
+            assert!(!staging.dirty.load(Relaxed), "a remap elsewhere marked the texture");
+
+            super::remapped(texture_start + 0x10, 0x10);
+            assert!(staging.dirty.load(Relaxed), "a remap under the texture did not mark it");
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
 }
 
 #[cfg(test)]
@@ -1709,6 +1862,57 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+
+    #[test]
+    fn subresource_len_stays_inside_staging_bytes() {
+        // 4 rows, RowPitch=256, final row=128 -> total=896 (padded 1024 exceeds total).
+        assert_eq!(super::subresource_len(0, 256, 4, 1, 896), 896);
+        assert_eq!(super::subresource_len(512, 256, 4, 1, 896), 384);
+        assert_eq!(super::subresource_len(0, 256, 4, 1, 2048), 1024);
+        assert_eq!(super::subresource_len(1024, 256, 4, 1, 896), 0);
+    }
+
+    #[test]
+    fn readable_and_query_reject_overflow_noaccess_and_guard_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+        // Address overflow must fail fast instead of saturating to usize::MAX or panicking.
+        assert!(!super::committed(usize::MAX as *const u8, 64));
+        assert!(!super::committed_by_query(usize::MAX as *const u8, 64));
+        assert_eq!(super::readable(usize::MAX - 8, 64, true), (0, 1));
+        assert_eq!(super::mapped_bytes(usize::MAX as *const u8, 64), 0);
+
+        // SAFETY: private committed test pages allocated and freed within this test.
+        unsafe {
+            let noaccess =
+                VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+            assert!(!noaccess.is_null());
+            assert!(!super::committed(noaccess.cast::<u8>(), 4096));
+            assert!(!super::committed_by_query(noaccess.cast::<u8>(), 4096));
+            assert_eq!(super::mapped_bytes(noaccess.cast::<u8>(), 4096), 0);
+            assert_ne!(VirtualFree(noaccess, 0, MEM_RELEASE), 0);
+
+            let guard = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE | PAGE_GUARD,
+            );
+            assert!(!guard.is_null());
+            assert!(!super::committed_by_query(guard.cast::<u8>(), 4096));
+            assert_ne!(VirtualFree(guard, 0, MEM_RELEASE), 0);
+
+            // Negative control: readable committed page passes all paths.
+            let rw = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!rw.is_null());
+            assert!(super::committed(rw.cast::<u8>(), 4096));
+            assert!(super::committed_by_query(rw.cast::<u8>(), 4096));
+            assert_eq!(super::mapped_bytes(rw.cast::<u8>(), 4096), 4096);
+            assert_ne!(VirtualFree(rw, 0, MEM_RELEASE), 0);
         }
     }
 }

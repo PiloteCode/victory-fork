@@ -13,6 +13,13 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+/// The source bytes needed for a desktop CBV upload. Allocation and
+/// descriptor creation apply their own 256-byte rounding.
+#[cfg(any(windows, test))]
+pub(crate) fn constant_staging_bytes(size: u32) -> u32 {
+    size.min(64 * 1024)
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -28,10 +35,10 @@ const HEAP_IIDS: [Iid; 4] = [
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapDesc {
-    kind: u32,
-    count: u32,
-    flags: u32,
-    nodes: u32,
+    pub(crate) kind: u32,
+    pub(crate) count: u32,
+    pub(crate) flags: u32,
+    pub(crate) nodes: u32,
 }
 
 /// Newer titles (the title) pass the description followed by
@@ -130,8 +137,10 @@ const SHADER_VISIBLE: u32 = 1;
 /// made or dropped. It was a mutex, and [`sync_heaps`] holds it for its
 /// whole pass (15 ms a frame on the submitting thread): the profile of run
 /// 225 has the title's six recording threads waiting 48.5 ms a frame in
-/// [`shader_slot`] for it, each lookup itself a few nanoseconds. Readers no
-/// longer wait for each other. Nothing a holder calls takes it again.
+/// `shader_slot` for it, each lookup itself a few nanoseconds. Readers no
+/// longer wait for each other. Nothing a holder calls takes it again. A
+/// reader holds it while it uses the heap it found (upstream #52: [`mirror`],
+/// [`with_shader_slot`]), so `Heap::drop`, a writer, cannot free it meanwhile.
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
@@ -139,23 +148,39 @@ static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLo
 #[cfg(windows)]
 static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The shader-visible heap holding `handle`, and the descriptor's index.
+/// Runs `f` with the shader-visible heap holding `handle` and the
+/// descriptor's index, with `SHADER_HEAPS` locked throughout so that
+/// `Heap::drop` cannot free the heap meanwhile (as [`mirror`] does,
+/// upstream #52).
 #[cfg(windows)]
-fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
+fn with_shader_slot<R>(handle: u64, f: impl FnOnce(&Heap, u32) -> R) -> Option<R> {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
-    // SAFETY: registered heaps are live (removed when dropped).
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
     let heap = unsafe { &*(at as *const Heap) };
-    Some((heap, heap.index(handle)?))
+    let index = heap.index(handle)?;
+    Some(f(heap, index))
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap.
+/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
+/// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
-    let Some((heap, index)) = shader_slot(handle) else {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&(_, _, at)) = heaps
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&handle))
+    else {
+        return;
+    };
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
+    let heap = unsafe { &*(at as *const Heap) };
+    let Some(index) = heap.index(handle) else {
         return;
     };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -350,6 +375,10 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
@@ -865,16 +894,15 @@ pub(crate) fn make_waiting() {
             // texture without a host copy must go on waiting).
             // (Looked up first: the handle is read only while its heap is
             // there.)
-            let Some((heap, index)) = shader_slot(handle) else {
-                continue;
-            };
-            let same = match view(handle) {
-                Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
-                _ => false,
-            };
-            if same && let Some(Some(host)) = heap.host.get() {
-                host.mirror(index, handle, true);
-            }
+            with_shader_slot(handle, |heap, index| {
+                let same = match view(handle) {
+                    Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
+                    _ => false,
+                };
+                if same && let Some(Some(host)) = heap.host.get() {
+                    host.mirror(index, handle, true);
+                }
+            });
         }
     }
 }
@@ -953,10 +981,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => View::Constant(u64::from(lo) | u64::from(hi) << 32, size),
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1022,7 +1051,9 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
-    let step = u64::from(increment(kind).unwrap_or(0));
+    let Some(step) = increment(kind).map(u64::from) else {
+        return;
+    };
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
@@ -1129,6 +1160,9 @@ pub(crate) extern "system" fn create_heap(
     let placed = placement.address != 0 && placement.size == size;
     tracing::debug!(?desc, placed, "descriptor heap");
     let (start, memory) = if placed {
+        if placement.address.checked_add(size).is_none() {
+            return E_INVALIDARG;
+        }
         (placement.address, None)
     } else {
         match Memory::zeroed(size, 64) {
@@ -1169,11 +1203,13 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(heap(this).desc) };
     }
+    out
 }
 /// The same address for the CPU and the GPU start.
 extern "system" fn start(this: This) -> u64 {
@@ -1196,6 +1232,21 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn constant_buffer_staging_uses_only_the_host_addressable_prefix() {
+        for (size, expected) in [
+            (0, 0),
+            (255, 255),
+            (65_535, 65_535),
+            (65_536, 65_536),
+            (65_537, 65_536),
+            (2_785_536, 65_536),
+            (u32::MAX, 65_536),
+        ] {
+            assert_eq!(constant_staging_bytes(size), expected, "guest CBV size {size}");
+        }
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
@@ -1523,5 +1574,44 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn heap_get_desc_returns_its_output_pointer() {
+        let desc = HeapDesc {
+            kind: 1,
+            count: 16,
+            flags: 0,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let mut out = std::mem::MaybeUninit::<HeapDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_desc = slot::<GetDesc>(h, 0x40);
+        assert_eq!(get_desc(h, out.as_mut_ptr()), out.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { out.assume_init() };
+        assert_eq!(
+            (read.kind, read.count, read.flags, read.nodes),
+            (desc.kind, desc.count, desc.flags, desc.nodes)
+        );
+        assert!(get_desc(h, std::ptr::null_mut()).is_null());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    #[test]
+    fn null_cbv_overwrites_previous_descriptor() {
+        let null = std::ptr::null();
+        let slot = [0u64; 4];
+        let at = slot.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 0, 256, 0], at);
+        assert_eq!(view(at), Some(View::Constant(0x1000, 256)));
+        create_cbv(null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Constant(0, 0)));
     }
 }

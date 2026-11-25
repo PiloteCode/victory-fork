@@ -1860,6 +1860,52 @@ mod tests {
         assert_eq!(seen, plain);
     }
     #[test]
+    fn a_page_list_filled_after_its_request_starts() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list, still empty when the request is submitted.
+        let list = Box::leak(Box::new([0usize; 1]));
+        let at = std::ptr::from_mut(list) as usize;
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        let number = page[0];
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // SAFETY: the leaked list, alive for the whole test.
+            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+        });
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        filler.join().unwrap();
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+    }
+    #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
         let allocate = |n: usize| {

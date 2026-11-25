@@ -54,6 +54,8 @@ What did it, on top of the list below:
   mirrored before every submission (pull request #305 by Flyander, after
   upstream VIctory 86a5ed6). Measured here: about 40,000 records a frame
   that no call had announced; their host slots were empty or stale.
+  The host slot and its fingerprint use the same captured record, even if
+  the guest slot changes after the page was read.
 - A buffer view that does not start on an element of its buffer's host
   copy gets a copy of its own bytes instead of being refused (after
   upstream 86a5ed6): 3 to 6 such views a frame.
@@ -356,6 +358,61 @@ both the ring and the scratch buffer.
 To run it: `Lancer GTA6 (VIctory).bat` next to the game's files builds the
 release and starts the title.
 
+### The official repository, merged (Marvisak/VIctory main at 940d32f)
+
+The official repository's 319 commits past the base this fork started from
+(ffe310e) are merged. Most of its runtime pull requests were here already,
+picked one by one (fxceless#653 and #716, the runtime and official-PR
+branches); where a change arrived both ways, one copy is kept, the one this
+branch had. Its translator's changes are not part of the merge:
+`crates/victory-shader` is this fork's, with three decoder fixes that came
+in whole (#661 SP3 text operands, #1021 `s_atc_probe`, #1636 FLAT offsets);
+the others are ported on their own, checked with the census. On 2026-11-24
+the official repository rebuilt much of the D3D12 layer, for its own
+translator's contract, where this fork had already done the same things its
+own way. Where both had a thing:
+
+| Both had | Kept | Why |
+|----------|------|-----|
+| Title memory at raw addresses (official: a page table of view pairs, shaders mark the pages they write and copy-backs compare only those; ours: the directory of copies, `memory.rs`) | ours | theirs needs its translator's root parameters and page marks; with ours the marked copy-back would never take a write made through a view |
+| Views shaders pick from the heap (official `bindless.rs`; ours: the heap pass, the view-address table) | ours | theirs needs its translator's heap layout |
+| A change journal for title memory (official: guards on all tracked memory; ours: write watch for pools, guards for views) | ours | the relay and copy-back rest on ours (13494e5) |
+| Rectangle lists through a geometry shader | ours | ours finds each rectangle's corner vertex (the tiled lighting's come corner first) and falls back to the CPU |
+| One host texture per texture memory; writable twins of depth textures | ours | ours keeps host copies lazy and lets idle ones go, has twins for D24S8 and copies twins back at a list's close |
+| Views off their buffer's elements; heap records copied as bytes | ours | ours also fingerprints records and leaves table slots to draws (9376fd6) |
+| Host objects retired after the lists that name them | ours | theirs frees them at the end of each submission, which flights still in the air may use |
+| Late DirectStorage page lists (#1726) | ours (read again for 250 ms, then retries) | its test is kept, and passes |
+| Indirect budget charged in record order (#1510) | ours (the ring, one charge per group) | |
+| Shader cache keyed by the translator | ours | our key also holds the switches and what the translator is told of the host |
+| Warm-up (`translate --cache`) | ours (`--warm`); `--cache` is `--warm all` | the pipeline pre-build (`--cache --pipelines`) is not in: its library would be gigabytes on NVIDIA, and it needs its own description path |
+| Mesh pipelines in the library | ours (triangles always, with a test) | |
+| Scripted keys on a connected pad (#197) | ours | the runtime branch turned it down (it conflicts with fxceless#640's taps) |
+| Title windows shown through a stand-in that always answers (#1677) | the one copy here | the runtime branch had picked the same commit |
+| `clzero` loops left as their last pass leaves them (#214) | the runtime branch's fit of it to our loop emulation | |
+| A frame wait takes its tick before it sleeps (#174) | both | our late-wait shortcut (`VICTORY_LATE_WAITS`) runs inside, under the clock's lock |
+
+Taken as they are: the host FidelityFX upscaler (`VICTORY_FIDELITYFX_DIR`,
+nothing changes unless it is set), the device's answers to feature queries
+7, 8 and 23, `VICTORY_*=0` switches being off (#615), the TDR settings in
+the log (#1082), swap-chain creation retried once a second (#1626), the
+device-removed reason (#928), `ID3D12Fence1` (#1562), `IUnknown` on every
+object (#270), depth/stencil copy footprints (#504), A8 out of the R8
+family (#1390), the dynamic slot search across its cursor (#974), appended
+input offsets aligned (#618), a stream subobject past its end not read, the
+shader pack and the shader database's effects (`shader-info`), the startup
+archive check (#12), and the runtime, loader, formats and audio pull
+requests this branch did not have yet. Left out: the official diagnostics tied to
+the parts above (`VICTORY_DUMP_WRITERS`, `VICTORY_PEEK`,
+`VICTORY_TRACE_SHADERS`), #669, #1246 and #322 (ours does the same), #1322
+(ours puts the title's bytes under shader ranges into copy and snapshot),
+#1337 (with its sampler change, to the shader port), and the console
+upscaler's UAV clears (no run of ours calls them). Made to fit on the way:
+#974's search across the cursor is no longer cut at 2^18 steps by ours; a
+descriptor mirror holds the heaps' read lock while it uses the heap it found
+(#52, on this branch's RwLock), and so does our re-mirror of waiting slots;
+a D24 depth plane is dumped as depth; `translate --cache` probes the
+adapter as `--warm` does.
+
 ### Picture checks (2026-11-25, RTX 5090, diagnostics builds)
 
 Captures of the opening cutscene (a new game) and of the save's gameplay,
@@ -566,6 +623,21 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute
 the intro); `VICTORY_SKIP_BINK=all` skips the looping ones too, so menu
 backgrounds stay dark.
 
+A warm-up, `victory translate --warm all <paths>` (`--cache` is the same),
+translates every shader in those files into the cache `run` reads, for the
+adapter it finds (or for the host `VICTORY_HOST_WAVE` and
+`VICTORY_VIEW_LIMIT` name), so a run does not translate them while it
+plays. With a file of the 16-digit hashes a run's log names instead of
+`all`, only those.
+
+Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
+it with the PC build on your GPU instead of the console build, get the
+[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
+`Kits/FidelityFX/signedbin` folder, which holds
+`amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
+upscaler for your GPU (the log says so), the title's own DLLs run.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
@@ -600,8 +672,9 @@ keyboard the left stick is Z Q S D and the triggers are W and C.
 victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
+victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--hashes] [--jobs N]
+victory translate [paths...] (--warm <hash file|all> | --cache) [--jobs N]
 victory translate-diff <old list> <new list> [--keys]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
@@ -637,6 +710,8 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
+The on/off switches below (`...=1`) are off when unset or set to `0`.
+
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
@@ -648,10 +723,15 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_CAPTURE_WORLD=1` | with `VICTORY_CAPTURE`, also saves the 2nd, 6th, 30th and 80th frames after the first that ran 500 draws (`VICTORY_CAPTURE_WORLD_ALSO=<list>`: more offsets) |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight, on every queue |
 | `VICTORY_HANG_WATCH=0` | no watch of the card's progress (by default a send to the host queue the card stays on for 500 ms or more is logged with its lists' pipelines) |
+| `VICTORY_EARLY_PIPELINES=0` | start a host pipeline when a draw or dispatch first requests it. Keeps the learned list, shader cache, and driver pipeline library for comparing startup scheduling across runs |
+| `VICTORY_VIEW_SET=0` | the guards' checks of view memory walk every block of a range, as before (by default they are answered from the view blocks that are not clean, and a block found uncommitted in a placeholder is parked until the runtime maps it; `VICTORY_PARK_EPOCH=<n>`: submissions between looks at parked blocks that are no placeholder, 32) |
+| `VICTORY_CENSUS=1` | every 10 s (`VICTORY_CENSUS_SECONDS=<s>`) a census of the card copies of title buffers: the reservation each lies in with the flags the title asked for, bytes sent up and fetched back a frame; and the host resources made a frame, by kind |
+| `VICTORY_SKIP_WC_BACK=1`, `VICTORY_SKIP_WC_COMPARE=1` | experiments, off: what shaders wrote to card copies of write-combining title memory is not fetched back (`_COMPARE`: those copies are not hashed or compared either); right only if the title's processor never reads what the card wrote there |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_MESH_LINK=0` | a mesh pipeline whose mesh program's outputs pass 32 KiB is made of the shared translations, as before, not of the pair linked for it (or, without a pixel program, of the mesh program with its system values only) |
@@ -669,7 +749,13 @@ Every build appends unhandled exceptions, panics, and host GPU failures to
 For a startup breakpoint (`0x80000003`), run the diagnostics build with
 `VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
 `crashes.log` entries. A host DLL refusal includes the caller stack in the
-console output. The refusal is expected for DLLs outside the host policy.
+console output. The refusal is expected for DLLs outside the host policy,
+including `rpcrt4.dll`.
+
+On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
+`+0x2237178` before the first window. Restore the archive from the same
+package beside the title executable. `run --execute` checks that it can
+read the RPF9 header before starting this build.
 
 To compare hardware and software rendering, repeat with
 `VICTORY_D3D12_WARP=1` and check the console for

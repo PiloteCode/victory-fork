@@ -142,7 +142,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -672,9 +672,11 @@ fn new_list(
         #[cfg(windows)]
         gate: Vec::new(),
     });
-    #[cfg(not(windows))]
-    let _ = pipeline;
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    if hr == S_OK {
+        crate::pipeline::bound(pipeline);
+    }
+    hr
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -734,8 +736,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -750,6 +753,65 @@ pub(crate) struct Barrier {
     first: This,
     second: u64,
     last: u64,
+}
+
+/// Builds a valid host `D3D12_RESOURCE_BARRIER_TYPE_ALIASING` barrier.
+///
+/// D3D12 only permits placed/reserved resources or `NULL` in aliasing
+/// barriers — passing a `CreateCommittedResource` pointer is a D3D12
+/// validation error. Each endpoint is passed as `Option<(This, bool)>` where
+/// `None` means the input was `NULL` and `Some((host_ptr, is_reserved))`
+/// carries the resolved host resource and whether it was created as a
+/// reserved (tiled) resource. Committed host resources are downgraded to
+/// `NULL` so the barrier remains a valid half-open or global aliasing
+/// barrier, and `flags` is cleared (D3D12 forbids barrier flags on aliasing
+/// barriers).
+fn aliasing_barrier(
+    first: Option<(This, bool)>,
+    second: Option<(This, bool)>,
+) -> Barrier {
+    let first = match first {
+        Some((ptr, true)) => ptr,
+        _ => std::ptr::null(),
+    };
+    let second = match second {
+        Some((ptr, true)) => ptr as u64,
+        _ => 0,
+    };
+    Barrier {
+        kind: 1,
+        flags: 0,
+        first,
+        second,
+        last: 0,
+    }
+}
+
+/// Splits `barriers` into maximal contiguous sub-slices so that no single
+/// `ID3D12GraphicsCommandList::ResourceBarrier` call contains two `Transition`
+/// (`kind == 0`) barriers targeting the same host resource (`first`).
+///
+/// Because [`host_barrier`] flattens per-subresource transitions to
+/// `D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES`, a title call transitioning two
+/// subresources of one texture to different states would otherwise emit
+/// duplicate whole-resource transitions in one `ResourceBarrier` slice
+/// (D3D12 error `#524`).
+fn for_barrier_batches(barriers: &[Barrier], mut emit: impl FnMut(&[Barrier])) {
+    let mut start = 0;
+    for (i, b) in barriers.iter().enumerate() {
+        if b.kind == 0
+            && !b.first.is_null()
+            && barriers[start..i]
+                .iter()
+                .any(|prev| prev.kind == 0 && prev.first == b.first)
+        {
+            emit(&barriers[start..i]);
+            start = i;
+        }
+    }
+    if start < barriers.len() {
+        emit(&barriers[start..]);
+    }
 }
 
 /// The barrier on host resources, or `None` if it names a resource the host
@@ -777,30 +839,26 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 last: u64::from(crate::host::legal_state(texture, wanted)),
             })
         }
-        1 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            second: if b.second == 0 {
-                0
-            } else {
-                host(b.second as This)? as u64
-            },
-            ..*b
-        }),
+        1 => {
+            let resolve = |r: This| -> Option<Option<(This, bool)>> {
+                if r.is_null() {
+                    return Some(None);
+                }
+                let copy = crate::resource::host_copy(r)?;
+                Some(Some((
+                    copy.texture.as_raw().cast_const().cast(),
+                    copy.tiled.is_some(),
+                )))
+            };
+            let first = resolve(b.first)?;
+            let second = resolve(b.second as This)?;
+            Some(aliasing_barrier(first, second))
+        }
         2 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
             } else {
-                // A depth texture's unordered access is its colour twin's
-                // (the host gives the depth texture none): the barrier is
-                // on the texture shaders write.
-                match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
-                    None => host(b.first)?,
-                }
+                host(b.first)?
             },
             ..*b
         }),
@@ -818,6 +876,34 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+#[cfg(windows)]
+fn host_barriers(list: &crate::host::HostList, barriers: &[Barrier]) -> Vec<Barrier> {
+    use windows::core::Interface;
+
+    let mut mapped = Vec::with_capacity(barriers.len());
+    for b in barriers {
+        if b.kind == UAV_BARRIER.kind
+            && let Some(twin) = crate::resource::twin(b.first)
+        {
+            // One title depth-stencil resource can have a separate host UAV
+            // texture for each plane. Both need the title's resource barrier.
+            mapped.push(Barrier {
+                first: twin.colour.texture.as_raw().cast_const().cast(),
+                ..*b
+            });
+            if let Some(plane) = &twin.plane {
+                mapped.push(Barrier {
+                    first: plane.texture.as_raw().cast_const().cast(),
+                    ..*b
+                });
+            }
+        } else {
+            mapped.extend(host_barrier(list, b));
+        }
+    }
+    mapped
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -826,10 +912,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let mut host = host_barriers(list, barriers);
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
@@ -842,16 +925,18 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
-            // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            for_barrier_batches(&host, |batch| {
+                // SAFETY: the same layout; borrowed resource pointers, never
+                // released through this slice.
+                let batch = unsafe {
+                    std::slice::from_raw_parts(
+                        batch.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+                        batch.len(),
+                    )
+                };
+                // SAFETY: an open list and live resources.
+                unsafe { list.list.ResourceBarrier(batch) };
+            });
         }
     }
     0
@@ -1552,7 +1637,10 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    let Some(end) = offset.checked_add(u64::from(count) * bytes) else {
+        return;
+    };
+    if end > size {
         return;
     }
     for i in 0..u64::from(count) {
@@ -2142,7 +2230,7 @@ extern "system" fn execute_indirect(
             });
         }
     } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(windows)]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
             address.is_some(),
@@ -2612,6 +2700,102 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing::{Event, Metadata, Subscriber, span};
+
+    struct PipelineBinds(Arc<AtomicUsize>);
+
+    impl Subscriber for PipelineBinds {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.is_event()
+                && metadata.target() == "victory_gpu::pipeline"
+                && metadata.fields().field("pipeline").is_some()
+                && metadata.fields().field("frame").is_some()
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            unreachable!()
+        }
+
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if self.enabled(event.metadata()) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn lists_bind_the_initial_pipeline_on_creation() {
+        use crate::pipeline::{ComputeHead, create_compute};
+
+        // A synthetic compute description matching the public ABI.
+        #[repr(C)]
+        struct ComputeDesc {
+            root: This,
+            code: *const u8,
+            size: usize,
+        }
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let desc = ListDesc {
+            kind: 0,
+            flags: 0,
+            nodes: 0,
+            barrier_batch: 0,
+        };
+        let bytes = [0xa5, 0xb6, 0xc7];
+        let compute = ComputeDesc {
+            root: null,
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        let compute = std::ptr::from_ref(&compute).cast::<ComputeHead>();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let binds = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing::Dispatch::new(PipelineBinds(binds.clone()));
+
+        tracing::dispatcher::with_default(&subscriber, || {
+            for console in [false, true] {
+                let create = |pipeline, out| {
+                    if console {
+                        create_list_x(null, &desc, allocator, pipeline, &LIST_IIDS[1], out)
+                    } else {
+                        create_list(null, 0, 0, allocator, pipeline, &LIST_IIDS[1], out)
+                    }
+                };
+                let mut pipeline = null;
+                let mut list = null;
+                assert_eq!(
+                    create_compute(null, compute, &PAGEABLE_IIDS[0], &mut pipeline),
+                    S_OK
+                );
+                let before = binds.load(Ordering::Relaxed);
+
+                assert_eq!(create(null, &mut list), S_OK);
+                assert_eq!(binds.load(Ordering::Relaxed), before);
+                assert_eq!(release(list), 0);
+
+                assert_eq!(create(pipeline, &mut list), S_OK);
+                assert_eq!(binds.load(Ordering::Relaxed), before + 1);
+                assert_eq!(release(list), 0);
+                assert_eq!(release(pipeline), 0);
+            }
+        });
+        assert_eq!(release(allocator), 0);
+    }
 
     /// A list cut for hoisted clamps (`crate::indirect::hoisting`) waits for
     /// nothing, and a submission takes its parts in the order they were
@@ -2653,6 +2837,157 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_depth_stencil_uav_barrier_names_both_twins() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::Interface;
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let null = std::ptr::null();
+        let iid = ID3D12Resource::IID;
+        let make_resource = |desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    std::ptr::from_ref(&heap).cast(),
+                    0,
+                    std::ptr::from_ref(desc).cast(),
+                    state.0 as u32,
+                    null.cast(),
+                    std::ptr::from_ref(&iid).cast(),
+                    &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        };
+        let release = |resource| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        let depth = make_resource(&desc, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        let Some(twin) = crate::resource::twin(depth) else {
+            release(depth);
+            return; // depth twins are turned off or the host cannot make one
+        };
+        let Some(plane) = &twin.plane else {
+            release(depth);
+            return; // depth-plane twins are turned off or unavailable
+        };
+        let colour = make_resource(
+            &D3D12_RESOURCE_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..desc
+            },
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let views = crate::descriptor::host::HostHeap::new(false, 2).unwrap();
+        for (index, format, plane_slice) in [
+            (0, DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1),
+            (1, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0),
+        ] {
+            let mut words = [0; 10];
+            words[..4].copy_from_slice(&[
+                format.0 as u32,
+                D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32,
+                0,
+                plane_slice,
+            ]);
+            let mut descriptor = [0u32; 8];
+            let handle = descriptor.as_mut_ptr() as u64;
+            crate::descriptor::create_uav(null, depth, null, &words, handle);
+            views.mirror(index, handle, false).unwrap();
+        }
+        let stencil_view = views.kept_texture(0).unwrap();
+        let depth_view = views.kept_texture(1).unwrap();
+        assert_eq!(stencil_view, twin.colour.texture);
+        assert_eq!(depth_view, plane.texture);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut command_list = null;
+        assert_eq!(
+            create_list(
+                null,
+                0,
+                0,
+                allocator,
+                null,
+                &LIST_IIDS[1],
+                &mut command_list
+            ),
+            S_OK
+        );
+        let list = host_list(command_list).unwrap();
+        let resource_barrier = |resource| Barrier {
+            first: resource,
+            ..UAV_BARRIER
+        };
+        let requested = [
+            UAV_BARRIER,
+            resource_barrier(colour),
+            resource_barrier(depth),
+        ];
+        let barriers = host_barriers(list, &requested);
+        let targets: Vec<_> = barriers.iter().map(|b| (b.kind, b.first.cast())).collect();
+        assert_eq!(
+            targets,
+            [
+                (UAV_BARRIER.kind, null.cast()),
+                (
+                    UAV_BARRIER.kind,
+                    crate::resource::host_resource(colour)
+                        .unwrap()
+                        .as_raw()
+                        .cast_const()
+                ),
+                (UAV_BARRIER.kind, stencil_view.as_raw().cast_const()),
+                (UAV_BARRIER.kind, depth_view.as_raw().cast_const()),
+            ]
+        );
+        let resource_barriers =
+            slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(command_list, 0xd0);
+        assert_eq!(
+            resource_barriers(command_list, requested.len() as u32, requested.as_ptr()),
+            0
+        );
+        assert_eq!(close(command_list), S_OK);
+        assert_eq!(release(command_list), 0);
+        assert_eq!(release(allocator), 0);
+        eprintln!("verified global, ordinary and both depth-stencil UAV barrier targets");
+        assert_eq!(release(colour), 0);
+        assert_eq!(release(depth), 0);
+    }
+
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();
@@ -2681,9 +3016,12 @@ mod tests {
             slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
             S_OK
         );
-        // List-owned upload memory: aligned, writable, gone at reset.
+        // List-owned upload memory: aligned, writable, below 2^40 (where
+        // shaders find title memory), gone at reset.
         let p = allocate_upload(list, 40, 0x100);
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
+        #[cfg(windows)]
+        assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
@@ -2706,5 +3044,259 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn barrier_batches_split_before_duplicate_resource_transitions() {
+        let a = 0x1000usize as This;
+        let b = 0x2000usize as This;
+        let c = 0x3000usize as This;
+        let transition = |res: This, before: u32, after: u32| Barrier {
+            kind: 0,
+            flags: 0,
+            first: res,
+            second: 0xffff_ffff | (u64::from(before) << 32),
+            last: u64::from(after),
+        };
+        let uav = |res: This| Barrier {
+            kind: 2,
+            flags: 0,
+            first: res,
+            second: 0,
+            last: 0,
+        };
+
+        // Empty input emits no batches.
+        let mut count = 0usize;
+        for_barrier_batches(&[], |_| count += 1);
+        assert_eq!(count, 0);
+
+        // Distinct transitions plus UAVs stay in a single batch.
+        let single = [transition(a, 0, 1), transition(b, 0, 2), uav(a), uav(a)];
+        let mut sizes = Vec::new();
+        for_barrier_batches(&single, |batch| sizes.push(batch.len()));
+        assert_eq!(sizes, vec![4]);
+
+        // Repeated transitions on the same host resource split into sequential batches.
+        let dup = [
+            transition(a, 0, 1),
+            transition(b, 0, 2),
+            transition(a, 1, 4),
+            transition(c, 0, 1),
+            transition(c, 1, 8),
+            uav(std::ptr::null()),
+        ];
+        let mut batches: Vec<Vec<(u32, usize, u64)>> = Vec::new();
+        for_barrier_batches(&dup, |batch| {
+            batches.push(
+                batch
+                    .iter()
+                    .map(|x| (x.kind, x.first as usize, x.last))
+                    .collect(),
+            );
+        });
+        assert_eq!(
+            batches,
+            vec![
+                vec![(0, 0x1000, 1), (0, 0x2000, 2)],
+                vec![(0, 0x1000, 4), (0, 0x3000, 1)],
+                vec![(0, 0x3000, 8), (2, 0, 0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn aliasing_barrier_downgrades_committed_resources_and_keeps_reserved() {
+        let res_a = 0x1000usize as This;
+        let res_b = 0x2000usize as This;
+
+        // Two committed resources -> global aliasing barrier (NULL, NULL).
+        let both_committed = aliasing_barrier(Some((res_a, false)), Some((res_b, false)));
+        assert_eq!(both_committed.kind, 1);
+        assert_eq!(both_committed.flags, 0);
+        assert!(both_committed.first.is_null());
+        assert_eq!(both_committed.second, 0);
+        assert_eq!(both_committed.last, 0);
+
+        // Committed -> reserved becomes (NULL, reserved).
+        let mixed = aliasing_barrier(Some((res_a, false)), Some((res_b, true)));
+        assert!(mixed.first.is_null());
+        assert_eq!(mixed.second, res_b as u64);
+
+        // Reserved -> reserved is preserved.
+        let both_reserved = aliasing_barrier(Some((res_a, true)), Some((res_b, true)));
+        assert_eq!(both_reserved.first, res_a);
+        assert_eq!(both_reserved.second, res_b as u64);
+
+        // (NULL, NULL) stays global aliasing barrier.
+        let global = aliasing_barrier(None, None);
+        assert!(global.first.is_null());
+        assert_eq!(global.second, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_barrier_handles_committed_aliasing_and_subresource_transitions_on_device() {
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let mut allocator = std::ptr::null();
+        assert_eq!(
+            create_allocator(std::ptr::null(), 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = std::ptr::null();
+        assert_eq!(
+            create_list(std::ptr::null(), 0, 0, allocator, std::ptr::null(), &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let hlist = host_list(list).expect("host list");
+
+        #[repr(C)]
+        struct TestHeapProperties {
+            kind: u32,
+            cpu_pages: u32,
+            pool: u32,
+            creation_nodes: u32,
+            visible_nodes: u32,
+        }
+        #[repr(C)]
+        struct TestResourceDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        const _: () = assert!(size_of::<TestHeapProperties>() == size_of::<crate::resource::HeapProperties>());
+        const _: () = assert!(size_of::<TestResourceDesc>() == size_of::<crate::resource::ResourceDesc>());
+        const RESOURCE_IID: Iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+
+        let heap = TestHeapProperties {
+            kind: 1, // DEFAULT
+            cpu_pages: 0,
+            pool: 0,
+            creation_nodes: 1,
+            visible_nodes: 1,
+        };
+        let desc = TestResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 2,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        let mut tex_a = std::ptr::null();
+        let mut tex_b = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0, // COMMON
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut tex_a,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0, // COMMON
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut tex_b,
+            ),
+            S_OK
+        );
+
+        // Committed aliasing barrier must downgrade to (NULL, 0) instead of passing committed pointers.
+        let alias_in = Barrier {
+            kind: 1,
+            flags: 1,
+            first: tex_a,
+            second: tex_b as u64,
+            last: 0,
+        };
+        let alias_out = host_barrier(hlist, &alias_in).expect("aliasing barrier translated");
+        assert_eq!(alias_out.kind, 1);
+        assert_eq!(alias_out.flags, 0);
+        assert!(alias_out.first.is_null(), "committed texture must not be passed in aliasing barrier");
+        assert_eq!(alias_out.second, 0, "committed texture must not be passed in aliasing barrier");
+
+        // Prime tex_a state in the list, then submit two subresource transitions to different states
+        // in one `barrier()` call; batch splitting avoids D3D12 #524 duplicate transition errors.
+        let _ = hlist.transition(tex_a, 0);
+        let sub_barriers = [
+            Barrier {
+                kind: 0,
+                flags: 0,
+                first: tex_a,
+                second: 0, // subresource 0
+                last: u64::from(COPY_DEST),
+            },
+            Barrier {
+                kind: 0,
+                flags: 0,
+                first: tex_a,
+                second: 1, // subresource 1
+                last: u64::from(COPY_SOURCE),
+            },
+            alias_in,
+        ];
+        assert_eq!(barrier(list, sub_barriers.len() as u32, sub_barriers.as_ptr()), 0);
+        assert_eq!(close(list), S_OK);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(tex_a), 0);
+        assert_eq!(release(tex_b), 0);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// An offset near `u64::MAX` must not overflow and write outside the
+    /// query destination buffer.
+    #[test]
+    fn resolve_queries_rejects_overflowing_offset() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let buffer = crate::resource::test_buffer(64);
+        // Used to overflow `offset + count * 8` (panic in debug, wrap in release).
+        resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
     }
 }
