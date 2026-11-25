@@ -350,7 +350,9 @@ fn cut(this: This, wait: ValueWait) {
 /// (`crate::indirect::hoisting`). What was recorded so far keeps its place
 /// as a part of its own ([`Part`], with the waits before it); the new part
 /// waits for nothing, and runs in the same submission right after it
-/// ([`detach`], [`detach_parts`]). Whether it was cut.
+/// ([`detach`], [`detach_parts`]). Whether it was cut: not past
+/// [`HOIST_PARTS_MOST`] parts (a list that writes records before each of
+/// its draws would be cut at every draw), nor where nothing was recorded.
 #[cfg(windows)]
 pub(crate) fn hoist_cut(this: This) -> bool {
     if this.is_null() {
@@ -362,7 +364,7 @@ pub(crate) fn hoist_cut(this: This) -> bool {
     let Some(current) = list.host.as_ref() else {
         return false;
     };
-    if current.untouched() {
+    if current.untouched() || list.earlier.len() + 1 >= HOIST_PARTS_MOST {
         return false;
     }
     let Some(fresh) = fresh_list() else {
@@ -383,6 +385,11 @@ pub(crate) fn hoist_cut(this: This) -> bool {
     }
     true
 }
+
+/// The most parts a list is cut into for hoisted clamps ([`hoist_cut`]);
+/// past them the clamps stay in the list, as without the switch.
+#[cfg(windows)]
+const HOIST_PARTS_MOST: usize = 32;
 
 /// Whether list `this` recorded a wait for a memory value (with waits cut
 /// into lists). A list cut only for hoisted clamps ([`hoist_cut`]) waits
