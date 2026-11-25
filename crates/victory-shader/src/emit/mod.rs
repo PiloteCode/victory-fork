@@ -95,6 +95,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(test, windows))]
 mod loop_tests;
+pub mod forms;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
@@ -104,6 +105,7 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+mod split;
 mod threading;
 mod trip;
 #[cfg(windows)]
@@ -114,6 +116,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(all(test, windows))]
+mod wave64_split_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -439,6 +443,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    forms::clear();
     let r = emit_any(c, native, p, st, io, res);
     if r.is_ok() && !permutes_outside_sections(p) {
         return r;
@@ -578,6 +583,8 @@ fn emit_forms(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    // (the exchange form: each host wave on its own instead where that is exact)
+    let original = split::local_if_exact(c, native, p, st, io, res, original);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -639,7 +646,7 @@ fn emit_forms(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again;
+                    return split::local_if_exact(c, native, p, st, io, res, again);
                 }
             }
         }
@@ -688,7 +695,7 @@ fn emit_forms(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again;
+                        return split::local_if_exact(c, native, p, st, io, res, again);
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -1059,6 +1066,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
     };
+    forms::note(&shader.dxil, l.form);
     Ok((shader, wave_size))
 }
 
