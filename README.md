@@ -80,6 +80,8 @@ draws or more.
 | Wave64 compute programs in the paired form (agent, `victory-shader`) | 24 compute programs (screen-tracing tiles, particles, alpha resolve, decal trails, hair shadow masks), 3 builder programs and the alpha-tested cascade shadows were refused on 32-lane GPUs; tiles of an older picture showed in the opening cutscene | no compute pipeline refused in play; the rectangles are gone |
 | Spare staging buffers (`texture.rs`) | every streamed texture made and let go an upload buffer of its own, ~500 a second at 0.2-0.3 ms each | opening cutscenes: heap pass 187 → 65 ms, frame 307 → 205 ms |
 | DirectStorage page numbers read again (`dstorage.rs`, `xmem.rs`) | a request whose page numbers the title wrote after enqueueing it failed (up to 302 in a burst at loading): its model or texture kept old data | no failed request since |
+| Shader translation fixes, second round (agent, `victory-shader`, `pipeline/host.rs`) | 76 programs: a float the console keeps constant packed beside an integer or the front face got another interpolation mode; 64-bit floats and wave sums of them (water); two reductions sharing their end block; blending asked on an integer target (the windshield-wiper mask pipeline was refused) | in the whole opening cutscene no pipeline is refused and no shader fails to translate; offline 25,680 of 25,953 programs pass (the rest: unused voxel geometry stages, mesh outputs over the host's limit that NVIDIA builds anyway, five ray-trace programs, one driver failure) |
+| Indirect records clamped into a ring, behind one enhanced barrier (`indirect.rs`, `host.rs`) | each clamp waited for the last indirect call to have read the one scratch buffer, and the call after it for the clamp | clamps 33 → 19 ms of card time a frame, the card's commands 102 → 95 ms; frames 179 → 171 ms (median), 210 → 189 ms (mean) |
 
 Together: the opening of the gameplay went from 487 ms to about 175-195 ms a
 frame (2 → 5-5.5 fps), the opening cutscene's streaming from a median of 590 ms
@@ -101,15 +103,14 @@ no frame time gained), the ray-tracing structure builder
 about 80 s into the gameplay, reading a pointer of all ones).
 
 Still open: the ray-tracing structure builder (all 52 programs now get
-pipelines, but switched on it crashes the title, so shadows stay dark);
-~100 ms of card time a frame, a third of it our clamps of indirect records
-(2,500 a frame, each between two waits of the whole card: the title's ~710
-barriers a frame cut its runs of records short); ~60 ms a frame that the
-submitting thread waits for flights to land, because a table's constants
-and the title's buffer copies read title memory inside a 174 MB pool that
-every flight declares written as a whole; about 350 programs that still do
-not translate offline (mostly mesh outputs over the host's limit and
-interpolation modes packed in one row; few of them seen in play).
+pipelines, but switched on it crashes the title at the prologue's leadout
+cutscene, so shadows stay dark); ~95 ms of card time a frame, 19 ms of it
+our clamps of indirect records (the card still turns from drawing to
+compute and back for each of 2,500 a frame: the title's ~710 barriers a
+frame cut its runs of records short); ~60 ms a frame that the submitting
+thread waits for flights to land, because small constant buffers the card
+writes are copied into upload memory on the CPU (they are not on the
+256-byte line a host constant view needs).
 
 To run it: `Lancer GTA6 (VIctory).bat` next to the game's files builds the
 release and starts the title.
