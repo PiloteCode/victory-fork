@@ -57,6 +57,11 @@ mod guarded;
 #[path = "rings.rs"]
 mod rings;
 
+/// Reads of a lane's quad: a pixel program's through quad operations, a compute program's
+/// sample gradients from its quad of lanes; a child module so it shares the emitter's state.
+#[path = "quad.rs"]
+pub(super) mod quad;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -1095,10 +1100,15 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
+            // (Lane permutations, and a sample whose level the quad's lanes
+            // give (`quad`), read other lanes too: after Belobug's fork,
+            // 2655edb7 and e510ba7b.)
             console_lanes = insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
+                    || quad::implicit_level(n) && super::compute_derivatives()
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -4694,6 +4704,8 @@ impl<'a> Lower<'a> {
             };
             let r = if mesh_quad {
                 self.quad_pick(x, src)
+            } else if quad && self.quad_ops() {
+                self.quad_read(x, quad::swizzle_picks(offset))
             } else {
                 self.read_lane(x, src)
             };
@@ -6846,10 +6858,12 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
-        } else {
-            self.read_lane(x, src)
+        let mut r = match dpp {
+            _ if mesh_quad => self.quad_pick(x, src),
+            Dpp::Row { ctrl, .. } if quad && self.quad_ops() => {
+                self.quad_read(x, quad::quad_perm_picks(u32::from(ctrl)))
+            }
+            _ => self.read_lane(x, src),
         };
         let mut enable = None;
         if let Some(inside) = inside {
@@ -9700,10 +9714,26 @@ impl<'a> Lower<'a> {
                 // incompatible with the shader stage": 730 compute programs,
                 // among them the G-buffer resolves and the sky), and what a
                 // driver does with it is its own affair.
-                // shortcut: such a sample reads level 0 (a bias: that
-                // level). The console takes derivatives from neighbouring
-                // lanes there; compute them from the lanes if a resolve
-                // shows the wrong mip.
+                // A compute program's takes its gradients from its quad of
+                // lanes, as the console does (`quad`).
+                // shortcut: a vertex or mesh program's reads level 0 (a
+                // bias: that level), as a compute program's does with
+                // `VICTORY_COMPUTE_DERIVATIVES=0`.
+                60 if !self.s.pixel && self.quad_derivatives() => {
+                    self.cross_lane(true)?;
+                    let g = self.quad_gradients(&cs[..spatial], None);
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(clamp);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
                 60 if !self.s.pixel => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
@@ -9763,6 +9793,22 @@ impl<'a> Lower<'a> {
                             Attr::ReadOnly,
                             self.s.t.res_ret,
                             61,
+                            &args,
+                        )
+                    } else if self.quad_derivatives() {
+                        // The quad's gradients times 2^bias: the level
+                        // the bias adds for isotropic filtering.
+                        self.cross_lane(true)?;
+                        let scale = self.unary(21, bias); // exp2
+                        let g = self.quad_gradients(&cs[..spatial], Some(scale));
+                        args.extend(g);
+                        args.push(clamp);
+                        self.s.op(
+                            c,
+                            "sampleGrad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            63,
                             &args,
                         )
                     } else {

@@ -319,6 +319,23 @@ impl Host {
 
     /// The error with the debug layer's messages since the last call, if
     /// the layer is on (`VICTORY_D3D12_DEBUG`).
+    /// The device's wave sizes (`WaveLaneCountMin`, `WaveLaneCountMax`); none if it does not
+    /// say. A program that declares a wave size outside them gets no pipeline (WARP's is 4).
+    #[cfg(test)]
+    pub fn wave_lanes(&self) -> Option<(u32, u32)> {
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a feature query into a structure of the size given.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o1).cast(),
+                size_of_val(&o1) as u32,
+            )
+        }
+        .ok()
+        .map(|()| (o1.WaveLaneCountMin, o1.WaveLaneCountMax))
+    }
+
     fn explained(&self, e: windows::core::Error) -> String {
         let mut text = err(e);
         let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
@@ -1062,6 +1079,9 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F texture SRV with levels (width and height of level 0, the texels of each
+    /// level, which halves both down to 1).
+    Mips(u32, u32, &'a [&'a [[f32; 4]]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1317,6 +1337,53 @@ impl Host {
                             (faces == 6).then_some(&cube as *const _),
                             at,
                         );
+                        keep.push(tex);
+                    }
+                    View::Mips(w, h, levels) => {
+                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
+                        desc.MipLevels = levels.len() as u16;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        for (k, texels) in levels.iter().enumerate() {
+                            let (lw, lh) = ((w >> k).max(1), (h >> k).max(1));
+                            let pitch = (lw as usize * 16).next_multiple_of(256);
+                            let upload = make(
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                &buffer((pitch * lh as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                            )?;
+                            let mut p = std::ptr::null_mut();
+                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                            for y in 0..lh as usize {
+                                let row = &texels[y * lw as usize..(y + 1) * lw as usize];
+                                std::ptr::copy_nonoverlapping(
+                                    row.as_ptr().cast::<u8>(),
+                                    p.cast::<u8>().add(y * pitch),
+                                    row.len() * 16,
+                                );
+                            }
+                            upload.Unmap(0, None);
+                            let mut at_level = subresource(&tex);
+                            at_level.Anonymous.SubresourceIndex = k as u32;
+                            list.CopyTextureRegion(
+                                &at_level,
+                                0,
+                                0,
+                                0,
+                                &footprint(&upload, lw, lh),
+                                None,
+                            );
+                            keep.push(upload);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {

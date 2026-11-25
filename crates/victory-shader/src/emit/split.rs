@@ -104,6 +104,10 @@ pub(super) fn read_inside_only(p: &Program, st: &Structured) -> HashSet<Value> {
             let other_lanes = match &inst.fields {
                 Fields::Valu(v) => v.dpp.is_some() || name.contains("lane") && name != "v_readfirstlane_b32",
                 Fields::Ds { .. } => name.starts_with("ds_swizzle") || name.contains("permute"),
+                // (its gradients are its quad's: `lower::quad`)
+                Fields::Image { .. } => {
+                    lower::quad::implicit_level(name) && super::compute_derivatives()
+                }
                 _ => false,
             } || section;
             // a section's select of the lanes that ran before it (`v_cndmask_b32 d, a, b, m`:

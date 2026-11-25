@@ -110,6 +110,8 @@ mod idiom;
 mod link;
 mod lower;
 mod own_bits;
+#[cfg(all(test, windows))]
+mod quad_tests;
 mod rect;
 mod sampler;
 mod shader;
@@ -238,6 +240,27 @@ pub fn group_sync() -> u8 {
 pub fn helper_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_HELPER_OWN").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether a pixel program's reads of other lanes of its quad (`ds_swizzle` in its quad
+/// modes, DPP `quad_perm`) go through the host's quad operations, which reach helper lanes
+/// (`lower::quad`; on by default). `VICTORY_QUAD_READS=0` turns it off: wave reads, whose
+/// reads of helper lanes are undefined, as before 2026-11-25. Part of the translation: the
+/// shader cache keys on it.
+pub fn quad_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_QUAD_READS").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether a compute program's implicit-level samples (`image_sample`, `image_sample_b`)
+/// take explicit gradients from their quad of lanes, as the console does (`lower::quad`; on by
+/// default). `VICTORY_COMPUTE_DERIVATIVES=0` turns it off: such samples read level 0 (a bias:
+/// that level), as before 2026-11-25. Part of the translation: the shader cache keys on it.
+pub fn compute_derivatives() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_COMPUTE_DERIVATIVES").map_or(true, |v| v.trim() != "0")
+    })
 }
 
 /// The clean-up passes that run over a translated program before it is
