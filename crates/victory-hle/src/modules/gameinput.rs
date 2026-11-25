@@ -1718,7 +1718,7 @@ mod tests {
             // First connected need not be XInput slot zero.
             source.pads[2] = Some(physical);
             source.pads[3] = Some(PadState::default());
-            source.keys = vec![key(0x0D), key(b'W'), key(b'C')];
+            source.keys = vec![key_at(0x0D, 0x1C), key_at(b'W', 0x11), key_at(b'C', 0x2E)];
         }
         hub.poll();
         let r = current(hub, GAMEPAD_KIND, 2).unwrap();
@@ -1740,7 +1740,7 @@ mod tests {
         {
             let mut source = host.lock().unwrap();
             source.pads = [None; PADS];
-            source.keys = vec![key(0x0D)];
+            source.keys = vec![key_at(0x0D, 0x1C)];
         }
         hub.poll();
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
