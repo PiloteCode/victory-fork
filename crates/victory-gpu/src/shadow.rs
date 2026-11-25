@@ -1990,6 +1990,7 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        crate::coherence::copy_gone(self.start as usize, self.len as usize);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2319,6 +2320,108 @@ impl Shadow {
         self.window
     }
 
+    /// Whether the copy is of a window of memory outside buffers (windows
+    /// may overlap: `crate::coherence` leaves nothing of them on the card).
+    pub(crate) fn windowed(&self) -> bool {
+        self.window
+    }
+
+    /// Runs `f` under the lock of the copy's reference (the snapshot, or
+    /// the CPU's side of a copy in the card's memory), which every merge
+    /// into the copy holds: `crate::coherence` takes and gives back the
+    /// pieces it leaves on the card under it.
+    pub(crate) fn with_side<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    /// The lock of [`Shadow::with_side`], taken with nothing of title
+    /// memory `[at, at + len)` left on the card (`crate::coherence`): what
+    /// is there is brought back first, as the holder is about to read that
+    /// memory, and nothing is left on the card while the lock is held (a
+    /// read under it that faulted into the bring-back would wait for the
+    /// lock this thread holds).
+    fn side_unowned(&self, at: usize, len: usize) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        loop {
+            crate::coherence::release(at, len, crate::coherence::BY_MERGE);
+            let side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            if !crate::coherence::owns(at, len) {
+                return side;
+            }
+            drop(side);
+        }
+    }
+
+    /// For `crate::coherence` (invariant 2), under [`Shadow::with_side`]:
+    /// whether the CPU side of a copy in the card's memory holds title
+    /// bytes at offsets `[lo, hi)` that the card had not received when the
+    /// flight whose send was `sent_as` ran: bytes still to go up, or that
+    /// went up with a later send.
+    pub(crate) fn cpu_pending(&self, lo: usize, hi: usize, sent_as: u64) -> bool {
+        let Some(card) = &self.card else {
+            return true;
+        };
+        let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.iter().any(|&(a, b)| a < hi && b > lo) || sent.iter().any(|s| s.2 > sent_as && s.0 < hi && s.1 > lo)
+    }
+
+    /// The lazy copy-back's merge (`crate::coherence`), under
+    /// [`Shadow::with_side`]: `gpu` is what the card's side of this copy
+    /// holds at offset `at` on, fetched after send `after`. The bytes that
+    /// differ from the CPU's side, outside the title bytes the card had not
+    /// received ([`Shadow::card_merge_relay`] leaves the same out), are
+    /// what shaders wrote: they go into the CPU's side, and come back as
+    /// runs (offset from `at`, bytes) for the caller to write into title
+    /// memory. Title memory is not read: the bytes the card did not change
+    /// stay the title's. Runs a dword apart are joined (shaders store
+    /// dwords).
+    pub(crate) fn lazy_runs(&self, at: usize, gpu: &[u8], after: u64) -> Vec<(usize, usize)> {
+        let Some(card) = &self.card else {
+            return Vec::new();
+        };
+        let n = gpu.len();
+        if at + n > self.len as usize {
+            return Vec::new();
+        }
+        // SAFETY: inside the mapping of the copy's CPU side (checked
+        // above); the caller holds the side's lock, which every writer of
+        // these offsets holds.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        let skip: Vec<(usize, usize)> = {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            dirty
+                .iter()
+                .copied()
+                .chain(sent.iter().filter(|s| s.2 > after).map(|s| (s.0, s.1)))
+                .filter(|&(a, b)| a < at + n && b > at)
+                .collect()
+        };
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (a, b) in outside(at, at + n, skip) {
+            let (a, b) = (a - at, b - at);
+            let mut i = a;
+            while i < b {
+                match first_difference(&gpu[i..b], &held[i..b]) {
+                    Some(d) => i += d,
+                    None => break,
+                }
+                let from = i;
+                while i < b && gpu[i] != held[i] {
+                    i += 1;
+                }
+                held[from..i].copy_from_slice(&gpu[from..i]);
+                // (Never across bytes left out: those are the title's.)
+                match runs.last_mut() {
+                    Some(last) if last.0 >= a && from - (last.0 + last.1) < 4 => last.1 = i - last.0,
+                    _ => runs.push((from, i - from)),
+                }
+            }
+        }
+        runs
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -2335,6 +2438,7 @@ impl Shadow {
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        crate::coherence::copy_gone(start as usize, len as usize);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -2352,6 +2456,8 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        // Which title memory host copies hold (`crate::coherence`).
+        crate::coherence::copy_made(start as usize, len as usize);
         Shadow {
             buffer,
             data,
@@ -2986,8 +3092,9 @@ impl Shadow {
                 // puts what the card wrote into title memory and into the
                 // reference under the same lock, and a page read before
                 // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                // bytes for the title's. (Nothing of the page left on the
+                // card meanwhile, `crate::coherence`: it is read below.)
+                let mut before = self.side_unowned(lo, hi - lo);
                 // A page that is not there is left as it is, and looked at
                 // again next time.
                 if !crate::host::read_into(lo as *const u8, title) {
@@ -3443,7 +3550,9 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // (Nothing there left on the card: the read below must not fault
+        // into a bring-back that waits for this lock.)
+        let _side = self.side_unowned(start + at, gpu.len());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
@@ -3518,8 +3627,12 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
+/// What `crate::coherence` left on the card of it comes back now.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let gone = buffers().remove(&(start, resource));
+    if let Some(shadow) = gone.and_then(|entry| entry.shadow) {
+        crate::coherence::copy_released(&shadow);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making

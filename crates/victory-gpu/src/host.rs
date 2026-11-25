@@ -2025,11 +2025,102 @@ void main(uint3 id : SV_DispatchThreadID) {
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
+        // (`VICTORY_COPYBACK=lazy` decides at the landing which pieces to
+        // fetch: the relay's own fetch.)
         relay()
+            && !crate::coherence::lazy()
             && ["VICTORY_CARD_FETCH_INFLIGHT", "VICTORY_READBACK_DIRECT"]
                 .iter()
                 .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
     })
+}
+
+/// Whether `VICTORY_COPYBACK=lazy` can leave pieces on the card
+/// (`crate::coherence`): flights land on the relay's thread, which fetches
+/// on its copy queue, and a first touch fetches the same way.
+pub(crate) fn lazy_ready() -> bool {
+    relay() && crate::queue2::second().is_some_and(|s| s.fetches())
+}
+
+/// Whether a fill read title memory `[at, at + len)` ahead of flights
+/// lately (`fill_ahead`): a landing's write there is compared with what it
+/// read, so `crate::coherence` leaves nothing there on the card.
+pub(crate) fn fills_read_ahead(at: usize, len: usize) -> bool {
+    fill_ahead::read_lately(at, len)
+}
+
+/// The lazy copy-back's fetch (`crate::coherence`, `VICTORY_COPYBACK=lazy`):
+/// the bytes of `pieces` (copy, offsets `[lo, hi)`, piece number) as the
+/// card's sides hold them now, through the relay's copy queue, behind the
+/// host fence value `behind` (their producers': reached already) and
+/// nothing else; no title list. Returns the bytes, one piece after the
+/// other, and the last send of title bytes the card had finished when the
+/// fetch was sent (the merge's "fetched after", as in
+/// [`Host::relay_card_back`]). `None` without the copy queue's fetches, or
+/// if the card could not be read.
+///
+/// Flights in the air may write the pieces while they come down, as with
+/// the relay's own fetch on the copy queue: they fetch them again at their
+/// landing whatever their compare says ([`BESIDE`]).
+pub(crate) fn lazy_fetch(pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u32)], behind: u64) -> Option<(Vec<u8>, u64)> {
+    /// The memory the pieces come down to: buffer, mapping, bytes.
+    static INTO: Mutex<Option<(ID3D12Resource, usize, u64)>> = Mutex::new(None);
+    let host = host()?;
+    let second = crate::queue2::second().filter(|s| s.fetches())?;
+    let total: u64 = pieces.iter().map(|p| (p.2 - p.1) as u64).sum();
+    if total == 0 {
+        return Some((Vec::new(), second.order_done()));
+    }
+    let mut into = INTO.lock().unwrap_or_else(|e| e.into_inner());
+    if into.as_ref().is_none_or(|b| b.2 < total) {
+        let size = total.next_multiple_of(1 << 20);
+        *into = host.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+    }
+    let (buffer, data, _) = into.clone()?;
+    // SAFETY: a plain event of our own, closed below.
+    let event = unsafe { CreateEventW(None, false, false, None) }.ok()?;
+    // The sends of title bytes the card has finished are in what comes
+    // down (a later one may be too: the merge leaves its bytes out).
+    let after = second.order_done();
+    // SAFETY: an open copy list of the lane's; live buffers (the copies are
+    // held by their owners); the host's fence, signalled up to `behind`.
+    let ran = unsafe {
+        (|| -> windows::core::Result<()> {
+            let copy = second.down.list()?;
+            let mut at = 0u64;
+            for (shadow, lo, hi, _) in pieces {
+                copy.1.CopyBufferRegion(&buffer, at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                at += (*hi - *lo) as u64;
+            }
+            let job = second.down.send(copy, &[(&host.fence, behind)], total)?;
+            second.down.wait(job, event)
+        })()
+    };
+    // SAFETY: the event made above.
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(event);
+    }
+    if ran.is_err() {
+        return None;
+    }
+    if refetch() {
+        // Whatever had started may have been writing these pieces while
+        // they came down: those flights fetch them again at their landing.
+        let (started, landed) = (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire));
+        if started > landed {
+            let mut all = BESIDE.lock().unwrap_or_else(|e| e.into_inner());
+            let noted = all.get_or_insert_with(Default::default);
+            for (shadow, _, _, number) in pieces {
+                let upto = noted.entry((std::sync::Arc::as_ptr(shadow) as usize, *number)).or_insert(0);
+                *upto = (*upto).max(started);
+            }
+            BESIDE_STATS[1].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+        }
+    }
+    // SAFETY: the mapping of the fetched bytes, `total` of them; the copy
+    // into it has run.
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, total as usize) }.to_vec();
+    Some((bytes, after))
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to
@@ -3242,6 +3333,31 @@ mod fill_ahead {
             );
         }
         first
+    }
+
+    /// Whether a fill kept for the check (the last `KEEP` frames) read
+    /// title memory `[at, at + len)`, or fills there wait.
+    pub(super) fn read_lately(at: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = at + len;
+        if ANY_HELD.load(Relaxed)
+            && HELD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|held| (at / PIECE..=(end - 1) / PIECE).any(|piece| held.contains(&piece)))
+        {
+            return true;
+        }
+        let frame = crate::frame::current();
+        let read = READ.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = read.as_ref() else { return false };
+        (at / PIECE..=(end - 1) / PIECE)
+            .filter_map(|piece| map.get(&piece))
+            .flat_map(|p| p.fills.iter())
+            .any(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame)
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -5448,7 +5564,18 @@ impl Host {
     /// of the last flight being landed: a piece an earlier fetch on the
     /// copy queue brought down beside one of these flights is fetched
     /// whatever the compare says ([`BESIDE`]).
-    fn relay_card_back(&self, plans: &[(u64, &CardPlan)], fetch: &mut Option<RelayFetch>, behind: u64, landed: u64) {
+    ///
+    /// With `VICTORY_COPYBACK=lazy` a flagged piece `crate::coherence::take`
+    /// keeps is left on the card, neither fetched nor merged; `backs` is the
+    /// title memory the landing's texture read-backs write (left eager).
+    fn relay_card_back(
+        &self,
+        plans: &[(u64, &CardPlan)],
+        fetch: &mut Option<RelayFetch>,
+        behind: u64,
+        landed: u64,
+        backs: &[(usize, usize)],
+    ) {
         if inflight_fetch() {
             let only: Vec<&CardPlan> = plans.iter().map(|p| p.1).collect();
             let taken = self.relay_card_inflight(&only);
@@ -5475,6 +5602,7 @@ impl Host {
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        let lazy = crate::coherence::lazy();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -5502,6 +5630,12 @@ impl Host {
                 }
                 let fetched = flagged_pieces(&flags);
                 numbers.extend(fetched.iter().copied());
+                let landing = crate::coherence::Landing {
+                    flight: number,
+                    fence: behind,
+                    sent_as: plan.sent_as,
+                    backs,
+                };
                 for r in &plan.ranges {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -5513,6 +5647,11 @@ impl Host {
                             && !crate::census::skip_back(r.shadow.title_start(), (hi - lo) as u64)
                             && seen.insert((copy, lo, hi))
                         {
+                            // `VICTORY_COPYBACK=lazy`: left on the card,
+                            // fetched at the CPU's first touch.
+                            if lazy && crate::coherence::take(&r.shadow, lo, hi, r.span.first + p, r.declared, &landing) {
+                                continue;
+                            }
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
@@ -5523,6 +5662,14 @@ impl Host {
             }
         }
         BESIDE_STATS[0].fetch_add(again, Ordering::Relaxed);
+        if lazy {
+            // A piece fetched now that an earlier landing left on the card
+            // comes back first, so that this fetch, later, merges on top.
+            for (shadow, lo, hi, _) in &pieces {
+                let start = shadow.title_start() as usize;
+                crate::coherence::release(start + lo, hi - lo, crate::coherence::BY_MERGE);
+            }
+        }
         if pieces.is_empty() {
             if inflight_fetch() {
                 // The next merge may be of a flight in the air now, with
@@ -5863,7 +6010,11 @@ impl Host {
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
-                self.relay_card_back(&plans, fetch, behind, landed);
+                let mut backs = Vec::new();
+                if crate::coherence::lazy() {
+                    join_ranges(&mut backs, flights.iter().flat_map(|f| f.texture_back_ranges.iter().copied()));
+                }
+                self.relay_card_back(&plans, fetch, behind, landed, &backs);
                 #[cfg(feature = "diagnostics")]
                 relay_part(0, &mut part);
                 let mut back: Vec<Declared> = Vec::new();
@@ -8828,6 +8979,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
     let mut offset = 0;
+    let mut brought = 0;
     while offset < len {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
@@ -8840,6 +8992,16 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if size != size_of_val(&info) || n == 0 {
             read_pieces(at, to, remaining);
             break;
+        }
+        // Closed by the lazy copy-back (`crate::coherence`), not a hole:
+        // what the card keeps there comes back, and it is looked at again.
+        if info.State == MEM_COMMIT
+            && info.Protect == PAGE_NOACCESS
+            && brought < 4
+            && crate::coherence::release(at as usize, n, crate::coherence::BY_KERNEL)
+        {
+            brought += 1;
+            continue;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]

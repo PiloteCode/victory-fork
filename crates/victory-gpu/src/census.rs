@@ -46,6 +46,8 @@ static RESERVATIONS: Mutex<BTreeMap<usize, Reservation>> = Mutex::new(BTreeMap::
 pub fn title_memory_reserved(at: usize, len: usize, kind: u32, flags: u64, protect: u32) {
     if at != 0 && len != 0 {
         crate::uheap::reserved(at, len, kind, flags, protect);
+        // Which memory the lazy copy-back may close (`VICTORY_COPYBACK=lazy`).
+        crate::coherence::reserved(at, len, kind, protect);
     }
     // (Also for the copy-back's watched pages, counted by write-combining:
     // `crate::coherence`.)
