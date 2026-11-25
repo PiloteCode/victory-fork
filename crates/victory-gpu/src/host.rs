@@ -1828,8 +1828,11 @@ struct CardWork {
     /// ([`CARD_MASKED`]), if it was made.
     masked: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
     /// Upload buffers for the masks, not in use (buffer, mapping, bytes): a
-    /// plan takes one and gives it back with its lists.
+    /// plan takes one ...
     masks: Vec<(ID3D12Resource, usize, u64)>,
+    /// ... held here, by the plan's number in the queue's order, until
+    /// `Host::card_done` gives it back with the plan's lists.
+    masks_out: Vec<(u64, (ID3D12Resource, usize, u64))>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -2378,9 +2381,6 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
-    /// The upload buffer its masks went up from (`CardWork::masks`), given
-    /// back by `Host::card_done`.
-    masks: Option<(ID3D12Resource, usize, u64)>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -5082,9 +5082,15 @@ impl Host {
         let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = |what| self.make_prelude(what).ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        // in one submission. With `VICTORY_MERGE_MASKED=1` four: the area
+        // starts again only when no plan is out, and once the stale settles
+        // are gone (one or two a frame) the line rarely empties; at 16,800
+        // pieces compared a frame (wave 9's save gameplay) half of one
+        // megabyte is taken in eight frames, and a settle follows
+        // (`Host::card_results_low`); half of four lasts past the sweep's
+        // settle, every second and a half.
+        let results: u64 = if crate::shadow::merge_masked() { 4 << 20 } else { 1 << 20 };
+        let (differs, data) = self.shared_buffer(results).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -5105,13 +5111,14 @@ impl Host {
                 fetch: list("card fetch")?,
                 root,
                 pso,
-                differs: (differs, data as usize, RESULTS),
+                differs: (differs, data as usize, results),
                 fetched: None,
                 taken: 0,
                 out: 0,
-                inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+                inflight: if inflight_fetch() { self.make_card_inflight(results) } else { None },
                 masked: if crate::shadow::merge_masked() { self.make_card_masked() } else { None },
                 masks: Vec::new(),
+                masks_out: Vec::new(),
             })
         }
     }
@@ -5541,8 +5548,11 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
-            masks,
         };
+        // (Masks are sent with the relay only: `sent_as` names the plan.)
+        if let Some(masks) = masks {
+            work.masks_out.push((sent_as, masks));
+        }
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
@@ -5686,7 +5696,10 @@ impl Host {
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
-        work.masks.extend(plan.masks);
+        while let Some(at) = work.masks_out.iter().position(|m| m.0 == plan.sent_as) {
+            let (_, masks) = work.masks_out.swap_remove(at);
+            work.masks.push(masks);
+        }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
         // not read yet: the area starts again only when none is out.
