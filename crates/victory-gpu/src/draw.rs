@@ -237,6 +237,13 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// Set by [`State::execute_indirect`] instead of recording an indirect
+    /// draw whose records a shader of the list may have written: the list
+    /// is to be cut there and the draw recorded again in the new part,
+    /// whose prelude then clamps them (`crate::indirect::hoisting`).
+    pub(crate) hoist_cut: bool,
+    /// The command is recorded again after such a cut: no second one.
+    pub(crate) hoist_retry: bool,
     /// Diagnostics: the last indirect dispatch whose record was clamped
     /// (host list, copy, stride; the record's offset in the copy).
     #[cfg(feature = "diagnostics")]
@@ -3386,8 +3393,9 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base), w.step));
+        // (Counted once for a command recorded again after a cut.)
         #[cfg(feature = "diagnostics")]
-        {
+        if !self.hoist_retry {
             use crate::copystat::{C, add};
             let why = if !windows() {
                 None
@@ -3450,10 +3458,6 @@ impl State {
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
-                if let Some((s, at)) = &counter {
-                    s.refresh(list, *at, 4);
-                }
                 // Whether a shader recorded before in the list may write the
                 // records: if none may, the card holds them as they are when
                 // the list begins, and they are clamped in its prelude
@@ -3461,6 +3465,25 @@ impl State {
                 // list.
                 let span = len.max(u64::from(step) * u64::from(records));
                 let written = list.writes_declared((arguments as usize, (arguments + span) as usize));
+                // A draw's records one may have written, with hoisting on:
+                // nothing is recorded, the caller cuts the list here and
+                // records the draw again in the new part, where none may
+                // have, so its clamp (and those of the draws after it, until
+                // the list writes again) goes to the new part's prelude
+                // instead of between the draws.
+                if written
+                    && kind != DISPATCH
+                    && counter.is_none()
+                    && !self.hoist_retry
+                    && crate::indirect::hoisting()
+                {
+                    self.hoist_cut = true;
+                    return false;
+                }
+                args.refresh(list, arguments, span);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
                 let early = crate::indirect::early() && counter.is_none() && !written;
                 #[cfg(feature = "diagnostics")]
                 {
