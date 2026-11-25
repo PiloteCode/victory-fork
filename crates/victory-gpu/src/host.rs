@@ -1043,6 +1043,8 @@ pub(crate) struct HostList {
     indirect_ring: Mutex<Option<(ID3D12Resource, u64, u64)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
+    /// What the barrier pass knows of the list (`crate::barrier`).
+    pub(crate) barriers: crate::barrier::Pass,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
@@ -4565,6 +4567,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 indirect_ring: Mutex::default(),
                 window_check: OnceLock::new(),
+                barriers: crate::barrier::Pass::default(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
@@ -4977,6 +4980,8 @@ impl Host {
                                 D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
+                            #[cfg(feature = "diagnostics")]
+                            crate::barrier::ours(crate::barrier::Ours::CardUpload, 1);
                         }
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&work.pso);
@@ -5065,6 +5070,8 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Check);
+                    #[cfg(feature = "diagnostics")]
+                    crate::barrier::ours(crate::barrier::Ours::CardCompare, 1 + u64::from(flown && work.inflight.is_some()));
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -6879,6 +6886,8 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // A wait the barrier pass deferred is recorded before the list ends.
+        crate::barrier::close(self);
         self.twins_to_depth();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
@@ -6912,6 +6921,7 @@ impl HostList {
         // (With it the scratch buffer of indirect arguments is taken for
         // common again: a list that ran was closed, which left it so.)
         *self.deferred() = Deferred::default();
+        self.barriers.reset();
         if let Some((_, _, taken)) = &mut *self.indirect_ring.lock().unwrap_or_else(|e| e.into_inner()) {
             *taken = 0;
         }
@@ -7266,6 +7276,15 @@ impl HostList {
         // and clamps.
         #[cfg(feature = "diagnostics")]
         let stamps = self.stamps().filter(|_| ours);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::barrier::{Ours, ours};
+            ours(Ours::PreludeCopy, to_copy.len() as u64);
+            ours(Ours::PreludeStates, barriers.len() as u64);
+            if !deferred.early.is_empty() {
+                ours(Ours::PreludeClamp, 2);
+            }
+        }
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live; the clamps' and uploads' buffers are
         // kept by the list.
@@ -7470,6 +7489,8 @@ impl HostList {
             self.list.CopyBufferRegion(&to.buffer, to.offset(dst), &from.buffer, from.offset(src), len);
             l7.Barrier(&[barriers(&after)]);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::barrier::ours(crate::barrier::Ours::CardCopy, 2);
         self.keep(&to.buffer);
         self.keep(&from.buffer);
         true

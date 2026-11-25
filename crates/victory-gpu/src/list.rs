@@ -172,9 +172,19 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
-/// The host list behind a title list, if there is a host GPU.
+/// The host list behind a title list, if there is a host GPU. What the
+/// caller records may be work: the barrier pass is told (`crate::barrier`).
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let host = host_list_quiet(this)?;
+    host.barriers.touch();
+    Some(host)
+}
+
+/// [`host_list`] for calls that record no work (the title's enhanced
+/// barriers, the list's close).
+#[cfg(windows)]
+fn host_list_quiet<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -703,7 +713,7 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
+    if let Some(host) = host_list_quiet(this) {
         host.close();
     }
     S_OK
@@ -912,6 +922,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        #[cfg(feature = "diagnostics")]
+        crate::barrier::legacy(barriers.iter().map(|b| b.kind));
         let mut host = host_barriers(list, barriers);
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
@@ -949,6 +961,12 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::StateChanges, 1);
+        // Copy and resolve states (0x400, 0x800, 0x1000, 0x2000) apart.
+        #[cfg(feature = "diagnostics")]
+        crate::barrier::ours(
+            if state & 0x3c00 != 0 { crate::barrier::Ours::CopyStates } else { crate::barrier::Ours::ShaderStates },
+            1,
+        );
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
@@ -2479,7 +2497,9 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
+/// write (the title's buffer barriers order compute passes), or with
+/// `VICTORY_BARRIER_OPT=1` only where the call declares a wait
+/// (`crate::barrier`).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     // Diagnostics: counted, what they hold tallied, and left out under
     // `VICTORY_BARRIER_TEST=groups`.
@@ -2494,13 +2514,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(windows)]
     if count > 0
-        && let Some(list) = host_list(this)
+        && let Some(list) = host_list_quiet(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: the title passes `count` groups; an open list.
+        unsafe { crate::barrier::groups(list, count, _groups) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);

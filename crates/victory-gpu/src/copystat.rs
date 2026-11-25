@@ -1466,6 +1466,7 @@ pub(crate) fn log(frames: f64) {
         if crate::indirect::early() { "on" } else { "off" },
     );
     tracing::info!("  changes of state of title textures before their use, per frame: {:.0}", c[C::StateChanges as usize]);
+    crate::barrier::log(frames, c[C::IndirectBounded as usize]);
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
