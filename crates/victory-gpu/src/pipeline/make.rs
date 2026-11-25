@@ -14,6 +14,17 @@
 //!
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
+//!
+//! Passes over the screen (triangles with no vertex input and no depth or
+//! stencil test, [`GraphicsState::screen_pass`]) go before every other
+//! pipeline a worker takes, and have a budget of their own ([`screen_wait`],
+//! 20 s a frame): the title fills its lighting tables with such draws once,
+//! at the world's first frame, and behind a world's worth of pipelines to
+//! make they waited past their budget and were dropped for good; that run
+//! had no diffuse light at all (Belobug's fork, 18e57db8, which gives them
+//! workers of their own). With a cold cache our runs make a world's worth
+//! too: 1,320 pipelines over four minutes in a gameplay run of a new
+//! translator.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -33,6 +44,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// A pass over the screen ([`GraphicsState::screen_pass`]).
+    screen: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -50,6 +63,7 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
+            screen: !shaders.is_empty() && graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -107,6 +121,28 @@ fn wait_budget() -> Duration {
     })
 }
 
+/// Waiting allowed per title frame for passes over the screen, over all
+/// threads ([`GraphicsState::screen_pass`]): `VICTORY_SCREEN_PASS_WAIT_MS`,
+/// 20,000 by default (below the title's 30 s watchdog); 0 makes them
+/// pipelines like the others, as before.
+fn screen_wait() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_SCREEN_PASS_WAIT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(20_000);
+        tracing::info!(millis, "passes over the screen: made first, wait budget per frame");
+        Duration::from_millis(millis)
+    })
+}
+
+/// Whether `p` is made before the others and waited for within
+/// [`screen_wait`].
+fn first(p: &Pending) -> bool {
+    p.screen && !screen_wait().is_zero()
+}
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -124,8 +160,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        let first = first(p);
+        start(p, if first { SCREEN } else { REQUESTED });
+        wait(p, crate::frame::current(), first);
     }
     p.made.get()?.as_ref()
 }
@@ -159,18 +196,20 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+/// Waits for `p` while frame `frame` has budget left (of the budget for
+/// passes over the screen if `screen`, [`screen_wait`]).
+fn wait(p: &Pending, frame: u64, screen: bool) {
+    let budget = if screen { screen_wait() } else { wait_budget() };
     if budget.is_zero() {
         return;
     }
-    // The frame the budget belongs to, and what was waited of it (or is
+    // The frame each budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let shared = shared_budget();
+    let spent_of = &SPENT[usize::from(screen)];
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -196,7 +235,7 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -216,11 +255,14 @@ fn wait(p: &Pending, frame: u64) {
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+/// Requested, a pass over the screen ([`first`]): made before the others.
+const SCREEN: u8 = 3;
+const MAKING: u8 = 4;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    screen: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -228,6 +270,7 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            screen: VecDeque::new(),
         }
     }
 
@@ -239,20 +282,23 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match priority {
+            SCREEN => self.screen.push_back(p.clone()),
+            REQUESTED => self.requested.push_back(p.clone()),
+            _ => self.early.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        // An entry can have been promoted to a queue served sooner and
+        // claimed already: each queue keeps only those still in its state.
+        let take = |queue: &mut VecDeque<Arc<Pending>>, state: u8| {
+            std::iter::from_fn(|| queue.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
+        };
+        let p = take(&mut self.screen, SCREEN)
+            .or_else(|| take(&mut self.requested, REQUESTED))
+            .or_else(|| take(&mut self.early, EARLY))?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -399,6 +445,28 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
+        assert!(queue.pop().is_none());
+    }
+
+    /// A pass over the screen asked for after others is made before them,
+    /// and one started early and then asked for is taken once.
+    #[test]
+    fn passes_over_the_screen_go_first() {
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let screen = Arc::new(Pending::new(Vec::new(), None));
+        let early_screen = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+
+        assert_eq!(queue.push(&early_screen, EARLY), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        assert_eq!(queue.push(&screen, SCREEN), Some(true));
+        assert_eq!(queue.push(&early_screen, SCREEN), Some(false));
+        // Asked for again as an ordinary one: nothing changes.
+        assert_eq!(queue.push(&screen, REQUESTED), None);
+
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &screen));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early_screen));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
         assert!(queue.pop().is_none());
     }
 }
