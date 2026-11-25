@@ -182,7 +182,11 @@ What did it, on top of the list below:
     no gain while the card is the limit).
   - Tried and refused: `VICTORY_BVH_HOLD=1` holds back the 64 programs
     that walk ray-tracing structures nothing has built; the picture loses
-    its indirect light with it, so it stays off.
+    its indirect light with it, so it stays off. Instead, while the
+    structure builder does not run (`VICTORY_BVH_BUILDER=0`, or before its
+    first frame), those programs run with every node test answering no
+    hit, not walking whatever lies in memory (`VICTORY_BVH_NO_HIT=0`: as
+    before); picture to be checked.
   - The process opts out of the system's efficiency mode
     (`VICTORY_EFFICIENCY_MODE=1` leaves it); on a hybrid processor the
     frame log found the title's render and recording threads on fast
