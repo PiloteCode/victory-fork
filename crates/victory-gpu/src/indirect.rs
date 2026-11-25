@@ -348,14 +348,15 @@ fn record_clamp_as(
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
     // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
-    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // The two waits for every earlier shader write ([`waits`]).
+    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the
+    // waits out whatever [`waits`] says (the state changes stay).
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
+    let waits = waits() && crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
+    let waits = waits();
     let first = [
         uav_barrier(),
         transition(
@@ -389,6 +390,24 @@ fn record_clamp_as(
         l.ResourceBarrier(&second[skip..]);
     }
     true
+}
+
+/// Whether the pass that bounds an indirect command waits for every
+/// earlier shader write before it and after it (`VICTORY_INDIRECT_WAITS`:
+/// `1` waits, `0` does not; waiting is the default).
+///
+/// Neither wait is needed for the arguments. Before the pass: the title
+/// writes its arguments in a pass of its own and puts a barrier between
+/// that pass and the indirect command, as the API asks of it (its barrier
+/// groups, each a wait for every earlier shader write here), so they are
+/// written by the time the bounding pass reads them. After it: the
+/// scratch buffer's change of state to indirect arguments makes the
+/// pass's writes the command's to read. Each wait stops the card until
+/// all its work is done, and the title issues some 5,000 indirect commands
+/// a frame, one record each.
+fn waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WAITS").is_none_or(|v| v != "0"))
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):

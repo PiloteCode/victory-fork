@@ -346,19 +346,29 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Device methods 0x1c8 and 0x218 (`SLOT`): a pipeline made from the
+/// console driver's own serialized form of it, graphics and compute (XCL,
+/// on another title, names them `DeserializeGraphicsPipelineStateX` and
+/// `DeserializeComputePipelineStateX`). The title reads that form from a
+/// pipeline cache file it ships, `(this, description, interface id, out)`:
+/// the root signature, two driver blobs, and per hardware stage native code
+/// and its metadata (graphics: 0x108 bytes, seven stages; compute: 0x48
+/// bytes, one). No DXIL is there.
+///
+/// It needs no answer. When the call fails the title makes the pipeline the
+/// way it would without the cache: graphics through `CreatePipelineState`
+/// (a stream), compute through `CreateComputePipelineStateX`, both from the
+/// shader containers, which are translated as usual; it checks the result
+/// only for a removed, hung or reset device. (The comment here said the
+/// title went without the pipeline: the title's code at the call sites,
+/// title+0x2479760 and title+0x247fd30, shows the fallback.) So the calls
+/// fail with `out` null, and are counted.
+/// shortcut: the driver's serialized form is not read. Answering `S_OK`
+/// here without making the pipeline would hand the title whatever its
+/// stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
-    desc: *const u8,
+    _desc: *const u8,
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -369,31 +379,11 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    if calls <= 4 || calls.is_power_of_two() {
-        // Sixteen 64-bit words at `at`, read through the kernel: neither
-        // pointer is known to be mapped.
-        #[cfg(windows)]
-        let words = |at: usize| -> Option<Vec<u64>> {
-            let mut bytes = [0u8; 128];
-            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
-                bytes
-                    .as_chunks::<8>().0.iter()
-                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
-                    .collect()
-            })
-        };
-        #[cfg(not(windows))]
-        let words = |_: usize| None::<Vec<u64>>;
-        let description = words(desc as usize);
-        let first = description
-            .as_ref()
-            .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
+    if calls == 1 || (calls.is_power_of_two() && calls >= 1024) {
+        tracing::debug!(
             slot = format_args!("{:#x}", SLOT),
             calls,
-            description = format_args!("{description:x?}"),
-            first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "a pipeline from the driver's serialized form: refused, the title makes it from its shaders instead"
         );
     }
     E_NOTIMPL
