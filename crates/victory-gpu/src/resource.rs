@@ -1335,6 +1335,71 @@ pub(crate) fn note_unaliased(this: This) {
     );
 }
 
+/// Diagnostics, for `this`, a texture made for a view the title placed in
+/// memory, read through a view for which [`alias_of`] found no texture of its
+/// shape at its address: whether its memory overlaps a texture the host wrote
+/// in this frame or the one before. [`note_unaliased`] only sees views whose
+/// memory the title has just written; a view of another shape that reads what
+/// the host renders (memory the title never writes) would show stale title
+/// memory without a word. Counted in [`OVERLAPS`] (views read, of them over a
+/// texture written that recently), and the first such pairs logged.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_overlap(this: This) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return;
+    }
+    let r = resource(this);
+    if !r.host.placed.load(Relaxed) || !fills(&r.desc) {
+        return;
+    }
+    let Some(size) = footprint(&r.desc).map(|f| f.size) else {
+        return;
+    };
+    let (start, end) = (r.data() as u64, r.data() as u64 + size);
+    let now = crate::frame::current();
+    OVERLAPS[0].fetch_add(1, Relaxed);
+    let hit = {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        targets.range(..end).rev().take(256).find_map(|(&at, &other)| {
+            let o = resource(other as This);
+            let len = footprint(&o.desc).map_or(0, |f| f.size);
+            let written = o.host.written.load(Relaxed);
+            (at + len > start && written != 0 && written + 1 >= now).then_some((at, len, other))
+        })
+    };
+    let Some((at, len, other)) = hit else {
+        return;
+    };
+    let n = OVERLAPS[1].fetch_add(1, Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() {
+        return;
+    }
+    let o = resource(other as This);
+    let shape = |d: &ResourceDesc| {
+        format!(
+            "{}x{}x{} levels {} format {} flags {:#x} dim {}",
+            d.width, d.height, d.depth_or_array_size, d.mip_levels, d.format, d.flags, d.dimension
+        )
+    };
+    tracing::warn!(
+        texture = ?this,
+        at = format_args!("{start:#x}+{size:#x}"),
+        shape = %shape(&r.desc),
+        written = ?other,
+        written_at = format_args!("{at:#x}+{len:#x}"),
+        written_shape = %shape(&o.desc),
+        views_read = OVERLAPS[0].load(Relaxed),
+        over_live_textures = n,
+        "a view the title placed is read over a texture the host wrote in this frame or the last, in another shape: it shows title memory, not what the host wrote"
+    );
+}
+
+/// Diagnostics: views of placed textures [`note_overlap`] looked at, and of
+/// them those over a texture the host wrote in this frame or the last.
+#[cfg(all(windows, feature = "diagnostics"))]
+static OVERLAPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Diagnostics, of the views [`note_unaliased`] logged: all, those whose
 /// overlapped texture the host wrote in this frame or the one before (the
 /// two in use at once), longer ago, and never.
