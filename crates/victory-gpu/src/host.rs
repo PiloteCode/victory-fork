@@ -1823,6 +1823,13 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
+    /// With `VICTORY_MERGE_MASKED=1` (`crate::shadow::merge_masked`): the
+    /// pass that writes the title's bytes into card sides by their masks
+    /// ([`CARD_MASKED`]), if it was made.
+    masked: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
+    /// Upload buffers for the masks, not in use (buffer, mapping, bytes): a
+    /// plan takes one and gives it back with its lists.
+    masks: Vec<(ID3D12Resource, usize, u64)>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -1949,6 +1956,46 @@ pub(crate) fn card_wide_hash() -> bool {
 /// The groups a card compare or hash pass over `pieces` pieces dispatches.
 pub(crate) fn card_groups(pieces: u32) -> u32 {
     if card_wide_hash() { pieces.min(65535) } else { pieces.div_ceil(64) }
+}
+
+/// The title's bytes into a copy's card side by their mask
+/// (`crate::shadow::merge_masked`): a thread a dword from dword `first` on,
+/// `dwords` of them; the mask is a bit per byte (four per dword, dword `j`'s
+/// in bits `4 (j % 8)` of mask word `j / 8`, from mask word `mask_at`). A
+/// dword with all four bits takes the CPU side's dword; one with some takes
+/// those bytes and keeps the card's others; one with none is not touched.
+pub(crate) const CARD_MASKED: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer What : register(b0) {
+    uint first;    // the first dword of the copy
+    uint dwords;
+    uint mask_at;  // the first mask word
+};
+ByteAddressBuffer cpu : register(t0);
+ByteAddressBuffer masks : register(t1);
+RWByteAddressBuffer card : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint j = id.x;
+    if (j >= dwords) return;
+    uint four = (masks.Load((mask_at + (j >> 3)) * 4u) >> ((j & 7u) * 4u)) & 0xFu;
+    if (four == 0u) return;
+    uint at = (first + j) * 4u;
+    uint mine = cpu.Load(at);
+    if (four == 0xFu) {
+        card.Store(at, mine);
+        return;
+    }
+    uint m = ((four & 1u) != 0u ? 0x000000FFu : 0u) | ((four & 2u) != 0u ? 0x0000FF00u : 0u)
+        | ((four & 4u) != 0u ? 0x00FF0000u : 0u) | ((four & 8u) != 0u ? 0xFF000000u : 0u);
+    card.Store(at, (card.Load(at) & ~m) | (mine & m));
+}
+"#;
+
+/// The groups of [`CARD_MASKED`] for a mask of `dwords` dwords.
+fn masked_groups(dwords: usize) -> u32 {
+    dwords.div_ceil(64).clamp(1, 65535) as u32
 }
 
 /// The compare as it was, one thread per 64 KiB piece walking its 16-byte
@@ -2331,6 +2378,9 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// The upload buffer its masks went up from (`CardWork::masks`), given
+    /// back by `Host::card_done`.
+    masks: Option<(ID3D12Resource, usize, u64)>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4465,6 +4515,16 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+        if crate::shadow::merge_masked() {
+            let [pages, bytes, sent, hidden] =
+                [0, 1, 2, 3].map(|i| crate::shadow::MASKED_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "title bytes under flights' shader writes by byte masks per frame (VICTORY_MERGE_MASKED=1): {pages:.1} pages \
+                 ({:.3} MB changed) went up by their masks, {sent:.1} masks sent, {hidden:.1} merges of fetched pieces left \
+                 masked bytes out",
+                bytes / (1 << 20) as f64
+            );
+        }
     }
     // What the waits above found ahead of them (coh-submit).
     crate::waits::line(frames);
@@ -5050,7 +5110,44 @@ impl Host {
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+                masked: if crate::shadow::merge_masked() { self.make_card_masked() } else { None },
+                masks: Vec::new(),
             })
+        }
+    }
+
+    /// The pass of [`CARD_MASKED`] (`crate::shadow::merge_masked`); `None`,
+    /// and pages refused as before, if it cannot be made.
+    fn make_card_masked(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        let made = (|| -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+            let code = compile(CARD_MASKED, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+            // SAFETY: the blob's own bytes; the root signature is inside the
+            // shader.
+            unsafe {
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &code)?;
+                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })?;
+                Ok((root, pso))
+            }
+        })();
+        crate::shadow::masked_ready(made.is_ok());
+        match made {
+            Ok(pass) => {
+                tracing::info!(
+                    "title bytes under flights' shader writes go up by their byte masks when a page holds many changed runs                      (VICTORY_MERGE_MASKED=1)"
+                );
+                Some(pass)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no masked pass (VICTORY_MERGE_MASKED=1): such pages settle the flights as before");
+                None
+            }
         }
     }
 
@@ -5201,6 +5298,14 @@ impl Host {
             None => 0,
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        // Title bytes that go up by their masks (`crate::shadow::merge_masked`),
+        // taken in the same hold of the queue's order as the ranges.
+        let masked = crate::shadow::card_masked(sent_as);
+        for (shadow, _) in &masked {
+            if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                dirty.push((shadow.clone(), Vec::new()));
+            }
+        }
         // With fetches on a copy queue (`crate::queue2`, bit 1 of
         // `VICTORY_QUEUE2`): the send's number is signalled on the direct
         // queue behind the send, so that a fetch knows which sends the card
@@ -5234,6 +5339,28 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // The masks' upload memory: one buffer for the plan, in use until
+        // its submission has run (`Host::card_done` gives it back).
+        let mask_words: usize = masked.iter().flat_map(|(_, m)| m.iter().map(|m| m.bits.len())).sum();
+        let masks: Option<(ID3D12Resource, usize, u64)> = if mask_words == 0 {
+            None
+        } else {
+            if work.masked.is_none() {
+                fail(format_args!("title bytes to go up by their masks, and no masked pass (VICTORY_MERGE_MASKED=1)"));
+            }
+            let bytes = (mask_words * 4) as u64;
+            match work.masks.iter().position(|m| m.2 >= bytes) {
+                Some(at) => Some(work.masks.swap_remove(at)),
+                None => {
+                    let size = bytes.next_power_of_two().max(64 << 10);
+                    let Some((buffer, data)) = self.upload_buffer(size) else {
+                        fail(format_args!("no upload memory for {bytes} bytes of masks (VICTORY_MERGE_MASKED=1)"));
+                    };
+                    name(&buffer, || "title bytes' masks for card copies".into());
+                    Some((buffer, data as usize, size))
+                }
+            }
+        };
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
         // 2): the landing buffer they are in, in the order of `dirty`'s
         // ranges, once the direct queue has waited. `None`: straight from
@@ -5296,6 +5423,8 @@ impl Host {
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
+                    // The next mask's first word in the masks' buffer.
+                    let mut mask_at = 0usize;
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -5314,6 +5443,41 @@ impl Host {
                             ranges.iter().map(|&(a, b)| (b - a) as u64).sum(),
                             ranges.len() as u64,
                         );
+                        // The title's bytes by their masks, after the ranges
+                        // (`crate::shadow::merge_masked`): only the bytes the
+                        // title changed, whatever the flights before wrote
+                        // beside them. Then the card side is read by the hash.
+                        let mine: &[crate::shadow::Masked] =
+                            masked.iter().find(|(s, _)| Arc::ptr_eq(s, shadow)).map_or(&[], |(_, m)| &m[..]);
+                        let mut readable = false;
+                        if !mine.is_empty()
+                            && let (Some((root, pso)), Some((buffer, data, _))) = (&work.masked, &masks)
+                        {
+                            let was = if ranges.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_DEST };
+                            list.ResourceBarrier(&[transition(&shadow.buffer, was, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                            list.SetComputeRootSignature(root);
+                            list.SetPipelineState(pso);
+                            list.SetComputeRootShaderResourceView(1, staging.GetGPUVirtualAddress());
+                            list.SetComputeRootShaderResourceView(2, buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(3, shadow.buffer.GetGPUVirtualAddress());
+                            for m in mine {
+                                // The plan's own buffer, sized for every mask
+                                // of it; the card reads it when the list runs.
+                                std::ptr::copy_nonoverlapping(m.bits.as_ptr(), (*data as *mut u32).add(mask_at), m.bits.len());
+                                let constants = [(m.base / 4) as u32, m.dwords as u32, mask_at as u32];
+                                list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                                list.Dispatch(masked_groups(m.dwords), 1, 1);
+                                mask_at += m.bits.len();
+                            }
+                            list.ResourceBarrier(&[transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            )]);
+                            #[cfg(feature = "diagnostics")]
+                            crate::barrier::ours(crate::barrier::Ours::CardUpload, 2);
+                            readable = true;
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -5323,7 +5487,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if !ranges.is_empty() && !readable {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -5340,7 +5504,11 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            ranges
+                                .iter()
+                                .map(|&(a, b)| shadow.card_run(a, b))
+                                .chain(mine.iter().map(|m| shadow.card_run(m.base, m.base + 4 * m.dwords)))
+                                .collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -5373,6 +5541,7 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
+            masks,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5517,6 +5686,7 @@ impl Host {
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
+        work.masks.extend(plan.masks);
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
         // not read yet: the area starts again only when none is out.
