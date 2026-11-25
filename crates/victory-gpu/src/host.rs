@@ -6566,8 +6566,9 @@ impl Host {
             && !(late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500))
             .then(crate::descriptor::heap_sync_begin)
             .flatten();
+        crate::descriptor::submitter_counted();
         if beside.is_none() {
-            crate::descriptor::sync_heaps();
+            crate::descriptor::on_submitter(crate::descriptor::SUBMITTER_SYNC, crate::descriptor::sync_heaps);
         }
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::HEAPS, &mut part);
@@ -6579,13 +6580,17 @@ impl Host {
         // landed since it began).
         if !behind {
             if let Some(ticket) = beside.take() {
-                crate::descriptor::heap_sync_joined(ticket);
+                crate::descriptor::on_submitter(crate::descriptor::SUBMITTER_JOIN, || {
+                    crate::descriptor::heap_sync_joined(ticket);
+                });
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             if let Some(ticket) = beside.take() {
-                crate::descriptor::heap_sync_joined(ticket);
+                crate::descriptor::on_submitter(crate::descriptor::SUBMITTER_JOIN, || {
+                    crate::descriptor::heap_sync_joined(ticket);
+                });
             }
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
@@ -6598,7 +6603,7 @@ impl Host {
         // lists that may read them run (after the sync: with one beside,
         // when it is done, below).
         if beside.is_none() {
-            crate::descriptor::make_waiting();
+            crate::descriptor::on_submitter(crate::descriptor::SUBMITTER_WAITING, crate::descriptor::make_waiting);
         }
         #[cfg(feature = "diagnostics")]
         submit_parts::to(submit_parts::SWEEP, &mut part);
@@ -6707,8 +6712,10 @@ impl Host {
         // The descriptor sync beside the preparing, before the lists that
         // read its slots go to the card; then the slots that waited.
         if let Some(ticket) = beside {
-            crate::descriptor::heap_sync_joined(ticket);
-            crate::descriptor::make_waiting();
+            crate::descriptor::on_submitter(crate::descriptor::SUBMITTER_JOIN, || {
+                crate::descriptor::heap_sync_joined(ticket);
+            });
+            crate::descriptor::on_submitter(crate::descriptor::SUBMITTER_WAITING, crate::descriptor::make_waiting);
             #[cfg(feature = "diagnostics")]
             submit_parts::to(submit_parts::HEAPS, &mut part);
         }

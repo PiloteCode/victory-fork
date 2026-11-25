@@ -409,12 +409,62 @@ static SYNC_PARTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame line, in every build: what the descriptor sync cost
+/// the thread that submits, in microseconds, at these places of
+/// `crate::host`'s submission ([`on_submitter`]), and the submissions.
+/// [`SYNCED`] times the sync wherever it runs (on the thread of
+/// [`heap_sync_beside`] too); this is the submitting thread's share, the
+/// one the frame waits for.
+#[cfg(windows)]
+static ON_SUBMITTER: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// [`sync_heaps`] run by the thread that submits.
+#[cfg(windows)]
+pub(crate) const SUBMITTER_SYNC: usize = 0;
+/// Waiting for the sync beside the preparing ([`heap_sync_joined`]).
+#[cfg(windows)]
+pub(crate) const SUBMITTER_JOIN: usize = 1;
+/// The slots that waited for a texture's host copy ([`make_waiting`]).
+#[cfg(windows)]
+pub(crate) const SUBMITTER_WAITING: usize = 2;
+
+/// Runs `f` on the thread that submits and adds its time to part `part` of
+/// [`ON_SUBMITTER`] (two clock reads: cheap enough for every build).
+#[cfg(windows)]
+pub(crate) fn on_submitter<R>(part: usize, f: impl FnOnce() -> R) -> R {
+    let began = std::time::Instant::now();
+    let r = f();
+    ON_SUBMITTER[part].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+/// A submission went through the descriptor sync's places ([`ON_SUBMITTER`]).
+#[cfg(windows)]
+pub(crate) fn submitter_counted() {
+    ON_SUBMITTER[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
-/// Nothing while no heap page changed.
+/// Nothing while no heap page changed and the thread that submits spent
+/// nothing on it.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let [asking, reading, slots] = [0, 1, 2].map(|i| SYNC_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [sync, join, waiting, submissions] =
+        [0, 1, 2, 3].map(|i| ON_SUBMITTER[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    if sync + join + waiting > 0.0 {
+        tracing::info!(
+            "descriptor sync on the thread that submits, per frame: {:.2} ms (the sync run there {:.2}, waiting for the \
+             sync beside the preparing {:.2} (VICTORY_HEAP_SYNC_BESIDE={}), slots that waited for a texture's host \
+             copy {:.2}) in {:.1} submissions",
+            (sync + join + waiting) / 1000.0 / frames,
+            sync / 1000.0 / frames,
+            join / 1000.0 / frames,
+            u8::from(heap_sync_beside()),
+            waiting / 1000.0 / frames,
+            submissions / frames
+        );
+    }
     if pages == 0 {
         return;
     }
