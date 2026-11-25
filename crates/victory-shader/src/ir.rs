@@ -1752,6 +1752,70 @@ mod tests {
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
     }
 
+    /// A POPS wait: past it when SCC says so (`s_cbranch_scc1`), else a loop that sleeps
+    /// until `src_pops_exiting_wave_id` passes s1; `after` follows.
+    fn pops_wait(after: &[u32]) -> Program {
+        let mut w = vec![
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0004, // s_cbranch_scc1 -> past the loop
+            0xBF8E_FFFF, // s_sleep 0xffff
+            0x810C_01EF, // s_add_i32 s12, src_pops_exiting_wave_id, s1
+            0xBF0A_0C01, // s_cmp_lt_u32 s1, s12
+            0xBF84_FFFC, // s_cbranch_scc0 -> s_sleep
+        ];
+        w.extend_from_slice(after);
+        w.push(S_ENDPGM);
+        build_words(&w, false)
+    }
+
+    #[test]
+    fn a_pops_wait_is_left_out_when_nothing_after_it_reads_what_it_wrote() {
+        let loops = |p: &Program| {
+            let order = reverse_postorder(&p.blocks);
+            order.iter().filter(|&&b| p.blocks[b].exit.successors().contains(&b)).count()
+        };
+        // v_mov_b32 v1, s2: the wait wrote nothing read after it
+        let p = pops_wait(&[0x7E02_0202]);
+        assert_eq!(loops(&p), 1);
+        let q = without_pops_wait(&p).expect("left out");
+        assert_eq!(loops(&q), 0);
+        // the branch around the wait has nothing left to decide
+        let entry = &q.blocks[0];
+        assert!(matches!(entry.exit, Exit::Jump(_)), "{:?}", entry.exit);
+        assert!(entry.insts.iter().all(|i| !i.name().starts_with("s_cbranch")));
+        // v_mov_b32 v1, s12: the sum the wait made is read after it: it stays
+        assert!(without_pops_wait(&pops_wait(&[0x7E02_020C])).is_none());
+        // no wait, nothing to leave out
+        assert!(without_pops_wait(&build_words(&[0x7E02_0202, S_ENDPGM], false)).is_none());
+    }
+
+    #[test]
+    fn a_split_join_gives_each_way_in_its_own_copy() {
+        let code = [
+            0xBF06_0100, // s_cmp_eq_u32 s0, s1
+            0xBF85_0002, // s_cbranch_scc1 -> s_mov_b32 s2, 0
+            0xB002_0092, // s_movk_i32 s2, 0x92
+            0xBF82_0001, // s_branch -> the join
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0x7E02_0202, // v_mov_b32 v1, s2 (the join)
+            S_ENDPGM,
+        ];
+        let p = build_words(&code, false);
+        let join = p.blocks.iter().position(|b| b.preds.len() == 2).expect("a join");
+        assert_eq!(p.blocks[join].phis.len(), 1, "s2 differs by the way in");
+        let q = split_joins(&p, &[join]).expect("split");
+        // two blocks read s2 into v1, neither through a phi
+        let reads: Vec<&Block> = q
+            .blocks
+            .iter()
+            .filter(|b| b.insts.first().is_some_and(|i| i.name() == "v_mov_b32"))
+            .collect();
+        assert_eq!(reads.len(), 2);
+        assert!(reads.iter().all(|b| b.preds.len() == 1 && b.phis.is_empty()));
+        // a block with one way in is left as it is
+        assert!(split_joins(&q, &[0]).is_none());
+    }
+
     #[test]
     fn joins_get_phis_only_where_values_differ() {
         let code = [
