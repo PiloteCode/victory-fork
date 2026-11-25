@@ -381,12 +381,14 @@ fn unspill(
     // Lane pairs (register, lower lane) that always move together: each
     // save of the lower lane is followed, in the same block and before its
     // register changes, by the save of the next register into the next
-    // lane; each restore of the lower lane is followed at once by the
-    // restore of the next lane into the next register.
+    // lane; each restore of the lower lane is followed, in the same block
+    // and before the next register is read or written, by the restore of
+    // the next lane into the next register.
     // The second save may come any number of instructions after the first (the
     // compiler puts loads and constants between the two: five instructions later
-    // in the ped mesh programs). Only wave64 programs have pairs: a wave32 mask
-    // is one dword, and a pair move of it with its neighbour would hide it.
+    // in the ped mesh programs), and so may the second restore. Only wave64
+    // programs have pairs: a wave32 mask is one dword, and a pair move of it
+    // with its neighbour would hide it.
     let mut slots: Vec<(u8, u32)> = parks.iter().flatten().map(|p| (p.1, p.3)).collect();
     slots.sort_unstable();
     slots.dedup();

@@ -273,6 +273,39 @@ impl Lower<'_> {
                     let t = l.s.m.select(c, ymaj, yv, xv);
                     l.s.m.select(c, zmaj, zv, t)
                 };
+                if super::super::lean_math() >= 1 {
+                    // The same values with one sign test: each face's choice
+                    // looks at the sign of the major coordinate, picked once
+                    // (and shared by the four instructions of a direction).
+                    let major = pick(self, z, y, x);
+                    let neg = neg(self, major);
+                    let r = match name {
+                        "v_cubeid_f32" => {
+                            let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
+                            let (f4, f2, f1, f0) = (k(self, 4.0), k(self, 2.0), k(self, 1.0), k(self, 0.0));
+                            let t = self.s.m.select(c, ymaj, f2, f0);
+                            let base = self.s.m.select(c, zmaj, f4, t);
+                            let odd = self.s.m.select(c, neg, f1, f0);
+                            self.s.m.bin(c, Bin::Add, base, odd)
+                        }
+                        "v_cubesc_f32" => {
+                            let (mx, mz) = (minus(self, x), minus(self, z));
+                            let zf = self.s.m.select(c, neg, mx, x);
+                            let xf = self.s.m.select(c, neg, z, mz);
+                            pick(self, zf, x, xf)
+                        }
+                        "v_cubetc_f32" => {
+                            let (my, mz) = (minus(self, y), minus(self, z));
+                            let yf = self.s.m.select(c, neg, mz, z);
+                            pick(self, my, yf, my)
+                        }
+                        _ => {
+                            let two = self.s.m.f32(2.0f32.to_bits());
+                            self.s.m.bin(c, Bin::Mul, major, two)
+                        }
+                    };
+                    return float(self, r);
+                }
                 let r = match name {
                     "v_cubeid_f32" => {
                         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
@@ -963,7 +996,19 @@ impl Lower<'_> {
                     return Err("a lane write");
                 };
                 let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
+                    Some(o) => match self.i32_of(o) {
+                        Ok(o) => o,
+                        // An old value without a host form (the first half of an
+                        // interpolation the register held) whose kept half no one reads.
+                        Err(_)
+                            if guard.is_none()
+                                && name == "v_fma_mixlo_f16"
+                                && inst.write(Reg::V(reg)).is_some_and(|w| self.high_half_unread(w, 4)) =>
+                        {
+                            self.s.m.i32(0)
+                        }
+                        Err(e) => return Err(e),
+                    },
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
@@ -1500,7 +1545,7 @@ impl Lower<'_> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
-            "f32" | "f16" if op == "class" => {
+            "f32" | "f16" if op == "class" => 'class: {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
                 let f16 = ty == "f16";
@@ -1523,6 +1568,12 @@ impl Lower<'_> {
                     self.as_int(x)
                 };
                 let mask = self.src(inst, 1)?;
+                // `VICTORY_CLASS_RANGES=1`: a constant mask tests ranges of the bits.
+                if super::super::lean::class_ranges_on()
+                    && let Some(m) = self.s.m.int_value(mask)
+                {
+                    break 'class super::super::lean::class_test(&mut self.s.m, c, x, m as u32, f16);
+                }
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
                 let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
                     (10, 15, 0x1F, 0x03FF, 0x0200)
