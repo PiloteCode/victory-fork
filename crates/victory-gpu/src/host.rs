@@ -1872,6 +1872,21 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Since the last frame-rate line, of the relay's landing (diagnostics):
+/// microseconds in copies in the card's memory (fetch and merge), in the
+/// CPU side's copies (compare and merge), closing the flights' ranges, and
+/// the rest (read-backs, card plans done, bottom-of-pipe writes, signals).
+#[cfg(feature = "diagnostics")]
+static RELAY_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Adds the microseconds since `from` to [`RELAY_PARTS`]`[i]` and restarts it.
+#[cfg(feature = "diagnostics")]
+fn relay_part(i: usize, from: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    RELAY_PARTS[i].fetch_add((now - *from).as_micros() as u64, Ordering::Relaxed);
+    *from = now;
+}
+
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
 /// how many, from the front, can be landed when the card has reached
@@ -2622,6 +2637,19 @@ fn late_line(frames: f64) {
             w[WHY_MOST],
             w[WHY_WRITES],
             w[WHY_FENCE],
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    if relay() {
+        let p: Vec<f64> = RELAY_PARTS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
+        tracing::info!(
+            "the relay's landing per frame: copies in the card's memory {:.1} ms (their fetches' waits included), \
+             the CPU side's copies {:.1} ms, the flights' ranges closed {:.1} ms, the rest {:.1} ms (read-backs, \
+             plans done, bottom-of-pipe writes, signals)",
+            p[0],
+            p[1],
+            p[2],
+            p[3]
         );
     }
     if relay() {
@@ -3426,7 +3454,7 @@ impl Host {
     /// flights being landed (the card has run them), the pieces their
     /// compares flagged are fetched, once each, with a list and a wait of
     /// this thread's own, and what shaders wrote in them goes into title
-    /// memory (`Shadow::card_merge_relay`). As [`Host::card_back`], but:
+    /// memory (`Shadow::card_merge_relay_many`). As [`Host::card_back`], but:
     /// no submission lock; a piece flagged under one range of a plan is
     /// fetched under all ([`flagged_pieces`]); the fetch runs behind
     /// whatever was sent meanwhile, so it may bring a later flight's
@@ -3556,15 +3584,20 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
+        // Per copy, all its pieces at once (`Shadow::card_merge_relay_many`).
+        let mut by_copy: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, &[u8])>)> = Vec::new();
         for (shadow, lo, hi, at) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
+            match by_copy.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                Some((_, list)) => list.push((*lo, gpu)),
+                None => by_copy.push((shadow.clone(), vec![(*lo, gpu)])),
+            }
+        }
+        let mut written = 0;
+        for (shadow, list) in by_copy {
+            written += shadow.card_merge_relay_many(list, after);
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
@@ -3601,8 +3634,12 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
+                #[cfg(feature = "diagnostics")]
+                let mut part = std::time::Instant::now();
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
+                #[cfg(feature = "diagnostics")]
+                relay_part(0, &mut part);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -3619,6 +3656,8 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
+                #[cfg(feature = "diagnostics")]
+                relay_part(1, &mut part);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -3626,12 +3665,16 @@ impl Host {
                         shadow.copy_back_done(ranges);
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                relay_part(2, &mut part);
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
         // In the order given: what tells the title the card is done.
+        #[cfg(feature = "diagnostics")]
+        let mut rest = std::time::Instant::now();
         let mut last = 0;
         let mut landed = Vec::new();
         for item in items {
@@ -3655,6 +3698,8 @@ impl Host {
             bury(last);
         }
         self.log_messages();
+        #[cfg(feature = "diagnostics")]
+        relay_part(3, &mut rest);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
             let mut line = line();

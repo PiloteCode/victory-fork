@@ -3024,7 +3024,7 @@ impl State {
                 Some(C::IndirectNotWindowedMany)
             } else if !windowed {
                 Some(C::IndirectNotWindowedStores)
-            } else if self.window.as_ref().is_some_and(|w| same(w)) {
+            } else if self.window.as_ref().is_some_and(&same) {
                 Some(C::IndirectWindowGrown)
             } else {
                 Some(C::IndirectWindowFirst)

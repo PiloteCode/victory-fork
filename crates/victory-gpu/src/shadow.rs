@@ -368,7 +368,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// (`crate::host`'s order of the queue): each range is noted with it, in
 /// the same lock that took it, so that a merge of pieces fetched before
 /// that send knows the card did not hold these bytes yet
-/// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
+/// ([`Shadow::card_merge_relay_many`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
@@ -411,6 +411,22 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// The most threads that merge one copy's fetched pieces
+/// ([`Shadow::card_merge_relay_many`]): `VICTORY_RELAY_MERGE_THREADS`, 1 by
+/// default (one after the other on the relay's thread).
+/// shortcut: one thread until a run on a quiet machine has measured more:
+/// the first run with 8 lost the device to another program's work on the
+/// card 2.5 minutes in (2026-11-25), which says nothing either way.
+fn merge_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_RELAY_MERGE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(1, |n| n.clamp(1, 32))
+    })
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -3142,74 +3158,130 @@ impl Shadow {
         written
     }
 
-    /// [`relay`], for a copy in the card's memory: `gpu` is what the
-    /// card's side held at offset `at` on when a fetch sent after send
-    /// `fetched_after` (`crate::host`'s order of the queue) ran, in a piece
-    /// the compare found differing. The bytes that differ from the CPU's
-    /// side are what shaders wrote; they go into title memory, from the
-    /// first to the last of them, and into the CPU's side. Nothing is sent
-    /// up afterwards (the card holds these bytes or newer ones: sending
-    /// them up could undo a later flight's write), and the title's other
-    /// bytes are left to the refresh.
+    /// [`relay`], for a copy in the card's memory: `pieces` are (offset,
+    /// bytes) of what the card's side held there when a fetch sent after
+    /// send `fetched_after` (`crate::host`'s order of the queue) ran, in
+    /// pieces the compare found differing, in any order. The bytes that
+    /// differ from the CPU's side are what shaders wrote; in each piece
+    /// they go into title memory, from the first to the last of them, and
+    /// into the CPU's side. Nothing is sent up afterwards (the card holds
+    /// these bytes or newer ones: sending them up could undo a later
+    /// flight's write), and the title's other bytes are left to the refresh.
     ///
     /// Left out: bytes of the CPU's side that hold title bytes the card
     /// had not received when the fetch ran, those still to go up and those
     /// that went up with a later send. There the card's side is the older
     /// one, and taking it for a shader's write would put it over what the
     /// title wrote. Under the CPU side's lock (the snapshot's, which such
-    /// a copy has no other use for), as [`Shadow::merge_under_writes`].
-    /// `title` is scratch memory. Returns the bytes written to title
-    /// memory.
-    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+    /// a copy has no other use for), as [`Shadow::merge_under_writes`],
+    /// taken once for all the pieces; the ranges to leave out are gathered
+    /// once (and found by a binary search), and the pieces are merged on
+    /// several threads, cut where no two pieces overlap.
+    ///
+    /// One piece at a time the relay spent 45-50 ms a frame merging some
+    /// 1,500 fetched pieces of 64 KiB (RTX 5090, the opening of the
+    /// gameplay), most of them of the title's 174 MB pool, each taking the
+    /// lock again and walking every range still to go up; the submitting
+    /// thread's reads of title memory wait for the landing.
+    /// Returns the bytes written to title memory.
+    pub(crate) fn card_merge_relay_many(&self, mut pieces: Vec<(usize, &[u8])>, fetched_after: u64) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
         };
-        if at + gpu.len() > self.len as usize {
+        pieces.retain(|(at, gpu)| at + gpu.len() <= self.len as usize && !gpu.is_empty());
+        if pieces.is_empty() {
             return 0;
         }
+        pieces.sort_unstable_by_key(|(at, _)| *at);
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: inside the mapping (checked above). The offsets are in a
-        // range declared and not done with, which no refresh writes; what
-        // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        let Some(first) = first_difference(gpu, held) else {
-            return 0;
-        };
-        let last = last_difference(gpu, held).unwrap_or(first);
-        let (at, n) = (at + first, last + 1 - first);
-        let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+        // The ranges left out (above), joined and in order.
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
+            let all: Vec<(usize, usize)> = dirty
                 .iter()
                 .copied()
                 .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
+                .filter(|&(a, b)| a < b)
+                .collect();
+            joined(all)
         };
-        title.clear();
-        title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
-        // The stretch as read: what the card did not change is the
-        // title's, and may have been written again since.
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
-        let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+        let data = self.data as usize;
+        // One piece.
+        let merge = |at: usize, gpu: &[u8], title: &mut Vec<u8>| -> usize {
+            // SAFETY: inside the mapping (checked above); pieces given to
+            // one thread do not overlap those of another, and what else
+            // writes these bytes holds the lock held here.
+            let held = unsafe { std::slice::from_raw_parts_mut((data + at) as *mut u8, gpu.len()) };
+            let Some(first) = first_difference(gpu, held) else {
+                return 0;
+            };
+            let last = last_difference(gpu, held).unwrap_or(first);
+            let (at, n) = (at + first, last + 1 - first);
+            let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+            let from = skip.partition_point(|&(_, b)| b <= at);
+            let here: Vec<(usize, usize)> = skip[from..].iter().copied().take_while(|&(a, _)| a < at + n).collect();
+            title.clear();
+            title.resize(n, 0);
+            let mapped = crate::host::read_into((start + at) as *const u8, title);
+            // The stretch as read: what the card did not change is the
+            // title's, and may have been written again since.
+            let as_read = (mapped && merge_race_on()).then(|| title.clone());
+            let mut changed = false;
+            for (a, b) in outside(at, at + n, here) {
+                let (a, b) = (a - at, b - at);
+                // Title memory that is not mapped: the CPU's side keeps what
+                // the card wrote, as before; `title` is scratch then.
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            }
+            if !mapped || !changed {
+                return 0;
+            }
+            crate::watch::writing(start + at, n);
+            merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
+            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+            n
+        };
+        // Each piece counted for the walls' trace (`walls_merged`).
+        let merge = |at: usize, gpu: &[u8], title: &mut Vec<u8>| -> usize {
+            let merged = merge(at, gpu, title);
+            self.walls_merged(gpu.len(), merged);
+            merged
+        };
+        // Cut into runs of about the same count, only between pieces that
+        // do not overlap (a piece cut short by a range may share bytes with
+        // the next one).
+        let threads = (pieces.len() / 64).clamp(1, merge_threads());
+        let mut runs: Vec<&[(usize, &[u8])]> = Vec::with_capacity(threads);
+        let mut rest: &[(usize, &[u8])] = &pieces;
+        while !rest.is_empty() {
+            let left = threads - runs.len();
+            let mut cut = if left <= 1 { rest.len() } else { rest.len().div_ceil(left) };
+            while cut < rest.len() && rest[cut - 1].0 + rest[cut - 1].1.len() > rest[cut].0 {
+                cut += 1;
+            }
+            let (run, next) = rest.split_at(cut);
+            runs.push(run);
+            rest = next;
         }
-        if !mapped || !changed {
-            return 0;
+        if runs.len() == 1 {
+            let mut title = Vec::new();
+            return pieces.iter().map(|(at, gpu)| merge(*at, gpu, &mut title)).sum();
         }
-        crate::watch::writing(start + at, n);
-        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        let merge = &merge;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = runs
+                .iter()
+                .map(|run| {
+                    scope.spawn(move || {
+                        let mut title = Vec::new();
+                        run.iter().map(|(at, gpu)| merge(*at, gpu, &mut title)).sum::<usize>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+        })
     }
 }
 
