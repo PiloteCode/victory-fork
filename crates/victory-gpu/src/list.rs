@@ -2224,7 +2224,7 @@ extern "system" fn execute_indirect(
             });
         }
     } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(windows)]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
             address.is_some(),
