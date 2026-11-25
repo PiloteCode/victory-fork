@@ -1823,6 +1823,8 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
+    /// The masked pass (`crate::masked`), with `VICTORY_MERGE_MASKED=1`.
+    masked: Option<crate::masked::Pass>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -4465,6 +4467,7 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+        crate::masked::line(frames);
     }
     // What the waits above found ahead of them (coh-submit).
     crate::waits::line(frames);
@@ -5022,9 +5025,15 @@ impl Host {
         let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = |what| self.make_prelude(what).ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        // in one submission. With `VICTORY_MERGE_MASKED=1` four: the area
+        // starts again only when no plan is out, and once the stale settles
+        // are gone (one or two a frame) the line rarely empties; at 16,800
+        // pieces compared a frame (wave 9's save gameplay) half of one
+        // megabyte is taken in eight frames, and a settle follows
+        // (`Host::card_results_low`); half of four lasts past the sweep's
+        // settle, every second and a half.
+        let results: u64 = if crate::shadow::merge_masked() { 4 << 20 } else { 1 << 20 };
+        let (differs, data) = self.shared_buffer(results).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -5045,11 +5054,12 @@ impl Host {
                 fetch: list("card fetch")?,
                 root,
                 pso,
-                differs: (differs, data as usize, RESULTS),
+                differs: (differs, data as usize, results),
                 fetched: None,
                 taken: 0,
                 out: 0,
-                inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+                inflight: if inflight_fetch() { self.make_card_inflight(results) } else { None },
+                masked: crate::masked::Pass::make(&self.device),
             })
         }
     }
@@ -5201,6 +5211,10 @@ impl Host {
             None => 0,
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        // Title bytes that go up by their masks (`crate::shadow::merge_masked`),
+        // taken in the same hold of the queue's order as the ranges.
+        let masked = crate::shadow::card_masked(sent_as);
+        crate::masked::join(&mut dirty, &masked);
         // With fetches on a copy queue (`crate::queue2`, bit 1 of
         // `VICTORY_QUEUE2`): the send's number is signalled on the direct
         // queue behind the send, so that a fetch knows which sends the card
@@ -5234,6 +5248,8 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // The masks' upload memory, the plan's until it is done.
+        let masks = crate::masked::take(work.masked.as_mut(), &masked, self);
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
         // 2): the landing buffer they are in, in the order of `dirty`'s
         // ranges, once the direct queue has waited. `None`: straight from
@@ -5296,6 +5312,8 @@ impl Host {
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
+                    // The next mask's first word in the masks' buffer.
+                    let mut mask_at = 0usize;
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -5314,6 +5332,18 @@ impl Host {
                             ranges.iter().map(|&(a, b)| (b - a) as u64).sum(),
                             ranges.len() as u64,
                         );
+                        // The title's bytes by their masks, after the ranges;
+                        // then the card side is read by the hash.
+                        let mine = crate::masked::of(&masked, shadow);
+                        let readable = crate::masked::record(
+                            list,
+                            shadow,
+                            staging,
+                            !ranges.is_empty(),
+                            mine,
+                            (work.masked.as_ref(), masks.as_ref()),
+                            &mut mask_at,
+                        );
                         let Some(before) = before else {
                             continue;
                         };
@@ -5323,7 +5353,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if !ranges.is_empty() && !readable {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -5340,7 +5370,11 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            ranges
+                                .iter()
+                                .map(|&(a, b)| shadow.card_run(a, b))
+                                .chain(crate::masked::runs(shadow, mine))
+                                .collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -5374,6 +5408,8 @@ impl Host {
             inflight: false,
             inflight_landed: 0,
         };
+        // (Masks are sent with the relay only: `sent_as` names the plan.)
+        crate::masked::hold(work.masked.as_mut(), sent_as, masks);
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
@@ -5517,6 +5553,7 @@ impl Host {
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
+        crate::masked::done(work.masked.as_mut(), plan.sent_as);
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
         // not read yet: the area starts again only when none is out.
@@ -11332,3 +11369,6 @@ void main() {
         drop(lists);
     }
 }
+
+#[cfg(test)]
+mod masked_tests;
