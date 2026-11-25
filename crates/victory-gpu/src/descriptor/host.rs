@@ -868,6 +868,56 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Searches for free dynamic slots that may fail in a frame, over all
+/// heaps (`VICTORY_DYNAMIC_WALKS`, 8 by default; 0: no limit, as before).
+/// Past them a table that does not fit is refused without a search until
+/// the next frame.
+///
+/// A failed search walks all the slots, and a release lets the next table
+/// search again ([`HostHeap::release`] forgets the shortest run that did
+/// not fit): with the slots run out, every table of a frame searched, and
+/// a heavy place of Belobug's fork took 7 to 11 s a frame (its 788ea467;
+/// its slots are four times ours, a walk here is a quarter of its). The
+/// opening cutscene here refused up to 721 tables a frame with 6.6 ms of
+/// searching.
+fn failed_walks_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        // The tests' heaps share one frame for the whole run: no limit
+        // there unless asked for ([`walks_left`] is tested on its own).
+        let default = if cfg!(test) { 0 } else { 8 };
+        std::env::var("VICTORY_DYNAMIC_WALKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    })
+}
+
+/// The frame the failed searches are counted for, and how many failed in it.
+static FAILED_WALKS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a search for free dynamic slots may still fail this frame
+/// ([`failed_walks_most`]).
+fn failed_walks_left() -> bool {
+    walks_left(&FAILED_WALKS, crate::frame::current(), failed_walks_most())
+}
+
+/// Whether `counted` (frame, failed searches in it) leaves a failed search
+/// in frame `frame` of `most` (0: no limit); a new frame starts the count.
+fn walks_left(counted: &[std::sync::atomic::AtomicU64; 2], frame: u64, most: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if most == 0 {
+        return true;
+    }
+    if counted[0].swap(frame, Relaxed) != frame {
+        counted[1].store(0, Relaxed);
+    }
+    counted[1].load(Relaxed) < most
+}
+
+/// A search for free dynamic slots failed ([`failed_walks_most`]).
+fn failed_walk() {
+    FAILED_WALKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1086,8 +1136,13 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
+        let could = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let enough = could && failed_walks_left();
+        #[cfg(feature = "diagnostics")]
+        if could && !enough {
+            crate::copystat::add(crate::copystat::C::DynamicWalksCapped, 1);
+        }
         let n = n as usize;
         // Search from `next` on, then from the start.
         let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
@@ -1109,6 +1164,7 @@ impl HostHeap {
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                failed_walk();
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
@@ -3738,6 +3794,22 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Failed searches are counted per frame: past the most, none until
+    /// the next frame; 0 is no limit.
+    #[test]
+    fn failed_searches_are_limited_per_frame() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let counted = [AtomicU64::new(0), AtomicU64::new(0)];
+        for _ in 0..3 {
+            assert!(walks_left(&counted, 7, 3));
+            counted[1].fetch_add(1, Relaxed);
+        }
+        assert!(!walks_left(&counted, 7, 3), "three failed in frame 7");
+        assert!(walks_left(&counted, 7, 0), "no limit");
+        assert!(walks_left(&counted, 8, 3), "a new frame");
+        assert_eq!(counted[1].load(Relaxed), 0);
     }
 }
 

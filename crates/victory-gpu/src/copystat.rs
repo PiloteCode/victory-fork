@@ -166,10 +166,13 @@ pub(crate) enum C {
     /// made for a longer read (`crate::draw`, `VICTORY_TABLE_LONGEST`).
     TablesLonger,
     TablesPrefix,
+    /// Tables refused without a search: the frame had used up its failed
+    /// searches (`VICTORY_DYNAMIC_WALKS`).
+    DynamicWalksCapped,
 }
 /// One past the last counter (it was a number kept by hand: 84 for 86
 /// counters had the last two index past the array).
-const COUNTERS: usize = C::TablesPrefix as usize + 1;
+const COUNTERS: usize = C::DynamicWalksCapped as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1226,9 +1229,10 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "  descriptor tables per frame: {:.0} made at a longer read than asked (VICTORY_TABLE_LONGEST), {:.0} draws \
-         took one made for a longer read",
+         took one made for a longer read, {:.0} refused without a search (VICTORY_DYNAMIC_WALKS)",
         c[C::TablesLonger as usize],
         c[C::TablesPrefix as usize],
+        c[C::DynamicWalksCapped as usize],
     );
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
