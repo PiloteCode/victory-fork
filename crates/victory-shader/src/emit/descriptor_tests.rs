@@ -1,5 +1,6 @@
-//! End-to-end tests of descriptors that no instruction names alone: an immediate sampler each
-//! arm of a uniform branch sets its own of. Synthetic GFX10 compute programs translated ([`super::emit`]),
+//! End-to-end tests of descriptors that no instruction names alone: an image's or a buffer's
+//! descriptor the code reads only the size of, and an immediate sampler each arm of a uniform
+//! branch sets its own of. Synthetic GFX10 compute programs translated ([`super::emit`]),
 //! validated by `dxil.dll` when present, and run on the host GPU and WARP.
 
 use super::host::{Dispatch, Host, Root, View};
@@ -136,6 +137,64 @@ fn run(shader: &HostShader, s0: u32, texture: View) -> Vec<(&'static str, Vec<u3
         out.push((label, words[0].clone()));
     }
     out
+}
+
+#[test]
+fn a_texture_read_only_for_its_size_gives_the_views_size() {
+    // The console compiler's `GetDimensions` of a texture the program does not sample: width
+    // and height from the descriptor's bits, and its last level; stored to the UAV.
+    let shader = translate(&native(&[
+        0x9014_9E09, // s_lshr_b32 s20, s9, 30
+        0x8F15_820A, // s_lshl_b32 s21, s10, 2
+        0x8814_1514, // s_or_b32 s20, s20, s21
+        0x8714_FF14,
+        0x0000_3FFF, // s_and_b32 s20, s20, 0x3fff
+        0x8114_8114, // s_add_i32 s20, s20, 1
+        0x9396_FF0A,
+        0x000E_000E, // s_bfe_u32 s22, s10, 0x000e000e (bits 14-27)
+        0x8116_8116, // s_add_i32 s22, s22, 1
+        0x9397_FF0B,
+        0x0004_0010, // s_bfe_u32 s23, s11, 0x00040010 (bits 16-19)
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0x7E04_0216, // v_mov_b32 v2, s22
+        0x7E06_0217, // v_mov_b32 v3, s23
+        0xE070_0000,
+        0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+        0xE070_0004,
+        0x8004_0200, // buffer_store_dword v2, off, s[16:19], 0 offset:4
+        0xE070_0008,
+        0x8004_0300, // buffer_store_dword v3, off, s[16:19], 0 offset:8
+    ]));
+    let texels = [[0.0f32; 4]; 13 * 7];
+    let results = run(&shader, 0, View::Texture(13, 7, &texels));
+    for (label, words) in results {
+        // 13 x 7 texels, one level (the last is level 0).
+        assert_eq!(words, [13, 7, 0, 0], "{label}");
+    }
+}
+
+#[test]
+fn a_buffer_read_only_for_its_size_gives_the_views_element_count() {
+    // The title's water simulation: whether a structured buffer has any elements, from its
+    // descriptor's record count, the buffer itself not read; stored to the UAV.
+    let shader = translate(&native_of(
+        &[
+            0x7E02_020A, // v_mov_b32 v1, s10
+            0xE070_0000,
+            0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+        ],
+        4,
+        16,
+    ));
+    let data = [0u32; 4 * 9];
+    let buffer = View::Buffer {
+        data: &data,
+        stride: super::host::Stride::Structured(16),
+    };
+    for (label, words) in run(&shader, 0, buffer) {
+        // nine elements of 16 bytes
+        assert_eq!(words[0], 9, "{label}");
+    }
 }
 
 #[test]
