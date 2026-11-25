@@ -131,15 +131,17 @@ shaders and emulates the one instruction.
   tiled-heap range the builder's copy-back had just written in that frame,
   and holds the same bytes: box nodes with no children and empty, infinite
   bounds. The title shows those pages to its CPU there; the console's
-  builder would have written real nodes. Not known yet: whether the
-  builder's inputs for those structures were missing or its output is
-  wrong. The structure walk of rt-int1 found 19,638 bad nodes in 283
-  structures, most of them boxes of zeros or of the header stage's empty
-  bounds.
-- The trees are not validated yet: the walk (`VICTORY_BVH_CHECK`) reads title
-  memory, which holds only what was put back, and ran only in rt-trace8,
-  before the fixes above (602 structures, 24,273 bad nodes, most of them
-  zeros where nothing had been put back).
+  builder would have written real nodes. In rt-int1 every such range was the
+  target of the in-place rehydration of a pre-built structure (DecompressHeader,
+  LeafRehydration, Box32Rehydration and Box16Rehydration, source and
+  destination the same address), its windows numbered for title memory by
+  address in that same frame. Not known yet: whether those stages' output is
+  wrong (their wave64 forms agree with each other on synthetic inputs, not
+  yet in place on real ones) or their inputs were.
+- The trees are not valid yet. The walk (`VICTORY_BVH_CHECK`) found 19,638
+  bad nodes in 283 structures in rt-int1, most of them boxes of zeros or of
+  the header stage's empty bounds. It reads title memory, which holds only
+  what was put back: a node in a window no dispatch named reads as it was.
 - Copy numbers are never given back: the builder named some 1,450 windows in
   six minutes (rt-dry1), and 2,047 numbers run out in a longer session.
 - One shadow-mask trace program (FullAdaptive) stops at a lane mask read as
