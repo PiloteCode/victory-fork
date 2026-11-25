@@ -125,13 +125,24 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
+///
+/// Read by every lookup and by [`sync_heaps`], written only when a heap is
+/// made or dropped. It was a mutex, and [`sync_heaps`] holds it for its
+/// whole pass (15 ms a frame on the submitting thread): the profile of run
+/// 225 has the title's six recording threads waiting 48.5 ms a frame in
+/// [`shader_slot`] for it, each lookup itself a few nanoseconds. Readers no
+/// longer wait for each other. Nothing a holder calls takes it again.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// One [`sync_heaps`] at a time, as when the list above was a mutex.
+#[cfg(windows)]
+static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -181,7 +192,8 @@ pub(crate) fn sync_heaps() {
     // and looking at their slots (mirrors included).
     let mut parts = [0u64; 3];
     let mut page_bytes: Vec<u8> = Vec::new();
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -210,27 +222,20 @@ pub(crate) fn sync_heaps() {
                 let read = crate::host::read_into(from as *const u8, &mut page_bytes);
                 let looking = std::time::Instant::now();
                 parts[1] += (looking - reading).as_micros() as u64;
-                if read && sync_batch() {
-                    pages += 1;
-                    // The records that lie whole in the range, in one look
-                    // (`HostHeap::mirror_copied_run`): as below, a record
-                    // that straddles the range's ends is left to the range
-                    // that holds its first byte.
-                    let (first, end) = whole_slots(from, to, start as usize, step, mirrored_count);
-                    if first < end {
-                        let at = (start + first * step) as usize - from;
-                        let bytes = ((end - first) * step) as usize;
-                        if let Some(records) = page_bytes.get(at..at + bytes) {
-                            looked += end - first;
-                            mirrored += host.mirror_copied_run(first as u32, records, step as usize, |index| {
-                                start + u64::from(index) * step
-                            });
-                        }
-                    }
-                    parts[2] += looking.elapsed().as_micros() as u64;
-                } else if read {
+                if read {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    // The page's records in one go, under one lock
+                    // (`HostHeap::mirror_copied_page`); one by one below
+                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
+                    let slots = if page_at_once() {
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        looked += seen;
+                        mirrored += made;
+                        0..0
+                    } else {
+                        slots
+                    };
                     for index in slots {
                         let handle = start + index * step;
                         // A record that straddles the range's ends is left
@@ -299,25 +304,14 @@ pub(crate) fn sync_line(frames: f64) {
     );
 }
 
-/// Whether [`sync_heaps`] looks at a changed page's records under one
-/// taking of the fingerprints' lock (`HostHeap::mirror_copied_run`;
-/// `VICTORY_HEAP_SYNC_BATCH=1`, off by default) rather than slot by slot.
+/// Whether [`sync_heaps`] hands a changed page's records to the host heap
+/// in one go (`host::HostHeap::mirror_copied_page`). On by default: the
+/// same records are mirrored either way. `VICTORY_HEAP_SYNC_PAGE=0`: one
+/// by one, as before.
 #[cfg(windows)]
-fn sync_batch() -> bool {
+fn page_at_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BATCH").is_some_and(|v| v == "1"))
-}
-
-/// The title descriptor slots whose records lie whole in a changed byte
-/// range `[range_from, range_end)` and that have host counterparts, as
-/// (first, end): those [`changed_slots`] gives that the slot by slot look
-/// of [`sync_heaps`] takes (a record that straddles an end of the range is
-/// left to the range that holds its first byte).
-#[cfg(windows)]
-fn whole_slots(range_from: usize, range_end: usize, heap_start: usize, step: u64, mirrored_count: u32) -> (u64, u64) {
-    let first = ((range_from - heap_start) as u64).div_ceil(step);
-    let end = (((range_end - heap_start) as u64) / step).min(u64::from(mirrored_count));
-    (first, end.max(first))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGE").is_none_or(|v| v != "0"))
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
@@ -341,7 +335,7 @@ fn changed_slots(
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -354,7 +348,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -1160,7 +1154,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -1241,35 +1235,6 @@ mod tests {
         );
     }
 
-    /// The batched look of the heap sync takes exactly the slots the slot
-    /// by slot look takes: those of `changed_slots` whose record lies whole
-    /// in the range, the cap included, for ranges that start and end inside
-    /// records, on their edges, and past the cap.
-    #[cfg(windows)]
-    #[test]
-    fn batched_heap_sync_takes_the_slots_the_slot_by_slot_look_takes() {
-        let start = 0x10000usize;
-        for step in [16u64, 32] {
-            for capped in [0u32, 1, 5, 40, 1000] {
-                for from in (0..48 * step as usize).step_by(3) {
-                    for len in [1usize, 2, 15, 16, 17, 31, 32, 33, 64, 100, 1000] {
-                        let (range_from, range_end) = (start + from, start + from + len);
-                        // What the slot by slot look of `sync_heaps` takes.
-                        let wanted: Vec<u64> = changed_slots(range_from, range_end, start, step, capped)
-                            .filter(|&index| {
-                                let handle = start as u64 + index * step;
-                                handle >= range_from as u64 && handle + step <= range_end as u64
-                            })
-                            .collect();
-                        let (first, end) = whole_slots(range_from, range_end, start, step, capped);
-                        let got: Vec<u64> = (first..end).collect();
-                        assert_eq!(got, wanted, "step {step} cap {capped} range {from}+{len}");
-                    }
-                }
-            }
-        }
-    }
-
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
@@ -1348,11 +1313,12 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
-    /// The heap sync's look at a page's records in one run
-    /// (`HostHeap::mirror_copied_run`) mirrors the slots the look slot by
+    /// The heap sync's look at a page's records in one go
+    /// (`HostHeap::mirror_copied_page`) mirrors the slots the look slot by
     /// slot (`HostHeap::mirror_copied`) mirrors: the new records, not a
     /// slot never looked at that holds nothing, and a record seen before
-    /// only once it changes.
+    /// only once it changes; a record that straddles the page's start or
+    /// end is not looked at.
     #[cfg(windows)]
     #[test]
     fn records_looked_at_in_one_run_are_mirrored_as_slot_by_slot() {
@@ -1376,7 +1342,13 @@ mod tests {
             let each: Vec<bool> = (0..8u32)
                 .map(|i| one.mirror_copied(i, base + u64::from(i) * STEP as u64, &records[i as usize * STEP..][..STEP]))
                 .collect();
-            let n = run.mirror_copied_run(0, &records, STEP, |i| base + u64::from(i) * STEP as u64);
+            let (looked, n) = run.mirror_copied_page(0..8, (base, STEP as u64), base as usize, &records);
+            assert_eq!(looked, 8);
+            // A page that starts inside slot 0's record and ends inside
+            // slot 7's: those two are left to the ranges that hold their
+            // first bytes, the six between them are looked at.
+            let (inner, _) = run.mirror_copied_page(0..8, (base, STEP as u64), base as usize + 4, &records[4..8 * STEP - 4]);
+            assert_eq!(inner, 6);
             (each, n)
         };
         let (each, n) = look(&mut memory);

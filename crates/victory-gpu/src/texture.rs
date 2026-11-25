@@ -348,7 +348,11 @@ pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { st
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
     let out = f();
-    REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let us = started.elapsed().as_micros() as u64;
+    REFRESH_WAITS[slot].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+    if slot == 2 {
+        crate::framelog::add(crate::framelog::T::RefreshStillUs, us);
+    }
     out
 }
 
@@ -510,14 +514,16 @@ pub(crate) fn let_go() -> [u64; 5] {
     [
         LET_GO[0].load(Relaxed),
         LET_GO[1].load(Relaxed),
-        STAGING_REUSED.load(Relaxed),
+        SPARE_STATS[0].load(Relaxed),
         spare,
         SPARE_BYTES.load(Relaxed),
     ]
 }
 
-/// Staging that took a spare upload buffer ([`take_spare`]).
-static STAGING_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Staging that took a spare upload buffer ([`take_spare`]), and staging
+/// that made a new one, since the start (the memory line, and the frame
+/// log's samples, `crate::framelog`).
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
@@ -764,6 +770,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    crate::framelog::add(crate::framelog::T::Uploads, 1);
     const COPY_DEST: u32 = 0x400;
     // In the list's prelude (`prelude_uploads`): the list goes on with the
     // texture as its prelude leaves it, in the state its next use asks.
@@ -1057,7 +1064,9 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
-        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        let us = whole.elapsed().as_micros() as u64;
+        REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        crate::framelog::add(crate::framelog::T::RefreshUs, us);
         read
     }
 
@@ -1551,10 +1560,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             // (a texture all unmapped yet is uploaded as it is).
             // SAFETY: the buffer's mapping, `class` >= `total` bytes.
             unsafe { std::ptr::write_bytes(data, 0, total as usize) };
-            STAGING_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (buffer, data)
         }
-        None => host.upload_buffer(class)?,
+        None => {
+            SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            host.upload_buffer(class)?
+        }
     };
     crate::host::name(&buffer, || {
         format!(
