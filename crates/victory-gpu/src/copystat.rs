@@ -1280,7 +1280,10 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    // `VICTORY_GPU_TIMING_LINES=<n>`: the heaviest n kinds (every kind with a large n: the
+    // card's time of each translated program, the light ones too).
+    let lines = std::env::var("VICTORY_GPU_TIMING_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    for (what, (n, us, longest)) in by.into_iter().take(lines) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
