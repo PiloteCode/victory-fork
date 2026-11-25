@@ -157,8 +157,10 @@ shaders and emulates the one instruction.
    memory they read, every range put back into title memory, page mappings
    (with their ranges) and copies; `VICTORY_BVH_DRY=1` binds the builder's
    dispatches without running them; `VICTORY_BVH_CHECK=<hash of the header
-   stage>` walks the structures it initialises a frame later, in title memory,
-   and reports bad nodes; `VICTORY_CRASH_MEMORY=1` adds the title memory
+   stage>[,<hash of the header decompression>]` walks the structures they
+   start a frame later, in title memory, and reports bad nodes (`V` lines for
+   those built on the card, `V rebuilt` for those rebuilt in place from what
+   was streamed); `VICTORY_CRASH_MEMORY=1` adds the title memory
    around the registers (and one pointer further) to a crash report. With the
    user's own `XboxBvhBuilder.dll`, `VICTORY_TEST_BVH_DLL` runs the builder's
    wave64 programs in their picked and paired forms on the card and compares
