@@ -10343,7 +10343,11 @@ void main() {
                 relay(),
                 second.held[0].load(Ordering::Relaxed)
             );
-            assert_eq!(down > 0, second.fetches(), "fetches through the copy queue");
+            // (With the fetch inside flights the pieces come down in the
+            // flights themselves, and the copy queue fetches none.)
+            if !inflight_fetch() {
+                assert_eq!(down > 0, second.fetches(), "fetches through the copy queue");
+            }
             assert_eq!(up + no_room > 0, second.uploads(), "sends through the copy queue");
             assert_eq!(up, second.held[0].load(Ordering::Relaxed), "the direct queue waits for every send");
         } else {
@@ -10406,6 +10410,14 @@ void main() {
         }
         if !relay() || !crate::queue2::second().is_some_and(|s| s.fetches()) {
             eprintln!("queue2_tests: skipped, fetches do not go to a copy queue beside the relay (VICTORY_RELAY=1 VICTORY_QUEUE2=1)");
+            return;
+        }
+        // With the fetch inside flights A's pieces come down in A itself,
+        // not beside B: the hole cannot show (wave 7 failed here as well).
+        if inflight_fetch() {
+            eprintln!(
+                "queue2_tests: skipped, pieces come down inside their flights (VICTORY_CARD_FETCH_INFLIGHT=1 or VICTORY_READBACK_DIRECT=1)"
+            );
             return;
         }
         const PIECE: usize = 64 << 10;
