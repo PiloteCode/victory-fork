@@ -6907,6 +6907,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                crate::loop_notes::log();
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
