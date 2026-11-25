@@ -834,6 +834,32 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// `VICTORY_DSTORAGE_ZERO_FAILED=1` (off by default): a request whose data
+/// does not decode (damaged or missing source bytes) leaves its destination
+/// zeroed instead of holding a partial decode over stale bytes.
+///
+/// shortcut: for game copies with damaged archives only. The title never
+/// reads a request's result, so it goes on to fix up the resource it asked
+/// for; over stale bytes that finds pointers outside the resource and the
+/// title stops on its own breakpoint. Zeros read as null pointers. The
+/// resource is still missing; this only changes how the title meets it.
+fn zero_failed_destination(request: &Request, size: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_ZERO_FAILED").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let zeroed = into_destination(request, size, |out| {
+        out.fill(0);
+        Ok(out.len())
+    });
+    tracing::warn!(
+        offset = request.offset,
+        destination_size = size,
+        zeroed = zeroed.is_ok(),
+        "dstorage: a request that did not decode left its destination zeroed (VICTORY_DSTORAGE_ZERO_FAILED)"
+    );
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -889,7 +915,9 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+        let n = inflate(&source, &mut packed)
+            .map_err(|hr| fail(hr, "zlib"))
+            .inspect_err(|_| zero_failed_destination(request, size))?;
         packed.truncate(n);
         Cow::Owned(packed)
     } else {
@@ -900,7 +928,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    })
+    .inspect_err(|_| zero_failed_destination(request, size))?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
