@@ -549,16 +549,14 @@ fn split_choices(
         }
         out
     }
-    let mut chosen = joins(res);
-    let mut form = ir::split_joins(p, &chosen)?;
+    let mut form = ir::split_joins(p, &joins(res))?;
     for _ in 0..4 {
         let st = structure::structure(&form).ok()?;
         let io = io::raise(&form, native).ok()?;
         let res = resource::track(&form, &native.layout, native.stage, Some(&st)).ok()?;
         match emit_program(c, native, &form, &st, &io, &res) {
             Err(ShaderError::Unsupported { what, .. }) if what == lower::CHOSEN => {
-                chosen = joins(&res);
-                form = ir::split_joins(&form, &chosen)?;
+                form = ir::split_joins(&form, &joins(&res))?;
             }
             Ok(done) => return Some(Ok(done)),
             Err(_) => return None,

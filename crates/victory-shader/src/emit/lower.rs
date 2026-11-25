@@ -2070,9 +2070,14 @@ impl<'a> Lower<'a> {
             let name = self.x.p.blocks[site.0].insts[site.1].name();
             a.param == MEMORY && (name.contains("store") || name.contains("atomic"))
         };
-        if self.s.ordered && let Some(&(site, _)) = self.x.res.scalar.iter().find(by_address) {
+        if self.s.ordered
+            && let Some(&(site, _)) = self.x.res.scalar.iter().find(by_address)
+        {
             let offset = self.x.p.blocks[site.0].insts[site.1].machine.offset;
-            return Err(unsupported(offset, "a write by address in a pixel program ordered by primitive"));
+            return Err(unsupported(
+                offset,
+                "a write by address in a pixel program ordered by primitive",
+            ));
         }
         self.find_sections();
         self.inputs()?;
@@ -5584,7 +5589,8 @@ impl<'a> Lower<'a> {
                         || un.starts_with("buffer_store_format")
                     {
                         (10 | u, 0x409)
-                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
+                    {
                         (12 | u, stride)
                     } else {
                         (11 | u, 0)
