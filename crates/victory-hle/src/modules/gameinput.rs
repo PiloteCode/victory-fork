@@ -1653,7 +1653,7 @@ mod tests {
             Value::Pad(p) => *p,
             Value::Keys(_) => unreachable!(),
         };
-        host.lock().unwrap().keys = vec![key(b'D')];
+        host.lock().unwrap().keys = vec![key_at(b'D', 0x20)];
         hub.poll();
         assert_eq!(pad(hub).left_x, 1.0);
         // A pad is switched on, in any slot: its input arrives, beside the
