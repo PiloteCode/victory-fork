@@ -525,6 +525,78 @@ pub(crate) struct Spans {
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    /// Per span, by its start: when the title last wrote a view of it
+    /// ([`WRITES`]; for a span only draws made slots of, when the first
+    /// was made). Of two spans that overlap, the one written later is the
+    /// one the title put there knowing of the other ([`Own::Newer`]).
+    written: std::collections::HashMap<u64, u64>,
+    /// Which spans end a texture's own bytes.
+    own: Own,
+    /// The longest span noted so far: how far back a span that reaches an
+    /// address can start ([`Spans::slots_holding`]).
+    longest: u64,
+}
+
+/// Counts the placed texture views noted, over all heaps: the order in
+/// which the title wrote them ([`Spans::written`]).
+static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Which textures placed inside a texture's span end the bytes that are its
+/// own, for the levels it holds ([`own_end`], levels on demand in
+/// `crate::texture`) and for a write behind the guards' back
+/// ([`Spans::slots_holding`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Own {
+    /// The next one whose view the title wrote after this texture's. A view
+    /// from before is as likely one the title never cleared (a console
+    /// title need not, when it streams a texture out), and this texture's
+    /// large levels are then its own: cut at such a view, they were taken
+    /// for not there, and a write of them named the old view alone (texel
+    /// noise on a character's skin, in our tree's runs).
+    #[default]
+    Newer,
+    /// The next one, whenever written (`VICTORY_OWN_BYTES=next`, as before
+    /// this rule).
+    Next,
+    /// None for the levels held (`VICTORY_OWN_BYTES=0`); a write as under
+    /// [`Own::Next`].
+    Whole,
+}
+
+/// [`Own`] as `VICTORY_OWN_BYTES` says.
+fn own_rule() -> Own {
+    static RULE: std::sync::OnceLock<Own> = std::sync::OnceLock::new();
+    *RULE.get_or_init(|| match std::env::var("VICTORY_OWN_BYTES").as_deref() {
+        Ok("0") => Own::Whole,
+        Ok("next") => Own::Next,
+        _ => Own::Newer,
+    })
+}
+
+/// Where the bytes of the placed texture at `start` (`end` at full size)
+/// that are its own end: the start of the next texture placed inside it
+/// past its first [`HEAD`] bytes, of those whose view the title wrote after
+/// this one's ([`Own`]); `None` if no such texture does. As [`next_start`]
+/// under `VICTORY_OWN_BYTES=next`, and always `None` under `=0`.
+pub(crate) fn own_end(start: u64, end: u64) -> Option<u64> {
+    match own_rule() {
+        Own::Whole => None,
+        Own::Next => next_start(start, end),
+        Own::Newer => {
+            let spans: Vec<_> = {
+                let heaps = PLACED_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+                heaps.iter().filter_map(std::sync::Weak::upgrade).collect()
+            };
+            fn lock(spans: &Mutex<Spans>) -> std::sync::MutexGuard<'_, Spans> {
+                spans.lock().unwrap_or_else(|e| e.into_inner())
+            }
+            match spans.iter().filter_map(|spans| lock(spans).written_at(start)).max() {
+                Some(written) => spans.iter().filter_map(|spans| lock(spans).next_newer(start, end, written)).min(),
+                // In no heap's spans: nothing says which is the newer.
+                None => spans.iter().filter_map(|spans| lock(spans).next_start(start, end)).min(),
+            }
+        }
+    }
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -587,6 +659,9 @@ impl Spans {
     fn note(&mut self, index: u32, start: u64, end: u64, newer: bool) -> Vec<u32> {
         let same = |span: Option<&(u64, std::collections::BTreeSet<u32>)>| span.is_some_and(|s| s.0 == end);
         if self.by_slot.get(&index) == Some(&start) && same(self.by_start.get(&start)) {
+            if newer {
+                self.wrote(start);
+            }
             return Vec::new();
         }
         self.forget(index);
@@ -627,6 +702,7 @@ impl Spans {
                         "a placed texture view makes older views of other memory stale"
                     );
                 }
+                self.written.remove(&at);
                 for slot in slots {
                     self.by_slot.remove(&slot);
                     stale.push(slot);
@@ -635,7 +711,32 @@ impl Spans {
         }
         self.by_start.entry(start).or_insert_with(|| (end, Default::default())).1.insert(index);
         self.by_slot.insert(index, start);
+        self.longest = self.longest.max(end - start);
+        if newer || !self.written.contains_key(&start) {
+            self.wrote(start);
+        }
         stale
+    }
+
+    /// The title wrote a view of the span at `start` now.
+    fn wrote(&mut self, start: u64) {
+        let now = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.written.insert(start, now);
+    }
+
+    /// When the title last wrote a view of the span at `start`
+    /// ([`Spans::written`]). `None`: no slot holds one.
+    fn written_at(&self, start: u64) -> Option<u64> {
+        self.written.get(&start).copied()
+    }
+
+    /// As [`Spans::next_start`], of the spans written after `written`.
+    fn next_newer(&self, start: u64, end: u64, written: u64) -> Option<u64> {
+        let from = start.saturating_add(HEAD);
+        if from >= end {
+            return None;
+        }
+        self.by_start.range(from..end).map(|(at, _)| *at).find(|at| self.written_at(*at).is_some_and(|w| w > written))
     }
 
     /// The view in slot `index` starts at level `first` of its texture; the
@@ -675,6 +776,7 @@ impl Spans {
             span.1.remove(&index);
             if span.1.is_empty() {
                 self.by_start.remove(&start);
+                self.written.remove(&start);
             }
         }
     }
@@ -694,15 +796,37 @@ impl Spans {
     /// `start` itself the one before it is left out (it ends where that
     /// one starts, and a request that fills a texture begins at its first
     /// byte: `slots_in` would name its neighbour with every such write).
+    /// A write that begins at no texture's start fills the larger levels
+    /// of one that starts before it: the nearest such, and under
+    /// [`Own::Newer`] also each one before whose view the title wrote
+    /// after those of every texture between it and the write. Those
+    /// between are then views from before it (a console title need not
+    /// clear the view of a texture it streamed out), and with the nearest
+    /// alone the request for a texture's large levels named only such a
+    /// view: the texture kept the bytes its upload had found there.
     fn slots_holding(&self, start: u64, end: u64) -> Vec<u32> {
+        /// Spans looked at before the write's start.
+        const BACK: usize = 256;
         if end <= start {
             return Vec::new();
         }
-        let before = if self.by_start.contains_key(&start) {
-            None
-        } else {
-            self.by_start.range(..start).next_back().filter(|(_, span)| span.0 > start).map(|(_, span)| span)
-        };
+        let mut before = Vec::new();
+        if !self.by_start.contains_key(&start) {
+            // The latest view written among the spans passed so far.
+            let mut latest: Option<u64> = None;
+            let from = if self.own == Own::Newer { start.saturating_sub(self.longest) } else { 0 };
+            for (at, span) in self.by_start.range(from..start).rev().take(BACK) {
+                let written = self.written_at(*at).unwrap_or(0);
+                if span.0 > start && latest.is_none_or(|latest| written > latest) {
+                    before.push(span);
+                }
+                if self.own != Own::Newer {
+                    break;
+                }
+                latest = Some(latest.map_or(written, |latest| latest.max(written)));
+            }
+            before.reverse();
+        }
         before
             .into_iter()
             .chain(self.by_start.range(start..end).map(|(_, span)| span))
@@ -2501,6 +2625,7 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    placed.own = own_rule();
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
                     // (Under the lock of `placed`: a later write of one of
@@ -4748,6 +4873,60 @@ mod tests {
         // The view from level 1 goes: the texture is viewed from level 3.
         spans.forget(2);
         assert_eq!(spans.first_viewed(0x1_0000), Some(3));
+    }
+
+    /// Views the title never cleared lie where a texture written after
+    /// them has its large levels: they do not end that texture's own bytes
+    /// (its large levels count as held), and a write of those levels, which
+    /// begins past the old views' starts, names the texture. A view written
+    /// after the texture's ends it, as before; so does any under
+    /// `Own::Next`. (Our commit 9cd33c80.)
+    #[test]
+    fn a_view_from_before_does_not_end_a_texture_written_after_it() {
+        let at = 0x000b_5bc3_0000u64;
+        let len = 700_416u64;
+        let own = |spans: &Spans, start: u64| {
+            let written = spans.written_at(start).unwrap();
+            spans.next_newer(start, start + len, written).map_or(len, |next| next - start)
+        };
+        let mut spans = Spans::default();
+        // Two old tenants' views, 64 and 16 KiB into where the texture
+        // then comes.
+        spans.note(3, at + 0x1_0000, at + 0x1_0000 + len, true);
+        spans.note(2, at + 0x4000, at + 0x4000 + len, true);
+        spans.note(1, at, at + len, true);
+        assert_eq!(own(&spans, at), len);
+        assert_eq!(spans.next_start(at, at + len), Some(at + 0x4000));
+        // Its level 0 arrives, past the old views' starts: it is named
+        // (with them: each was written after the ones past it).
+        assert_eq!(spans.slots_holding(at + 0x2_0000, at + 0x8_0000), [1, 2, 3]);
+        // A draw that makes a slot from what it held says nothing new.
+        spans.note(2, at + 0x4000, at + 0x4000 + len, false);
+        assert_eq!(own(&spans, at), len);
+        // The title writes the neighbour's view anew: it is there now, and
+        // the texture ends at it.
+        spans.note(2, at + 0x4000, at + 0x4000 + len, true);
+        assert_eq!(own(&spans, at), 0x4000);
+        assert_eq!(spans.slots_holding(at + 0x2_0000, at + 0x8_0000), [2, 3]);
+        assert_eq!(spans.slots_holding(at + 0x8000, at + 0x9000), [2]);
+        // Written again itself, it is the newer one once more.
+        spans.note(1, at, at + len, true);
+        assert_eq!(own(&spans, at), len);
+        assert_eq!(spans.slots_holding(at + 0x8000, at + 0x9000), [1, 2]);
+        // As before this rule: the nearest alone.
+        spans.own = Own::Next;
+        assert_eq!(spans.slots_holding(at + 0x8000, at + 0x9000), [2]);
+        assert_eq!(spans.slots_holding(at + 0x2_0000, at + 0x8_0000), [3]);
+        // A slot that goes takes its span's record with it.
+        spans.forget(1);
+        assert_eq!(spans.written_at(at), None);
+        // A texture that ends before the write is not named, and does not
+        // hide one before it, written after it, that reaches the write.
+        let mut spans = Spans::default();
+        spans.note(2, at + 0x1000, at + 0x2000, true);
+        spans.note(1, at, at + 0x3000, true);
+        assert_eq!(spans.slots_holding(at + 0x2800, at + 0x2900), [1]);
+        assert_eq!(spans.slots_holding(at + 0x3000, at + 0x3100), [] as [u32; 0]);
     }
 
     /// Views of one placed texture are told from views of others by the

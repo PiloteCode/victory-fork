@@ -1079,11 +1079,14 @@ impl Staging {
     /// Then where the next texture placed in this one's span starts, in
     /// bytes from this one's start (`u64::MAX`: none does): for a texture
     /// viewed from level 0 although a neighbour sits where its large
-    /// levels would be.
+    /// levels would be. Only a neighbour whose view the title wrote after
+    /// this texture's (`crate::descriptor::host::own_end`): one from before
+    /// may be a view the title never cleared, and the large levels are this
+    /// texture's then.
     fn judgement(&self) -> [u64; 2] {
         let start = self.memory as u64;
         let first = crate::descriptor::host::first_viewed(start).map_or(0, u64::from);
-        let limit = crate::descriptor::host::next_start(start, start.saturating_add(self.layout.size))
+        let limit = crate::descriptor::host::own_end(start, start.saturating_add(self.layout.size))
             .map_or(u64::MAX, |at| at - start);
         [first, limit]
     }
