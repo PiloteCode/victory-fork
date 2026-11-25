@@ -889,15 +889,19 @@ pub(crate) fn land_probes(finished: u64) {
 }
 
 /// How the frames before a black one went to black, from their levels
-/// (oldest first, the black one last): "fade" when each of the last four
-/// before it is darker than the one before and the last is below a quarter
-/// of the first (a fade of the title's, over frames), "drop" when it fell
-/// at once from a lit frame, "dark" when the frames before were already dim.
+/// (oldest first, without the black one): "fade" when each of the last
+/// three is darker than the one before and the last is below half the
+/// brightest of the last six (a fade of the title's over frames: at about
+/// five frames a second the cutscene's fades take 4 to 6 frames, 255 down
+/// to 79 then black in one run), "drop" when it fell at once from a lit
+/// frame, "dark" when the frames before were already dim.
 pub(crate) fn how_black(before: &[u8]) -> &'static str {
-    let tail = &before[before.len().saturating_sub(4)..];
-    let fading = tail.len() >= 3
-        && tail.windows(2).all(|w| w[1] < w[0])
-        && u32::from(*tail.last().unwrap_or(&0)) * 4 < u32::from(tail[0]);
+    let tail = &before[before.len().saturating_sub(6)..];
+    let last3 = &tail[tail.len().saturating_sub(3)..];
+    let brightest = tail.iter().copied().max().unwrap_or(0);
+    let fading = last3.len() == 3
+        && last3.windows(2).all(|w| w[1] < w[0])
+        && u32::from(*last3.last().unwrap_or(&0)) * 2 < u32::from(brightest);
     match before.last() {
         _ if fading => "fade",
         Some(&last) if last >= 64 => "drop",
@@ -958,6 +962,11 @@ mod tests {
     #[test]
     fn black_frames_are_told_apart_by_the_frames_before() {
         assert_eq!(super::how_black(&[200, 180, 120, 60, 20]), "fade");
+        // The opening cutscene's fade of one run (frame 2156): 255, then
+        // five frames down to 79, then black.
+        assert_eq!(super::how_black(&[229, 254, 255, 181, 159, 157, 91, 79]), "fade");
+        // From the menu straight to black (frame 1674 of that run).
+        assert_eq!(super::how_black(&[96, 105, 113, 113, 121, 129]), "drop");
         assert_eq!(super::how_black(&[200, 210, 205, 199]), "drop");
         assert_eq!(super::how_black(&[30, 31, 30, 29]), "dark");
         // Darker each frame but not by much: not a fade.

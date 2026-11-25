@@ -720,6 +720,9 @@ pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// Buffer views of no elements made null since the start (not refusals: the
 /// console's descriptor of no records reads zeros too).
 pub(crate) static EMPTY_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Raw buffer views made on a copy of their own bytes because they do not
+/// start on 16 bytes of their buffer's copy (`own_bytes`), since the start.
+pub(crate) static RAW_OWN_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
@@ -2319,6 +2322,9 @@ fn buffer_srv(
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
+                if raw && offset.is_multiple_of(4) {
+                    RAW_OWN_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 desc.Anonymous.Buffer.FirstElement = 0;
                 (own, 0)
             }
@@ -2420,6 +2426,9 @@ fn buffer_uav(
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
+                if raw && shadow.offset(address).is_multiple_of(4) {
+                    RAW_OWN_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 desc.Anonymous.Buffer.FirstElement = 0;
                 (own, true)
             }
@@ -2804,6 +2813,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
+                // A view of no memory (address 0) is the console's null
+                // view, which the host's null view matches: every one seen
+                // in the opening cutscene was one (2026-11-25).
+                if desc[10] == 0 && desc[11] == 0 {
+                    return None;
+                }
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
@@ -2891,6 +2906,11 @@ fn unmirrored(view: &View, read: bool) {
         return;
     };
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    // A view of no memory is the console's null view: it reads zeros and
+    // drops writes, as the host's null view does. Nothing is lost there.
+    if address == 0 {
+        return;
+    }
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let (addresses, counts) = seen.get_or_insert_with(Default::default);
     let shape = || {
