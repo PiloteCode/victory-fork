@@ -427,10 +427,20 @@ static SPARE: Mutex<std::collections::VecDeque<Spare>> = Mutex::new(std::collect
 static SPARE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The bytes of spare upload buffers kept at most: `VICTORY_STAGING_SPARE_MB`
-/// (1024 by default; 0 makes a buffer for each staging, as before).
+/// (1024 by default; 0 makes a buffer for each staging, as before, and so
+/// does upstream's `VICTORY_STAGING_POOL=0`).
+///
+/// Upstream (f85101b) pooled these buffers too, by powers of two of up to
+/// 8 MiB and 256 MB in all; the merge kept this pool alone: classes of an
+/// eighth of a power of two waste less of each buffer, textures over 8 MiB
+/// are pooled too, and it is the one measured here (the opening cutscenes'
+/// heap pass 187 -> 65 ms a frame).
 fn spare_limit() -> u64 {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
+        if std::env::var_os("VICTORY_STAGING_POOL").is_some_and(|v| v == "0") {
+            return 0;
+        }
         std::env::var("VICTORY_STAGING_SPARE_MB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
