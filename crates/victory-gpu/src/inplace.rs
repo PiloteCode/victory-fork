@@ -301,6 +301,14 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         for k in 0..len.div_ceil(K64) {
             v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
         }
+        // The GPU upload heap tally (`crate::uheap`): which of these pages
+        // show at another address too.
+        if crate::uheap::tally_on() {
+            let aliased = crate::uheap::aliased_pages(
+                (0..len.div_ceil(K64)).filter_map(|k| v.pages.get(&(section, offset + (k * K64) as u64))),
+            );
+            crate::uheap::view_mapped(at, len, aliased);
+        }
     }
     // This view is writable from now on: a guard over the same bytes at
     // another view must look at them again, and the pages are noted written
@@ -635,6 +643,17 @@ impl Rig {
             let event = CreateEventW(None, false, false, None)?;
             Ok(Rig { device: device.clone(), queue, allocator, list, fence, done: 0, event })
         }
+    }
+
+    /// The rig's own queue (its timestamp frequency, for `crate::uheap`'s
+    /// probe).
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
+    /// The device the rig runs on.
+    pub(crate) fn device(&self) -> &ID3D12Device {
+        &self.device
     }
 
     /// Records with `record`, runs it and waits (ten seconds at most).
@@ -1250,7 +1269,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over

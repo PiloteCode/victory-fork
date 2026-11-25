@@ -858,6 +858,10 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // GPU upload heaps: whether the device has them, said; with
+        // `VICTORY_GPU_UPLOAD_HEAP` whether scratch memory and texture
+        // staging go there, and the probe (`crate::uheap`).
+        crate::uheap::device_ready(&device);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1670,7 +1674,9 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    // Written by the processor only (fills, rectangles' vertices): in the
+    // card's memory with `VICTORY_GPU_UPLOAD_HEAP=1` (`crate::uheap`).
+    let (buffer, data) = host.written_buffer(size)?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -7563,7 +7569,7 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = host.written_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -7907,6 +7913,7 @@ impl HostList {
                     if crate::bvhtrace::armed() {
                         crate::bvhtrace::line(|| format!("C {dst:#x}+{len:#x} from {src:#x}"));
                     }
+                    crate::uheap::layer_read(src, len, crate::uheap::Read::Copy);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7919,6 +7926,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
+                    crate::uheap::layer_read(src, len, crate::uheap::Read::Fill);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -8149,6 +8157,7 @@ impl Batch {
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
+        crate::uheap::refreshed(from, to - from, copied, us);
         preparing(0, us);
         preparing(1, copied as u64);
     }
@@ -8588,6 +8597,27 @@ impl Host {
             }
         }
     }
+
+    /// A mapped buffer of `size` bytes that the processor only writes and
+    /// the card only reads (lists' scratch memory, texture staging): with
+    /// `VICTORY_GPU_UPLOAD_HEAP=1` on a device that has them, in a GPU
+    /// upload heap (the card's own memory, which the processor writes
+    /// through the BAR; it starts in the common state, from which the
+    /// card's reads promote it), else in upload memory as before. Never
+    /// read it on the processor: that crosses the bus, uncached.
+    pub(crate) fn written_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if crate::uheap::buffers() {
+            match crate::uheap::make(&self.device, size) {
+                Ok(made) => {
+                    crate::census::made(9, size);
+                    crate::uheap::made(size);
+                    return Some(made);
+                }
+                Err(e) => crate::uheap::refused(size, &e),
+            }
+        }
+        self.upload_buffer(size)
+    }
 }
 
 /// The swap chain formats a presented texture can be copied into: its own
@@ -8721,6 +8751,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::fence::event_waits_line(frames);
         crate::plaincopy::line(frames);
+        crate::uheap::line(frames);
         if let Some(host) = host() {
             host.drain_messages();
         }

@@ -1243,6 +1243,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    crate::uheap::page_written(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1467,6 +1468,7 @@ pub fn title_memory_reading_range_now(at: usize, len: usize) -> Option<Reading> 
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::uheap::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
