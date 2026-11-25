@@ -322,6 +322,43 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let r = emit_any(c, native, p, st, io, res);
+    if r.is_ok() {
+        return r;
+    }
+    // A whole-wave section that a jump splits (two reductions a branch chooses between that
+    // share their end): once more with each such section in one block
+    // ([`ir::whole_sections`]), where the simulation follows it. The original's error if that
+    // does not translate either.
+    let mut q = None;
+    for _ in 0..4 {
+        match ir::whole_sections(q.as_ref().unwrap_or(p)) {
+            Some(next) => q = Some(next),
+            None => break,
+        }
+    }
+    let Some(q) = q else { return r };
+    let again = (|| {
+        let st = structure::structure(&q)?;
+        let io = io::raise(&q, native)?;
+        let res = resource::track(&q, &native.layout, native.stage, Some(&st))?;
+        emit_any(c, native, &q, &st, &io, &res)
+    })();
+    match again {
+        Ok(shader) => Ok(shader),
+        Err(_) => r,
+    }
+}
+
+/// [`emit`] of `p` as it is.
+fn emit_any(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     let r = emit_forms(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that no form above gives
     // the host (it still asks for 64-lane waves, or does not translate): once more in the

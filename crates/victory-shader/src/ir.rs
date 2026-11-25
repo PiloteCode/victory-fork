@@ -725,6 +725,113 @@ pub(crate) fn split_joins(p: &Program, joins: &[usize]) -> Option<Program> {
     Some(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// The program with each whole-wave section (`s_or_saveexec -1` up to the restore of the
+/// saved mask, `emit::wave`) that a jump splits in one block: the block the section starts
+/// in, when it jumps to the block that restores the mask, takes that block's code and exit
+/// (a copy where other ways lead there too). The compiler shares the end of two sections
+/// whose start a branch chooses (`cond ? WaveActiveMax(x) : WaveActiveMin(x)` in the title's
+/// water optical depth: each arm reduces up to the read of lane 32, the join reads lane 0
+/// and restores), and a section is followed within one block. Every instruction still runs
+/// once on each path. A join that is a loop header is left as it is. `None` if nothing
+/// changes.
+pub(crate) fn whole_sections(p: &Program) -> Option<Program> {
+    use crate::gfx10::{Fields, Operand};
+    /// The saved mask's scalar code if `inst` starts a section: EXEC becomes every lane
+    /// (`s_or_saveexec -1`, `s_nand_saveexec 0`).
+    fn start(inst: &Inst) -> Option<u8> {
+        let all = match inst.name() {
+            "s_or_saveexec_b64" | "s_or_saveexec_b32" => Operand::Const(193),
+            "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Operand::Const(128),
+            _ => return None,
+        };
+        match &inst.fields {
+            Fields::Sop {
+                dst: Some(Operand::Scalar { code, .. }),
+                src,
+                ..
+            } if src.first() == Some(&all) => Some(*code),
+            _ => None,
+        }
+    }
+    let order = reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        index[b] = n;
+    }
+    // (block, the join whose code it takes)
+    let mut fuse = Vec::new();
+    for &b in &order {
+        let block = &p.blocks[b];
+        let Exit::Jump(join) = block.exit else { continue };
+        // the last section start of the block, unless its restore is in the block too
+        let Some((at, code)) = block
+            .insts
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, inst)| start(inst).map(|c| (i, c)))
+        else {
+            continue;
+        };
+        let saved = block.insts[at].write(Reg::S(code));
+        let restores = |i: &Inst, held: Option<Value>| {
+            i.write(Reg::S(EXEC)).is_some() && i.read(Reg::S(code)).is_some_and(|v| Some(v) == held)
+        };
+        if block.insts[at + 1..].iter().any(|i| restores(i, saved)) {
+            continue;
+        }
+        let z = &p.blocks[join];
+        if join == b || z.preds.iter().any(|&q| index[q] >= index[join]) {
+            continue;
+        }
+        // what the saved register holds in the join: the value itself, or a join of it
+        let held = match z.phis.iter().find(|phi| phi.reg == Reg::S(code)) {
+            Some(phi) => {
+                let from_b = z.preds.iter().position(|&q| q == b).map(|k| phi.args[k]);
+                if from_b != saved {
+                    continue;
+                }
+                Some(phi.value)
+            }
+            None => saved,
+        };
+        // the join's first write of EXEC is the restore, and nothing before it writes the
+        // saved register
+        let first = z
+            .insts
+            .iter()
+            .position(|i| i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(code)).is_some());
+        if first.is_some_and(|k| restores(&z.insts[k], held)) {
+            fuse.push((b, join));
+        }
+    }
+    if fuse.is_empty() {
+        return None;
+    }
+    let mut blocks = p.blocks.clone();
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    for &(b, join) in &fuse {
+        if blocks[b].insts.last().is_some_and(|i| i.name() == "s_branch") {
+            blocks[b].insts.pop();
+        }
+        let tail = p.blocks[join].insts.clone();
+        blocks[b].insts.extend(tail);
+        blocks[b].exit = p.blocks[join].exit;
+    }
+    // a join whose every way in took its code is left: nothing reaches it
+    for &(_, join) in &fuse {
+        if p.blocks[join].preds.iter().all(|q| fuse.contains(&(*q, join))) {
+            blocks[join].insts.clear();
+            blocks[join].exit = Exit::End;
+        }
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
