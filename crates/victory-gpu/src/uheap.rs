@@ -242,6 +242,8 @@ fn kernel_copy_works(device: &ID3D12Device) -> bool {
     let copied = crate::host::read_into(source.as_ptr(), &mut target[..480])
         && crate::host::read_into(source[480..].as_ptr(), &mut target[480..480 + 4096])
         && crate::host::read_into(source[4576..].as_ptr(), &mut target[4576..]);
+    // The write-combined stores are out before they are read back.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     let mut back = vec![0u8; SIZE];
     // SAFETY: as above; the processor reads the card's memory here.
     unsafe { std::ptr::copy_nonoverlapping(data.cast_const(), back.as_mut_ptr(), SIZE) };
