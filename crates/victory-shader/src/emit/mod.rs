@@ -93,6 +93,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod idiom;
 mod lower;
 mod own_bits;
 mod rect;
@@ -489,12 +490,12 @@ fn emit_forms(
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
         // Where the wave operations are the allocation idiom
-        // ([`lower::wave_local`]) that is exact. Other programs are taken
+        // ([`idiom::wave_local`]) that is exact. Other programs are taken
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
         let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
-        let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
+        let idiom = |p: &ir::Program, st: &structure::Structured| match idiom::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
