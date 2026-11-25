@@ -816,14 +816,27 @@ impl State {
             return 0;
         }
         // The title address of the buffer view at that dword of the table.
-        let address = match self.roots_ref(compute).get(usize::from(slot)) {
-            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
-            _ => 0,
+        let view = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4),
+            _ => None,
         };
-        if address == 0 {
-            once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
+        let address = view
+            .as_ref()
+            .and_then(crate::descriptor::host::buffer_range)
+            .map_or(0, |range| range.0);
+        // A null view (no resource: the particle update's table holds one at
+        // slot 1, dword 8, in every frame of the opening cutscene,
+        // GpuParticleUpdate:CS_UpdateParticles) has address 0 on the console
+        // too, so 0 is what the shader is meant to read. Anything else that
+        // has no address is logged.
+        let null = matches!(view, Some(View::Shader(0, _) | View::Unordered(0, ..)));
+        if address == 0 && !null {
+            once!(
+                slot,
+                dword,
+                view = ?view.map(|v| format!("{v:?}").chars().take(80).collect::<String>()),
+                "a shader takes the address of a buffer view that is not there: it reads 0"
+            );
         }
         if kind == USER_VIEW_ADDRESS {
             address as u32
