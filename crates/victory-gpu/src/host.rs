@@ -2060,6 +2060,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            note_blocked("buffer copy", src, len, written);
                         }
                         return Some(WHY_READ);
                     }
@@ -2068,6 +2070,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            note_blocked("fill", src, len, written);
                         }
                         return Some(WHY_READ);
                     }
@@ -2077,6 +2081,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            note_blocked("texture", at, len, written);
                         }
                         return Some(WHY_READ);
                     }
@@ -2087,6 +2093,32 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         }
     }
     None
+}
+
+/// Diagnostics: a read of `[at, at + len)` by `what` waits for flights; the
+/// first 64 and every 256th after, with the ranges of `written` it touches.
+#[cfg(feature = "diagnostics")]
+fn note_blocked(what: &str, at: usize, len: usize, written: &[(usize, usize)]) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 64 && !n.is_multiple_of(256) {
+        return;
+    }
+    let first = written.partition_point(|r| r.1 <= at);
+    let hit: Vec<String> = written[first..]
+        .iter()
+        .take_while(|r| r.0 < at + len)
+        .take(4)
+        .map(|r| format!("{:#x}+{:#x}", r.0, r.1 - r.0))
+        .collect();
+    tracing::info!(
+        n,
+        what,
+        at = format_args!("{at:#x}"),
+        len = format_args!("{len:#x}"),
+        ?hit,
+        "a read waits for flights' shader writes"
+    );
 }
 
 /// With flights in the air, after the submission's write-watch asking:
