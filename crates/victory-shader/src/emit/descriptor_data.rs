@@ -106,7 +106,9 @@ impl<'a> Lower<'a> {
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
-                        (10 | u, 0x409)
+                        // (Unsigned integers where the access moves halves, `half_bits`.)
+                        let halves = self.half_place(at, un, &src).is_some();
+                        (10 | u, if halves { 0x405 } else { 0x409 })
                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
                     {
                         (12 | u, stride)

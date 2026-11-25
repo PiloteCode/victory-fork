@@ -6,7 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -118,6 +118,13 @@ mod export;
 #[path = "official.rs"]
 mod official;
 
+/// 16-bit typed buffer accesses that keep their bits (fxceless #927), a child module so it
+/// shares the emitter's state.
+#[path = "half_bits.rs"]
+mod half_bits;
+#[cfg(test)]
+pub(super) use half_bits::with_half_bits_off;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -148,6 +155,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -304,6 +313,13 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel as integers
+    /// ([`super::HostShader::half_views`]): root parameter, dword in the table.
+    half_views: BTreeSet<(u8, u32)>,
+    /// The places every access through which moves halves, and the format loads read only as
+    /// halves ([`Self::half_places`]), found before the code is lowered.
+    half_only: BTreeSet<(u8, u32)>,
+    half_loads: HashSet<Site>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1691,6 +1707,9 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: BTreeSet::new(),
+            half_only: BTreeSet::new(),
+            half_loads: HashSet::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2565,6 +2584,9 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        if half_bits::half_bits() {
+            (self.half_only, self.half_loads) = self.half_places();
+        }
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -2724,6 +2746,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         let form = match () {
@@ -2742,6 +2765,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
