@@ -913,11 +913,16 @@ fn guard_unclean(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
         }
         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
         if g.protected.contains(&block) {
-            // Written through the runtime, or guarded with another view of
-            // its page: still read-only.
+            // Written through the runtime, or through another view of its
+            // pages (`open`), or guarded with another view of its page:
+            // still read-only. The view written may be one no copy checks:
+            // guarded again here, with the others (as in the walk).
             g.clean.insert(block);
             g.unclean.remove(&block);
             flush(g, &mut run);
+            if view_guard() {
+                protect_aliases(g, block);
+            }
             continue;
         }
         run = match run {
@@ -1141,6 +1146,11 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         for alias in crate::inplace::pages_of(block * BLOCK) {
             let alias = alias / BLOCK;
             if alias != block && g.protected.contains(&alias) && g.clean.remove(&alias) {
+                // A view block: not clean ([`Guards::unclean`]), or the
+                // asking answered from that set would not see it written.
+                if covered(&g.views, alias, alias + 1) {
+                    g.unclean.insert(alias);
+                }
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
