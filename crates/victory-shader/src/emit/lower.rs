@@ -4692,7 +4692,21 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let at = self.begin_guarded(guard);
+        // A subtraction of a value that is no constant, as `ds_add` of its negation (HLSL's
+        // `InterlockedAdd(shared, -x)`) or as `ds_sub`, is a compare-exchange loop: NVIDIA's
+        // compiler refuses `atomicrmw add` of `0 - x` and `atomicrmw sub` on group-shared
+        // memory, the whole pipeline failing with E_OUTOFMEMORY (RTX 5090, driver of
+        // 2026-11; DXC's own `InterlockedAdd(g, -x)` fails the same way, `InterlockedAdd(g,
+        // x)`, `(g, 5 - x)` and `(g, -5)` do not). The title's `weatherParticle:
+        // CS_BeginUpdate` hands its particles out so (`v_sub_nc_u32 v1, 0, v1;
+        // ds_add_rtn_u32`) and got no pipeline.
+        let take = match rmw {
+            Some(Rmw::Add) => self.s.m.negation_of(v0),
+            Some(Rmw::Sub) if !matches!(v0, V::Const(_)) => Some(v0),
+            _ => None,
+        };
         let r = match rmw {
+            _ if let Some(x) = take => self.lds_rmw_loop(p, |l, old| l.s.m.bin(l.cur, Bin::Sub, old, x)),
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
             None => self
@@ -4719,6 +4733,12 @@ impl<'a> Lower<'a> {
     // shortcut: f32 denormals compare as kept; with the console's MODE
     // flushing them they would order as ±0 first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
+        self.lds_rmw_loop(p, |l, old| l.lds_float_pick(old, data, max))
+    }
+
+    /// A read-modify-write of the LDS dword at `p` as a compare-exchange loop: `new` gives,
+    /// in the loop's one block, what is written over the old value; the old value returns.
+    fn lds_rmw_loop(&mut self, p: V, new: impl FnOnce(&mut Self, V) -> V) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
         let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
@@ -4726,7 +4746,7 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         let old = self.s.m.phi(lp, i32t);
         self.cur = lp;
-        let new = self.lds_float_pick(old, data, max);
+        let new = new(self, old);
         let prev = self.s.m.cmpxchg(lp, p, old, new);
         let done = self.s.m.cmp(lp, pred::EQ, prev, old);
         self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
