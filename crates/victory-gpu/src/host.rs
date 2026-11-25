@@ -3454,7 +3454,7 @@ impl Host {
     /// flights being landed (the card has run them), the pieces their
     /// compares flagged are fetched, once each, with a list and a wait of
     /// this thread's own, and what shaders wrote in them goes into title
-    /// memory (`Shadow::card_merge_relay_many`). As [`Host::card_back`], but:
+    /// memory (`Shadow::card_merge_relay`). As [`Host::card_back`], but:
     /// no submission lock; a piece flagged under one range of a plan is
     /// fetched under all ([`flagged_pieces`]); the fetch runs behind
     /// whatever was sent meanwhile, so it may bring a later flight's
@@ -3584,20 +3584,22 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        // Per copy, all its pieces at once (`Shadow::card_merge_relay_many`).
-        let mut by_copy: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, &[u8])>)> = Vec::new();
+        // One piece at a time, each with the ranges to leave out as they
+        // stand then: refreshes go on beside the merge without its lock,
+        // and a range one of them sends meanwhile must be left out of the
+        // pieces merged after it. (Gathered once for all of a copy's
+        // pieces, 2026-11-25, stale bytes of the card went over newer title
+        // bytes: the device was lost in 2 runs of 4, and the landing took
+        // no less time.)
+        let mut title = Vec::new();
+        let mut written = 0;
         for (shadow, lo, hi, at) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            match by_copy.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                Some((_, list)) => list.push((*lo, gpu)),
-                None => by_copy.push((shadow.clone(), vec![(*lo, gpu)])),
-            }
-        }
-        let mut written = 0;
-        for (shadow, list) in by_copy {
-            written += shadow.card_merge_relay_many(list, after);
+            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            shadow.walls_merged(gpu.len(), merged);
+            written += merged;
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
