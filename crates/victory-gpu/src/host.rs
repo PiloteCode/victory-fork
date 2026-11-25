@@ -8941,11 +8941,19 @@ impl Meter {
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
                 let [kept, dropped, slots, uploaded] =
                     [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
+                let [behind, oldest, refreshed] =
+                    [0, 1, 2].map(|i| crate::descriptor::host::PAGE_BEHIND[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({}),                      {refreshed} made due for it; textures older than the title's last write now: {behind} slots (the oldest write                      {oldest} frames ago) (VICTORY_PAGE_WRITES: unset or 1 the guards and the slots, guards the guards alone, 0 counts                      only, slots, all)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
-                    if mode & 4 != 0 { "told as well" } else { "counted only" },
+                    if mode & 4 != 0 {
+                        "told as well"
+                    } else if mode & 2 != 0 {
+                        "their texture slots told"
+                    } else {
+                        "counted only"
+                    },
                     if mode & 2 != 0 { "made due again" } else { "left as they were" }
                 );
             }

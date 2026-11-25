@@ -220,8 +220,11 @@ Memory sync between the title's memory and the copies on the card:
   guarded again in between no longer fails the read.
 - Writes of the storage layer into physical pages are counted where the title
   has those pages mapped (10,000 to 50,000 guarded blocks of copies lay under
-  them in every run) and can open the guards there:
-  `VICTORY_PAGE_WRITES=guards` (off by default; `1`, `slots`, `all` do more).
+  them in every run); the guards there are opened and the textures picked by
+  index that were uploaded before such a write are uploaded again (fxceless
+  #995: they kept the bytes from before for the rest of the run, which
+  textures depending on timing). `VICTORY_PAGE_WRITES=guards` opens the
+  guards alone (the default before), `0` counts only, `all` does more.
 - Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
 
 Card memory (the test card is full from the first frame of the world: 85 to
