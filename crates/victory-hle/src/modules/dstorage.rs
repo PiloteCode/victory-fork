@@ -1167,11 +1167,13 @@ fn into_destination(
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        let writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
+        // The blocks stayed open over the fill; noted written once more.
+        drop(writing);
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the
