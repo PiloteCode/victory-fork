@@ -684,7 +684,10 @@ impl Module {
     /// whose operands' settled facts allow a shorter form (`choose`) take it in place: the
     /// select becomes the form's last instruction and the product its first; the compares
     /// are left to the clean-up. Returns how many changed.
-    pub(crate) fn legacy_after_joins(&mut self, choose: impl Fn(&Facts, &Facts) -> Option<Form>) -> u32 {
+    pub(crate) fn legacy_after_joins(
+        &mut self,
+        choose: impl Fn(&Facts, &Facts) -> Option<Form>,
+    ) -> u32 {
         let sites = std::mem::take(&mut self.legacy_sites);
         if sites.is_empty() {
             return 0;

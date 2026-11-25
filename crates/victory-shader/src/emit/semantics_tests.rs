@@ -1404,12 +1404,13 @@ fn legacy_short_forms_are_the_consoles() {
         vec![mul_legacy(mul_legacy(x, x), mad(x, 0xC000_0000, 0x4080_0000))]
     }));
     // `0 - x` of x = v_med3_f32(v1, 0, 1) times 0.5: by IEEE never -0, so the product alone
-    // would do, but the card's driver makes `0 - x` the negation, -0 of +0: no short form
-    // (`VICTORY_LEGACY_LOOPS`'s facts follow the card).
+    // would do, but the card's driver makes `0 - x` the negation, -0 of +0: the default forms
+    // keep the select (`VICTORY_LEGACY_LOOPS`'s facts follow the card); `(x + 0) * 0.5` of
+    // VICTORY_LEGACY_ZERO still applies.
     let mut body = vop3(0x157, 6, [v(1), int(0), 242], NONE).to_vec();
     body.push(vop2(0x04, 7, int(0), 6));
     body.push(vop2(0x07, 5, 240, 7));
-    long.push(body.clone());
+    let select_kept = body.clone();
     probes.push(probe(body, unary(F32_EDGES), F32, |i| {
         let x = med3(i[0], 0, 0x3F80_0000);
         vec![mul_legacy(0x3F00_0000, add(0, x ^ 0x8000_0000))]
@@ -1452,12 +1453,16 @@ fn legacy_short_forms_are_the_consoles() {
     };
     let mut zero_form = Vec::new();
     for p in &probes {
-        let (on, default, off) = (lowered(p, true, true), lowered(p, true, false), lowered(p, false, false));
+        let on = lowered(p, true, true);
+        let (default, off) = (lowered(p, true, false), lowered(p, false, false));
         let what = disassembly(&p.body, false);
         if long.contains(&p.body) {
             assert_eq!(on, off, "{what}: no short form");
         } else {
             assert_ne!(on, off, "{what}: a short form");
+        }
+        if p.body == select_kept {
+            assert_eq!(default, off, "{what}: the default forms keep the select");
         }
         zero_form.push(on != default);
     }
@@ -1481,7 +1486,7 @@ fn legacy_short_forms_are_the_consoles() {
     TEST_ZERO.set(None);
     let (card, other): (Vec<_>, Vec<_>) = failures.into_iter().partition(|(_, card)| *card);
     for (f, _) in &card {
-        eprintln!("VICTORY_LEGACY_ZERO (off by default) differs from the console on the card only:\n{f}");
+        eprintln!("VICTORY_LEGACY_ZERO (off by default), on the card only:\n{f}");
     }
     assert_clean(other.into_iter().map(|(f, _)| f).collect());
 }
