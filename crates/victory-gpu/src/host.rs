@@ -7712,6 +7712,22 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // What the system tells every window about displays and devices, in
+    // the log: Windows reset the card four times on 2026-11-25, each 2.5
+    // to 4.6 s after a remote-desktop host (Parsec) ended its session and
+    // removed its virtual input device, and nothing in our log showed it.
+    match message {
+        WM_DISPLAYCHANGE => tracing::info!(
+            width = lparam.0 & 0xffff,
+            height = (lparam.0 >> 16) & 0xffff,
+            bits = wparam.0,
+            "the display's mode changed"
+        ),
+        WM_DEVICECHANGE if wparam.0 == DBT_DEVNODES_CHANGED as usize => {
+            tracing::info!("a device was added to or removed from the system")
+        }
+        _ => {}
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
