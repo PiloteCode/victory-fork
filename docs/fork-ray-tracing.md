@@ -1,8 +1,11 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+Status, 2026-11-25: **nothing is lit by ray tracing yet.** With
+`VICTORY_BVH_BUILDER=1` the builder now runs its whole first frame in the
+game (some 12,000 dispatches in the user-save scenario), but the title still
+dies one frame later on a CPU read of what the builder produced (run
+rt-trace9: one access violation at title +0xf6349). The builder stays off by
+default.
 
 ## What the title does
 
@@ -63,14 +66,79 @@ shaders and emulates the one instruction.
    also keeps the builder's stores out of title memory, for a first test). A
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
+6. **What running the builder in the game took so far** (2026-11-25, each a
+   commit of its own):
+   - *List upload memory where shaders reach it.* The builder writes the
+     tables its stages read into list upload memory and hands them the
+     addresses; its header stage (InitHeaders) reads its records by address.
+     The blocks of the process heap the layer gave out lay at 1.5-1.8 TiB,
+     past the console's 40 bits and the directory (below 128 GiB): the records
+     read as zeros and no structure header was written. Upload memory now
+     comes from 4 MiB chunks of one write-watched reservation below 128 GiB
+     (`list.rs`, `upload`), named before every builder dispatch.
+   - *The structures' sizes, copied on the card.* The title copies each
+     structure's compacted size out of the builder's buffer with
+     `CopyBufferRegion` in the list that computed it. Done on the CPU at
+     submission, the copy took what the buffer held before the list's
+     shaders ran; in lists whose shaders store by address it now runs on the
+     card behind them (`HostList::copy_on_card`).
+   - *Copies of title memory by address kept current where named.* Every list
+     that ran a builder stage refreshed and compared all numbered copies
+     (1,023 windows, 4 GiB): with the stages bound and not run that alone made
+     a median 975 ms a frame against 353 without the builder. A list now
+     refreshes the copies its dispatches name (and the upload memory's) and
+     declares written only those, and only for programs that store through an
+     address (`VICTORY_MEMORY_ALL=1`: as before). Low dwords of address pairs
+     are no longer also taken as addresses in 256-byte units (717 of the 802
+     windows named that way in the first frame were), and there are 2,047
+     numbers: the first frame ran out of the 1,023.
+   - *Remaps after the flights.* `CopyPageMappingsBatchX` waits for flights
+     whose shaders may write the range it maps.
+   - *DirectStorage's writes into physical pages, seen wherever the pages are
+     shown.* The title streams its pre-built structures into pool pages and
+     maps them into its tiled heap. A write through another view than the
+     guarded address never reached the host copies, which kept what the pages
+     held before; the builder rehydrated those bytes in place, the copy-back
+     put empty box nodes where the title's CPU read them, and the title's
+     threads died on child pointers of all ones (13 exceptions on several
+     threads in runs rt-trace7 and rt-trace8; none of that kind in rt-trace9,
+     which told every address showing a written page). The integration branch
+     has the same report from upstream (`xmem.rs`, `pages_written`;
+     `watch.rs`, `title_memory_written`, `VICTORY_PAGE_WRITES`) and guards
+     every view of a page together (`VICTORY_VIEW_GUARD`), so a write the
+     title's CPU makes through one view is seen at the others.
+7. **Four more sun-shadow trace programs translate.** They take the address
+   of their structure out of a descriptor they pick from the view heap; the
+   host keeps a table of view addresses by heap slot (`SLOT_VIEW_ADDRESSES`).
+   The game's scene in the user-save scenario uses the checkerboard variant,
+   which translated before.
+8. **Diagnostics.** `VICTORY_BVH_TRACE=<file>` traces every dispatch of the
+   builder and of the programs that reach memory by address, the list upload
+   memory they read, every range put back into title memory, page mappings
+   (with their ranges) and copies; `VICTORY_BVH_DRY=1` binds the builder's
+   dispatches without running them; `VICTORY_BVH_CHECK=<hash of the header
+   stage>` walks the structures it initialises a frame later, in title memory,
+   and reports bad nodes; `VICTORY_CRASH_MEMORY=1` adds the title memory
+   around the registers (and one pointer further) to a crash report. With the
+   user's own `XboxBvhBuilder.dll`, `VICTORY_TEST_BVH_DLL` runs the builder's
+   wave64 programs in their picked and paired forms on the card and compares
+   them (they agree).
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder has not yet run in the game: until
-  the paired form, three of its programs did not translate on a 32-lane GPU,
-  which kept it off. Every builder pipeline is now created offline
-  (`victory translate --pipelines` with `VICTORY_HOST_MAX_WAVE=32`).
-- Five shadow-mask trace programs do not translate yet.
+- With `VICTORY_BVH_BUILDER=1` the title dies one frame after the builder's
+  first frame (rt-trace9: a read of 0xf at title +0xf6349; the object it came
+  from points at structure data with empty, infinite bounds). Not known yet:
+  whether the builder's output is wrong there or its inputs were stale
+  (rt-trace9 ran before the views of a page were guarded together).
+- The trees are not validated yet: the walk (`VICTORY_BVH_CHECK`) reads title
+  memory, which holds only what was put back, and ran only in rt-trace8,
+  before the fixes above (602 structures, 24,273 bad nodes, most of them
+  zeros where nothing had been put back).
+- Copy numbers are never given back: the builder named some 1,450 windows in
+  six minutes (rt-dry1), and 2,047 numbers run out in a longer session.
+- One shadow-mask trace program (FullAdaptive) stops at a lane mask read as
+  data.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
@@ -87,3 +155,9 @@ shaders and emulates the one instruction.
   and raw addresses.
 - `crates/victory-gpu/src/pipeline.rs`, `draw.rs`: the builder rule and the
   host side of root views and title memory.
+- `crates/victory-gpu/src/memory.rs`: title memory by address (directory,
+  numbered copies, what a dispatch names).
+- `crates/victory-gpu/src/bvhtrace.rs`: the builder's trace and the
+  structure walk.
+- `crates/victory-hle/src/modules/xmem.rs`: physical pages, their views, and
+  the addresses a write into them shows at.

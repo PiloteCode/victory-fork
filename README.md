@@ -189,12 +189,13 @@ card), a table's constants read from the card copies (the scene vanished:
 refreshes leave ranges under shader writes alone), clamp windows of 1,024
 records or lasting to the title's next barrier (no fewer clamps that matter,
 no frame time gained), the ray-tracing structure builder
-(`VICTORY_BVH_BUILDER=1`, with or without quarantine: the title crashes
-about 80 s into the gameplay, reading a pointer of all ones).
+(`VICTORY_BVH_BUILDER=1`: its first frame now runs whole, and the title
+dies one frame later; see docs/fork-ray-tracing.md).
 
-Still open: the ray-tracing structure builder (all 52 programs now get
-pipelines, but switched on it crashes the title at the prologue's leadout
-cutscene, so shadows stay dark); ~95 ms of card time a frame, 19 ms of it
+Still open: the ray-tracing structure builder (all 52 programs get
+pipelines and its first frame runs, with its upload memory, sizes, copies
+and streamed pages fixed, but switched on the title still dies one frame
+after it, so shadows stay dark); ~95 ms of card time a frame, 19 ms of it
 our clamps of indirect records (the card still turns from drawing to
 compute and back for each of 2,500 a frame: the title's ~710 barriers a
 frame cut its runs of records short); ~60 ms a frame that the submitting
