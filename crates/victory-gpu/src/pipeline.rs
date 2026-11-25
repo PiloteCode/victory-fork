@@ -307,10 +307,11 @@ fn translate(container: &[u8], thread_limited: bool) -> Result<Translated, Strin
 /// made" would be a dropped stage). One that cannot be made turns the
 /// builder off for the rest of the run.
 ///
-/// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
-/// the whole builder and the host side of title memory by address
-/// (`memory.rs`) working on a card; nothing reads the structures before
-/// the programs that walk them translate.
+/// On by default; `VICTORY_BVH_BUILDER=0` turns it off. Run
+/// integ-general-2-rt2-builder had it on for 420 s of save gameplay
+/// without a fault (before the fix for its dispatches by thread counts,
+/// `crate::list`, the title died one frame after its first), for some 88 ms
+/// more card time a frame (160 ms against 72 in the same scene).
 #[cfg(windows)]
 struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
@@ -326,6 +327,30 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     whole: false,
     off: false,
 });
+
+/// The builder runs whole and is not turned off ([`Builder`]): read at
+/// every dispatch of a program that walks the structures
+/// ([`structures_walked`]), without the builder's lock.
+#[cfg(windows)]
+static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the programs that walk the title's ray-tracing structures may
+/// read their nodes: the structure builder runs ([`Builder`]). While it
+/// does not (before its first dispatch, with `VICTORY_BVH_BUILDER=0`, or
+/// once turned off), every node test of theirs answers no hit without
+/// reading memory (`victory_shader::emit::USER_STRUCTURES`): no box is
+/// entered and no triangle hit, so their rays see an empty scene instead
+/// of whatever bytes lie where the structures would be (see
+/// [`walk_held`]; in wave 2's runs with the builder off, screen-aligned
+/// dark tiles on sunlit hair and lit squares in shadow, and the hair's
+/// light changing from run to run). `VICTORY_BVH_NO_HIT=0` lets them walk
+/// those bytes, as before.
+#[cfg(windows)]
+pub(crate) fn structures_walked() -> bool {
+    static ANYWAY: OnceLock<bool> = OnceLock::new();
+    BUILT.load(std::sync::atomic::Ordering::Relaxed)
+        || *ANYWAY.get_or_init(|| std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "0"))
+}
 
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
@@ -394,10 +419,10 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// because its program walks ray-tracing structures nothing has built
 /// (`VICTORY_BVH_HOLD=1`; off by default).
 ///
-/// The structure builder does not run (see [`Builder`]: only with
-/// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
-/// waves does not manage yet). The title's ray-traced passes run all the
-/// same: 64 programs of its shader pack test rays against structure nodes
+/// While the structure builder does not run (see [`Builder`]: before its
+/// first dispatch, with `VICTORY_BVH_BUILDER=0`, or turned off because one
+/// of its programs has no host pipeline), the title's ray-traced passes
+/// run all the same: 64 programs of its shader pack test rays against structure nodes
 /// (ray-traced shadows, screen probes, reflections, the irradiance cache;
 /// one of them, `CS_IrradianceCache_ShadowTrace_WithFar` f607780aa8e502d0,
 /// from the first world frame on in every run). Each walks, in a loop the
@@ -450,16 +475,17 @@ pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
+        BUILT.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
     }
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
-/// [`Builder`]).
+/// [`Builder`]; `VICTORY_BVH_BUILDER=0` turns it off).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "0")) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -484,6 +510,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
