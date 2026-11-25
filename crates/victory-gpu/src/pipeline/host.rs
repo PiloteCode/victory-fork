@@ -605,7 +605,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -761,7 +761,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -785,6 +785,59 @@ fn mesh_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// The title's blend state with blending off for its integer render targets, which D3D12
+/// refuses to blend and the console's color block does not blend. A pipeline that blends an
+/// integer target is `E_INVALIDARG`, also when target 0's blend stands for every target
+/// (`IndependentBlendEnable` clear): measured on an RTX 5090 with `PS_WindshieldWiperMask`,
+/// which writes a uint to target 2 (blending target 0 for all of them: refused; targets 0
+/// and 1 alone: made). Its mesh pipeline was refused in every run that drew it. A state
+/// that blends no integer target, or uses a logic operation, is left as the title gave it.
+fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
+    let integer = |k: usize| {
+        matches!(
+            targets.RTFormats[k],
+            DXGI_FORMAT_R32G32B32A32_UINT
+                | DXGI_FORMAT_R32G32B32A32_SINT
+                | DXGI_FORMAT_R32G32B32_UINT
+                | DXGI_FORMAT_R32G32B32_SINT
+                | DXGI_FORMAT_R16G16B16A16_UINT
+                | DXGI_FORMAT_R16G16B16A16_SINT
+                | DXGI_FORMAT_R32G32_UINT
+                | DXGI_FORMAT_R32G32_SINT
+                | DXGI_FORMAT_R10G10B10A2_UINT
+                | DXGI_FORMAT_R8G8B8A8_UINT
+                | DXGI_FORMAT_R8G8B8A8_SINT
+                | DXGI_FORMAT_R16G16_UINT
+                | DXGI_FORMAT_R16G16_SINT
+                | DXGI_FORMAT_R32_UINT
+                | DXGI_FORMAT_R32_SINT
+                | DXGI_FORMAT_R8G8_UINT
+                | DXGI_FORMAT_R8G8_SINT
+                | DXGI_FORMAT_R16_UINT
+                | DXGI_FORMAT_R16_SINT
+                | DXGI_FORMAT_R8_UINT
+                | DXGI_FORMAT_R8_SINT
+        )
+    };
+    let n = (targets.NumRenderTargets as usize).min(8);
+    let independent = blend.IndependentBlendEnable.as_bool();
+    let of = |k: usize| &blend.RenderTarget[if independent { k } else { 0 }];
+    if blend.RenderTarget.iter().any(|t| t.LogicOpEnable.as_bool())
+        || !(0..n).any(|k| integer(k) && of(k).BlendEnable.as_bool())
+    {
+        return *blend;
+    }
+    let mut b = *blend;
+    if !independent {
+        b.IndependentBlendEnable = true.into();
+        b.RenderTarget = [blend.RenderTarget[0]; 8];
+    }
+    for k in (0..n).filter(|&k| integer(k)) {
+        b.RenderTarget[k].BlendEnable = false.into();
+    }
+    b
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -893,6 +946,77 @@ mod tests {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         }
+    }
+
+    /// Target 0's blend standing for every target, over a float and a uint target: each target
+    /// gets target 0's blend, but the uint one blends nothing. Independent blends lose only
+    /// the integer targets' blending; states that blend no integer target stay as they are.
+    #[test]
+    fn integer_targets_are_not_blended() {
+        let mut targets = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: 3,
+            ..Default::default()
+        };
+        targets.RTFormats[..3].copy_from_slice(&[DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT]);
+        let mut all = GraphicsState::default().blend;
+        all.RenderTarget[0].BlendEnable = true.into();
+        all.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        let b = host_blend(&all, &targets);
+        assert!(b.IndependentBlendEnable.as_bool());
+        let on: Vec<bool> = b.RenderTarget[..3].iter().map(|t| t.BlendEnable.as_bool()).collect();
+        assert_eq!(on, [true, true, false]);
+        assert_eq!(b.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+        let mut each = all;
+        each.IndependentBlendEnable = true.into();
+        each.RenderTarget[2] = each.RenderTarget[0];
+        let b = host_blend(&each, &targets);
+        let on: Vec<bool> = b.RenderTarget[..3].iter().map(|t| t.BlendEnable.as_bool()).collect();
+        assert_eq!(on, [true, false, false]);
+        // nothing to change: the same state back
+        let mut floats = targets;
+        floats.RTFormats[2] = DXGI_FORMAT_R16_FLOAT;
+        let same = host_blend(&all, &floats);
+        assert!(!same.IndependentBlendEnable.as_bool());
+        assert_eq!(format!("{same:?}"), format!("{all:?}"));
+    }
+
+    /// A pixel shader writing a float to target 0 and a uint to target 1 (as the windshield
+    /// wiper mask writes one to target 2), under target 0's blend for every target: the host
+    /// refuses that state (`E_INVALIDARG`), and makes the pipeline with the uint target's
+    /// blending off.
+    #[test]
+    fn a_pipeline_that_blends_an_integer_target_is_made_without() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.mesh_shaders() {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(
+            &dxc,
+            dir.path(),
+            "struct O { float4 c : SV_Target0; uint m : SV_Target1; };
+             O main() { O o; o.c = 1; o.m = 7; return o; }",
+            "ps_6_5",
+        );
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        g.blend.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        let name = super::super::library::name("mesh blend test", &root_blob, &[&ms, &ps], &g.describe());
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
     }
 
     /// A mesh pipeline made once is loaded from the library the next time,

@@ -308,6 +308,46 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
+/// 64-bit floats, which the title's water volumetrics count their lanes in: `v_add_f64` and
+/// `v_mul_f64` of register pairs (one operand negated, one an inline double),
+/// `v_cvt_f64_f32`, and `v_cvt_f32_f64` rounding to nearest (1 + 0.75 of a float's last
+/// place becomes 1 + one place). The doubles come in s0..s3 (v1..v4): a in v[1:2], b in
+/// v[3:4].
+#[test]
+fn f64_arithmetic_and_conversions_are_ieee() {
+    let to_f32 = vop1(0x0F, 0, vgpr(5)); // v_cvt_f32_f64 v0, v[5:6]
+    let d = |a: f64, b: f64| {
+        let (a, b) = (a.to_bits(), b.to_bits());
+        [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+    };
+    let with = |first: &[u32]| {
+        let mut w = first.to_vec();
+        w.push(to_f32);
+        w
+    };
+    let add = with(&vop3(0x164, 5, vgpr(1), vgpr(3), 0)); // v_add_f64 v[5:6], v[1:2], v[3:4]
+    let neg_mul = with(&vop3_mod(0x165, 5, vgpr(1), vgpr(3), 0, 0, 1, 0, false)); // -a * b
+    let half = with(&vop3(0x164, 5, 240, vgpr(1), 0)); // v_add_f64 v[5:6], 0.5, v[1:2]
+    let mut wide = vec![vop1(0x10, 5, vgpr(1))]; // v_cvt_f64_f32 v[5:6], v1
+    wide.extend(vop3(0x164, 5, vgpr(5), vgpr(5), 0)); // v_add_f64 v[5:6], v[5:6], v[5:6]
+    wide.push(to_f32);
+    let near = 1.0 + 3.0 * 2f64.powi(-25);
+    let cases: [(&[u32], [u32; 4], f32); 6] = [
+        (&add, d(1.5, 2.25), 3.75),
+        (&add, d(near, 0.0), f32::from_bits(0x3F80_0001)),
+        (&add, d(1e300, -1e300), 0.0),
+        (&neg_mul, d(3.0, 0.5), -1.5),
+        (&half, d(2.0, 0.0), 2.5),
+        (&wide, [1.25f32.to_bits(), 0, 0, 0], 2.5),
+    ];
+    for (body, inputs, want) in cases {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            assert_eq!(f32::from_bits(got), want, "{backend}: {body:08x?} on {inputs:08x?}");
+        });
+    }
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
