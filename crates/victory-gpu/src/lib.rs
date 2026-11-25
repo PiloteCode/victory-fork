@@ -12,7 +12,8 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
+//! share, [`console`] which console model the title sees, `external` host
+//! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
 #[cfg(windows)]
@@ -33,6 +34,8 @@ mod drvwatch;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
@@ -73,6 +76,9 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+mod switch;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
@@ -87,5 +93,5 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
 #[cfg(windows)]
 pub use watch::{
     title_memory_committed, title_memory_reading, title_memory_reading_range, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_range, title_memory_written, writing as kernel_will_write,
+    title_memory_remapping, title_memory_remapping_range, title_memory_written, Writing as KernelWrite, writing as kernel_will_write,
 };

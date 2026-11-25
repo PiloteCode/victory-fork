@@ -4,6 +4,7 @@
 //! is defined in docs/asset-policy.md.
 
 pub mod sgd5;
+pub mod shaderpack;
 
 /// A specific build of the title executable we know how to run.
 #[derive(Debug, Clone, Copy)]
@@ -14,6 +15,8 @@ pub struct KnownBuild {
     pub blake3: &'static str,
     /// Changes to its code made before it is mapped.
     pub patches: &'static [CodePatch],
+    /// RPF9 archive the title needs during startup, relative to its executable.
+    pub startup_archive: &'static str,
 }
 
 /// A change to title code: at `rva`, the bytes `expect` (a short signature
@@ -34,6 +37,7 @@ const UPSCALER_6: &[u8] = &[0xb8, 0x06, 0x00, 0x00, 0x00, 0xc3];
 pub const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
     label: "Xbox Series master",
     blake3: "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93",
+    startup_archive: "appdata0.rpf",
     // The title picks its upscaler by console: on a Series S with the
     // FidelityFX upscaler's capability, FSR 4 (type 7), else its own
     // (type 6, as on a Series X). FSR 4's output never reaches the screen
