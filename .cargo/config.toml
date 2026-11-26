@@ -1,3 +1,6 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
 # Code for x86-64-v3 (AVX2, FMA, BMI2): the title itself needs AVX2 (`victory
 # run` checks for it before it starts one), so no machine that can play it
 # lacks these. Measured on our earlier tree with thin LTO and one codegen unit
