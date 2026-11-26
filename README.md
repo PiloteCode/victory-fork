@@ -1,28 +1,53 @@
-# VIctory on an RX 7900 XTX
-
-## Run the codec_d Windows build
-
-Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
-
-```powershell
-$env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
-.\Play-VIctory.cmd pareto-residency
-```
-
-The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
-
-To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
+# Pilote Victory
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+This one is about **NVIDIA cards**. It is the layer of
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
+which was built for speed on AMD RDNA 3, with a shader translator that covers
+cards of 32-lane waves and the fixes of
+[codec-d/cool_fox](https://github.com/codec-d/cool_fox) for a view heap of
+1,000,000 descriptors.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-### This branch: their layer with our translator, and the defaults it runs with
+## Where this fork stands (2026-11-27)
+
+Tested on one machine only: Windows 11, Intel i9-14900KF, 64 GB RAM, GeForce
+RTX 5090 on a PCIe 5 link, a diagnostics build, runs of about five minutes.
+
+| | |
+|---|---|
+| Prologue, about 4,800 draws a frame, the Series X profile | 79-95 ms a frame (10.5-12.5 fps), the picture right |
+| The same scene with the layer this tree replaced | 130-168 ms |
+| The same scene under `--console series-s` | about 44 ms (22 fps), but a black picture: the upscaler's programs do not translate yet |
+
+What bounds the frame under the Series X profile is the card: it is 75-84 %
+busy with the translated shaders, while preparing a frame takes 22-26 ms.
+
+Known to be wrong here:
+
+- Textures of what just came into view appear late: skin and clothes can stay
+  grey for seconds.
+- Mouths do not move in cutscenes on NVIDIA cards (16-bit typed buffers; the
+  fix is being fitted to this layer).
+- The Series S profile shows a black picture (see the table).
+- The first run after a build or a driver update stutters while the driver
+  makes pipelines.
+
+## How to run this fork
+
+```powershell
+cargo build --release -p victory
+targeteleaseictory.exe run <path of your copy's executable> --execute
+```
+
+The play settings of the layer underneath are `victory run`'s defaults here
+(next section): no script and no environment variable is needed.
+
+## Their layer with our translator, and the defaults it runs with
 
 This tree is the RX 7900 XTX fork's layer (everything below) with the shader
 translator of our tree (PiloteCode's waves, `crates/victory-shader` as of
@@ -66,15 +91,28 @@ and off unless set:
   run, the programs that walk its structures see an empty scene.
 
 On by the layer's own default, as in our tree: texture read-back into title
-memory (`VICTORY_TEXTURE_BACK=0` turns it off), linked mesh programs
-(`VICTORY_MESH_LINK=0`), textures made due again after DirectStorage writes
-(`VICTORY_PAGE_WRITES=guards` for the old way), a texture's own bytes ending
-only at a view written after its own (`VICTORY_OWN_BYTES=next` for the old way).
+memory (`VICTORY_TEXTURE_BACK=0` turns it off) and linked mesh programs
+(`VICTORY_MESH_LINK=0`). Two texture rules of our older tree are here behind
+switches and off, because the first put texel noise on textures in this layer
+(RTX 5090, the prologue's first playable scene): a texture's own bytes ending
+only at a view written after its own (`VICTORY_OWN_BYTES=newer`), and textures
+made due again after DirectStorage writes (`VICTORY_PAGE_WRITES=1`).
 Builds are made for x86-64-v3 (AVX2, which the title needs anyway;
 `.cargo/config.toml`), release and diag with thin LTO and one codegen unit
 (`Cargo.toml`).
 
-## Where it stands (2026-11-25)
+## The layer underneath: avatarmanz's README
+
+What follows is the README of
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) as
+this tree took it (its commit 0a435665). Its figures are its own machine's.
+
+A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+that runs an Xbox Series title natively on Windows from files the user supplies.
+This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
+one PC, without giving up the picture. It is not there yet.
+
+### Where it stands (2026-11-25)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
 RX 7900 XTX, 1440p, the Series X profile.
@@ -101,7 +139,7 @@ What is known to be wrong:
   pipelines (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
-## How to run it
+### How to run it
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
@@ -131,7 +169,7 @@ Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
 
-## What is different here
+### What is different here
 
 In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
 
@@ -161,6 +199,14 @@ commits taken from elsewhere name the commit and its author.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  the layer this tree is built on, and most of this README.
+- **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)**: the work on an
+  RTX 5090 that keeps the dynamic descriptor slots from running out on a
+  1,000,000-view heap, the two presented planes of the Series S profile, host
+  memory admission for texture staging (its `docs/bug-journal.md` is kept).
+- **[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq)**:
+  its patches were read for fixes worth taking; each one taken names its patch.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
   this one started from, and the people whose pull requests it carries.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
@@ -174,7 +220,8 @@ commits taken from elsewhere name the commit and its author.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
 - **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
   title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- avatarmanz's README says of its own changes that they were made with
+  [Claude Code](https://claude.com/claude-code).
 
 ## License
 
