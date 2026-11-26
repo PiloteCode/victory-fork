@@ -2661,8 +2661,23 @@ pub(crate) fn install() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_write));
+        let registered = !AddVectoredExceptionHandler(1, Some(on_write)).is_null();
+        HANDLER.store(registered, std::sync::atomic::Ordering::Release);
+        if !registered {
+            tracing::warn!("the handler of faults in guarded title memory could not be registered");
+        }
     });
+}
+
+/// Whether [`install`] registered the handler (the system may refuse):
+/// what relies on it to take a fault, the copies that fail instead of
+/// faulting (`crate::safecopy`), must not run without it.
+static HANDLER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`install`], and whether the handler is there.
+pub(crate) fn installed() -> bool {
+    install();
+    HANDLER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Whether `at` is committed read-write memory now.

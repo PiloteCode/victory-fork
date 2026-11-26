@@ -323,8 +323,12 @@ pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0");
-        if on {
-            crate::watch::install();
+        // Without the handler a fault in a copy would find nobody to take
+        // it: copies go through the kernel then, as with
+        // `VICTORY_SAFE_COPY=0` (fxceless#990 by ryotdev, our 73c54389).
+        if on && !crate::watch::installed() {
+            tracing::warn!("copies of title memory go through the kernel: the fault handler they rely on is not there");
+            return false;
         }
         on
     })
