@@ -419,6 +419,21 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     )
 }
 
+fn volume_root(host: &mut Vec<u16>) {
+    let prefix = if host.starts_with(&VERBATIM) {
+        VERBATIM.len()
+    } else {
+        0
+    };
+    if let [_, colon, sep, ..] = host[prefix..]
+        && colon == u16::from(b':')
+        && SEPARATORS.contains(&sep)
+    {
+        host.truncate(prefix + 3);
+        host.push(0);
+    }
+}
+
 /// Wants a volume root: a virtual drive answers for the host volume its
 /// folder is on.
 pub extern "system" fn GetDiskFreeSpaceW(
@@ -429,12 +444,8 @@ pub extern "system" fn GetDiskFreeSpaceW(
     clusters: *mut u32,
 ) -> i32 {
     let mut p = wide(root);
-    if let Some(host) = &mut p.1
-        && let [letter, colon, sep, ..] = host[..]
-        && colon == u16::from(b':')
-        && SEPARATORS.contains(&sep)
-    {
-        *host = vec![letter, colon, sep, 0];
+    if let Some(host) = &mut p.1 {
+        volume_root(host);
     }
     host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)(
         p.ptr(),
@@ -896,7 +907,19 @@ mod tests {
         let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
         assert!(!f.is_null(), "{file}");
         host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
-        assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
+        // Right after `fclose` another process (or a scan of the new file)
+        // can still hold it for a moment: the delete then fails with
+        // ERROR_SHARING_VIOLATION, about once in 300 runs of the whole test
+        // binary. Try again for up to a second.
+        let mut deleted = 0;
+        for _ in 0..100 {
+            deleted = DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr());
+            if deleted != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_ne!(deleted, 0, "delete: {}", std::io::Error::last_os_error());
         assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
     }
 
@@ -1016,5 +1039,49 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn disk_free_space_truncates_to_volume_root() {
+        let mut plain = w(r"C:\dir\sub");
+        volume_root(&mut plain);
+        assert_eq!(plain, w(r"C:\"));
+
+        let mut verbatim = w(r"\\?\C:\dir\sub");
+        volume_root(&mut verbatim);
+        assert_eq!(verbatim, w(r"\\?\C:\"));
+
+        let mut unc = w(r"\\?\UNC\server\share\dir");
+        volume_root(&mut unc);
+        assert_eq!(unc, w(r"\\?\UNC\server\share\dir"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let (mut spc, mut bps, mut free, mut total) = (0, 0, 0, 0);
+        assert_ne!(
+            GetDiskFreeSpaceW(
+                w(&format!(r"{letter}:\")).as_ptr(),
+                &mut spc,
+                &mut bps,
+                &mut free,
+                &mut total,
+            ),
+            0
+        );
+        assert_ne!(spc * bps, 0);
+        assert_ne!(total, 0);
+
+        let (mut v_spc, mut v_bps, mut v_free, mut v_total) = (0, 0, 0, 0);
+        assert_ne!(
+            GetDiskFreeSpaceW(
+                w(&format!(r"\\?\{letter}:\")).as_ptr(),
+                &mut v_spc,
+                &mut v_bps,
+                &mut v_free,
+                &mut v_total,
+            ),
+            0
+        );
+        assert_eq!((v_spc, v_bps, v_total), (spc, bps, total));
     }
 }

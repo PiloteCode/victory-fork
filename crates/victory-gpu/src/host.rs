@@ -4736,6 +4736,17 @@ impl Host {
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
+                // A removed device answers UINT64_MAX for every fence, also
+                // for work that never ran: the fetch is then no fetch, and its
+                // buffer's stale bytes must not be merged into title memory
+                // (fxceless#964, by avt0m4t48 for the copy lanes of its tree:
+                // our be46efef). The removal ends the run (`fail`).
+                let ran = |fence: &ID3D12Fence| -> windows::core::Result<()> {
+                    if fence.GetCompletedValue() == u64::MAX {
+                        self.device.GetDeviceRemovedReason()?;
+                    }
+                    Ok(())
+                };
                 if let Some(queue) = &copy_queue {
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
@@ -4744,6 +4755,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    ran(&fence)?;
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -4759,6 +4771,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                ran(&fence)?;
                 Ok(after)
             })()
         };
@@ -8850,11 +8863,19 @@ impl Meter {
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
                 let [kept, dropped, slots, uploaded] =
                     [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
+                let [behind, oldest, refreshed] =
+                    [0, 1, 2].map(|i| crate::descriptor::host::PAGE_BEHIND[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({}),                      {refreshed} made due for it; textures older than the title's last write now: {behind} slots (the oldest write                      {oldest} frames ago) (VICTORY_PAGE_WRITES: unset or 1 the guards and the slots, guards the guards alone, 0 counts                      only, slots, all)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
-                    if mode & 4 != 0 { "told as well" } else { "counted only" },
+                    if mode & 4 != 0 {
+                        "told as well"
+                    } else if mode & 2 != 0 {
+                        "their texture slots told"
+                    } else {
+                        "counted only"
+                    },
                     if mode & 2 != 0 { "made due again" } else { "left as they were" }
                 );
             }

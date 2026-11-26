@@ -85,7 +85,8 @@ fn title_path(module: *mut c_void) -> Option<String> {
 
 /// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
 /// truncate to the buffer, report `ERROR_INSUFFICIENT_BUFFER` and return
-/// the buffer size.
+/// the buffer size. A name that fits clears the last error, as the host
+/// does: titles tell a truncated name from a whole one by it.
 fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
     let Some(room) = out.len().checked_sub(1) else {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
@@ -98,8 +99,11 @@ fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return out.len() as u32;
     }
+    host::set_last_error(ERROR_SUCCESS);
     n as u32
 }
+
+const ERROR_SUCCESS: u32 = 0;
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
@@ -160,13 +164,15 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
+    // Values below 0x10000 are ordinals; we export by name only. A miss
+    // fails as the host's does, with the last error set.
     if (name as usize) < 0x1_0000 {
         tracing::warn!(
             module = m.name,
             ordinal = name as usize,
             "GetProcAddress by ordinal"
         );
+        host::set_last_error(ERROR_PROC_NOT_FOUND);
         return std::ptr::null_mut();
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
@@ -175,6 +181,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -354,6 +361,7 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 /// The title's argument list: the program, then what was given after `--`.
 /// The host's own would be ours (`victory run <exe> ...`), and the title
@@ -743,6 +751,50 @@ mod tests {
         unsafe { assert_eq!((*__p___argc(), (**__p___argv()).is_null()), (1, false)) };
     }
 
+    /// The host clears the last error when the name fits (titles tell a
+    /// truncated name from a whole one by it, also after a call that
+    /// filled the buffer exactly); a title image's name does the same.
+    #[cfg(windows)]
+    #[test]
+    fn a_module_name_that_fits_clears_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: reads this thread's last error.
+        let last_error = || unsafe { GetLastError() };
+        // SAFETY: sets this thread's last error.
+        let stale = || unsafe { SetLastError(ERROR_INSUFFICIENT_BUFFER) };
+        let (mut wide, mut narrow) = ([0u16; 512], [0u8; 512]);
+
+        // What the host does, for one of its own modules.
+        let kernel32 = host::get_module_handle_w(w("kernel32.dll").as_ptr());
+        stale();
+        assert_ne!(GetModuleFileNameW(kernel32, wide.as_mut_ptr(), 512), 0);
+        assert_eq!(last_error(), 0, "the host, wide");
+        stale();
+        assert_ne!(GetModuleFileNameA(kernel32, narrow.as_mut_ptr(), 512), 0);
+        assert_eq!(last_error(), 0, "the host, narrow");
+
+        let base = 0x7200_0000_0000;
+        runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
+        let module = base as *mut c_void;
+        // Too small: the error says so, as before.
+        // SAFETY: this thread's last error.
+        unsafe { SetLastError(0) };
+        assert_eq!(GetModuleFileNameW(module, wide.as_mut_ptr(), 4), 4);
+        assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
+        // Then with room, the way titles grow their buffer until it fits.
+        assert_eq!(GetModuleFileNameW(module, wide.as_mut_ptr(), 512), 17);
+        assert_eq!(last_error(), 0, "a title image, wide");
+        stale();
+        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 512), 17);
+        assert_eq!(last_error(), 0, "a title image, narrow");
+        // An exact fit is whole too (17 characters and the NUL).
+        stale();
+        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 18), 17);
+        assert_eq!(last_error(), 0);
+        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 17), 17);
+        assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
+    }
+
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }
@@ -826,6 +878,28 @@ mod tests {
             // SAFETY: reads this thread's last error.
             let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_export_of_our_modules_sets_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: sets and reads this thread's last error.
+        let clear = || unsafe { SetLastError(0) };
+        // SAFETY: as above.
+        let last = || unsafe { GetLastError() };
+        // The host's own modules, for comparison.
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        clear();
+        assert!(GetProcAddress(kernel32, c"NotAnExport".as_ptr().cast()).is_null());
+        assert_eq!(last(), ERROR_PROC_NOT_FOUND);
+        // Ours, by name and by ordinal.
+        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        for name in [c"NotAnExport".as_ptr().cast(), 9999 as *const u8] {
+            clear();
+            assert!(GetProcAddress(runtime, name).is_null());
+            assert_eq!(last(), ERROR_PROC_NOT_FOUND, "{name:?}");
         }
     }
 }

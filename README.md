@@ -22,6 +22,58 @@ one PC, without giving up the picture. It is not there yet.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
+### This branch: their layer with our translator, and the defaults it runs with
+
+This tree is the RX 7900 XTX fork's layer (everything below) with the shader
+translator of our tree (PiloteCode's waves, `crates/victory-shader` as of
+wave 11): every one of the title's 25,953 programs translates and validates for
+a card of 32-lane waves too (NVIDIA), with paired forms of wave64 programs,
+geometry programs, linked mesh programs, dispatches past 65,535 groups split,
+thread-limited forms for dispatches by thread counts.
+
+`victory run` now plays with the switches `scripts\play.ps1` set, as its
+defaults (`apps/victory/src/defaults.rs`); a switch set in the environment
+keeps its value:
+
+| Switch | Default here | What it does |
+|---|---|---|
+| `VICTORY_THIN` | 1 | list calls written down, translated by eight threads of ours |
+| `VICTORY_JOIN_PARTS` | 8 | parts of submissions prepared as one |
+| `VICTORY_UPLOAD_AHEAD` | 1 | first texture uploads on a copy queue of their own |
+| `VICTORY_RELAY` | 2 | what shaders wrote comes back beside the guards, on a thread of its own |
+| `VICTORY_RELAY_COPY` | 1 | that fetch on a copy queue |
+| `VICTORY_WIDE_BACK` | 1 | (the layer's default too) |
+| `VICTORY_CARD_REHASH_RUNS` | 1 | card copies' hashes by runs |
+| `VICTORY_JOIN_COPIES` | 1 | copies of a submission joined |
+| `VICTORY_CARD_STEPS` | 2 | fills that need bytes on the card done on the card |
+| `VICTORY_INDIRECT_WINDOW` | 1 | indirect draws clamped a window at a time |
+| `VICTORY_INDIRECT_BATCH` | 2 | single-record executions clamped in batches, dispatches included |
+| `VICTORY_TEXTURE_NO_WAIT` | 1 | texture uploads wait for no mapping |
+| `VICTORY_SHOW_AFTER` | 1 | a slot shows a texture after its upload has run |
+| `VICTORY_MAP_THREADS` | 1 | pages mapped by the caller alone |
+| `VICTORY_TITLE_PRIORITIES` | 0 | the title's thread priorities as it sets them |
+| `VICTORY_CARD_AWAKE` | 1 | the card's clocks kept up between submissions |
+| `VICTORY_D3D12_DRED` | light | crash tracing that can stay on (diagnostics builds) |
+
+`VICTORY_PLAY_DEFAULTS=0` leaves every one at the layer's own default;
+`VICTORY_PLAY_DEFAULTS=safe` is the script's `-Safe` (no `THIN`, `JOIN_PARTS`,
+`UPLOAD_AHEAD`; `VICTORY_UNDER_WIDE=0`, `VICTORY_LAND_ECHO=0`). Not among them,
+and off unless set:
+
+- `VICTORY_AMBIENT=0.8`, the script's stand-in for the traced indirect light;
+- `VICTORY_BVH_BUILDER=1`, the ray-tracing structure builder (the script's
+  `-RayTracing`): its cost kept it off in our measurements; while it does not
+  run, the programs that walk its structures see an empty scene.
+
+On by the layer's own default, as in our tree: texture read-back into title
+memory (`VICTORY_TEXTURE_BACK=0` turns it off), linked mesh programs
+(`VICTORY_MESH_LINK=0`), textures made due again after DirectStorage writes
+(`VICTORY_PAGE_WRITES=guards` for the old way), a texture's own bytes ending
+only at a view written after its own (`VICTORY_OWN_BYTES=next` for the old way).
+Builds are made for x86-64-v3 (AVX2, which the title needs anyway;
+`.cargo/config.toml`), release and diag with thin LTO and one codegen unit
+(`Cargo.toml`).
+
 ## Where it stands (2026-11-25)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
@@ -65,6 +117,8 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+In this branch `target\diag\victory.exe run <exe> --execute` alone plays with the
+script's switches too (above), all but the stand-in light (`VICTORY_AMBIENT`).
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

@@ -61,23 +61,62 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
-    (b'X', X),
-    (b'Y', Y),
-    (0x26, UP), // arrows
-    (0x28, DOWN),
-    (0x25, LEFT),
-    (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
-    (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
+/// Where a control of the stand-in gamepad sits on the keyboard. Keys that
+/// are the same on every layout (Esc, Enter, arrows) are named by virtual
+/// key. The letters are named by their place on a US keyboard (scan code):
+/// a player on an AZERTY keyboard gets the same hand position, so the keys
+/// of W A S D are Z Q S D there, rather than letters that happen to match.
+#[derive(Clone, Copy)]
+enum Place {
+    Key(u8),
+    Scan(u32),
+}
+
+impl Place {
+    fn held(self, key: &KeyState) -> bool {
+        match self {
+            Place::Key(vk) => key.virtual_key == vk,
+            Place::Scan(scan) => key.scan_code == scan,
+        }
+    }
+}
+
+// Places named by the letter a US keyboard has there.
+const US_Q: Place = Place::Scan(0x10);
+const US_W: Place = Place::Scan(0x11);
+const US_E: Place = Place::Scan(0x12);
+const US_Y: Place = Place::Scan(0x15);
+const US_I: Place = Place::Scan(0x17);
+const US_A: Place = Place::Scan(0x1E);
+const US_S: Place = Place::Scan(0x1F);
+const US_D: Place = Place::Scan(0x20);
+const US_F: Place = Place::Scan(0x21);
+const US_H: Place = Place::Scan(0x23);
+const US_J: Place = Place::Scan(0x24);
+const US_K: Place = Place::Scan(0x25);
+const US_L: Place = Place::Scan(0x26);
+const US_Z: Place = Place::Scan(0x2C);
+const US_X: Place = Place::Scan(0x2D);
+const US_C: Place = Place::Scan(0x2E);
+
+/// The keyboard's stand-in gamepad (place, button); README lists it.
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C (US places).
+const FALLBACK_BUTTONS: [(Place, u32); 15] = [
+    (Place::Key(0x1B), MENU), // Esc
+    (Place::Key(0x09), VIEW), // Tab
+    (Place::Key(0x0D), A),    // Enter
+    (Place::Key(0x20), A),    // Space
+    (Place::Key(0x08), B),    // Backspace
+    (US_X, X),
+    (US_Y, Y),
+    (Place::Key(0x26), UP), // arrows
+    (Place::Key(0x28), DOWN),
+    (Place::Key(0x25), LEFT),
+    (Place::Key(0x27), RIGHT),
+    (US_Q, LEFT_SHOULDER),
+    (US_E, RIGHT_SHOULDER),
+    (US_F, LEFT_STICK),
+    (US_H, RIGHT_STICK),
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -108,16 +147,54 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
-    fn pad(&mut self, slot: usize) -> Option<PadState>;
+    fn pad(&mut self, slot: usize, looks: u64) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
-    fn keys(&mut self) -> Vec<KeyState>;
+    fn keys(&mut self, looks: u64) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// A press is reported until the title has taken this many current readings
+/// since it began: one would let the poll between a pad reading and a
+/// keyboard reading of the same frame drop it.
+const LATCH_LOOKS: u64 = 2;
+/// ... or this long, for a title that is not reading at all.
+const LATCH_MAX: Duration = Duration::from_secs(2);
+
+/// Presses kept until the title has looked.
+///
+/// The host is polled every [`POLL`] and the title takes the current reading
+/// once a frame. At a few frames a second a tap falls between two frames:
+/// the key or button is down and up again before the title looks, and the
+/// press is lost (seen in the world at about 350 ms a frame: three 60 ms
+/// taps of the menu key did nothing, a 1.5 s hold opened the menu). A press
+/// is therefore reported from when it begins until the title has looked
+/// [`LATCH_LOOKS`] times, even if it was released meanwhile.
+#[derive(Default)]
+struct Latch {
+    /// (key or button, looks when the press began, when it began)
+    held: Vec<(u32, u64, Instant)>,
+}
+
+impl Latch {
+    /// What to report as down: `down` now, plus presses the title has not
+    /// seen yet. `looks` counts successful reads from this input source.
+    fn report(&mut self, down: &[u32], looks: u64, now: Instant) -> Vec<u32> {
+        self.held.retain(|&(id, at, since)| {
+            down.contains(&id) || (looks < at + LATCH_LOOKS && now.duration_since(since) < LATCH_MAX)
+        });
+        for &id in down {
+            if !self.held.iter().any(|h| h.0 == id) {
+                self.held.push((id, looks, now));
+            }
+        }
+        self.held.iter().map(|h| h.0).collect()
+    }
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
+    let on = |place: Place| -> f32 {
+        if keys.iter().any(|k| place.held(k)) {
             1.0
         } else {
             0.0
@@ -126,14 +203,14 @@ fn fallback(keys: &[KeyState]) -> PadState {
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
+            .filter(|(place, _)| on(*place) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        left_trigger: on(US_Z),
+        right_trigger: on(US_C),
+        left_x: on(US_D) - on(US_A),
+        left_y: on(US_W) - on(US_S),
+        right_x: on(US_L) - on(US_J),
+        right_y: on(US_I) - on(US_K),
     }
 }
 
@@ -349,6 +426,11 @@ struct State {
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
+    /// Tokens currently delivering blocking enumeration on their registering thread.
+    enumerating: Vec<u64>,
+    /// Live events for tokens in `enumerating`, drained after initial enumeration
+    /// so `poll()` never overtakes or races with blocking enumeration.
+    deferred: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
 }
@@ -361,6 +443,9 @@ pub struct Hub {
     source: Mutex<Box<dyn Source>>,
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
+    /// Successful current readings per input source. The stand-in pad and
+    /// keyboard are two views of the same sampled keys.
+    looks: [AtomicU64; DEVICES],
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -393,10 +478,13 @@ impl Hub {
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             one_pad,
+            looks: Default::default(),
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
                 pending: Vec::new(),
+                enumerating: Vec::new(),
+                deferred: Vec::new(),
                 running: Vec::new(),
             }),
             returned: Condvar::new(),
@@ -432,8 +520,9 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let pads: [_; PADS] =
+                std::array::from_fn(|i| source.pad(i, self.looks[i].load(Ordering::Relaxed)));
+            (pads, source.keys(self.looks[KEYBOARD].load(Ordering::Relaxed)))
         };
         let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
         self.deliver(events);
@@ -536,12 +625,18 @@ impl State {
             } else {
                 (STATUS_CONNECTED, 0)
             };
-            events.extend(
-                self.callbacks
-                    .iter()
-                    .filter(|r| r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
-                    .map(|r| r.event(index, now, current, previous)),
-            );
+            for r in self
+                .callbacks
+                .iter()
+                .filter(|r| r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
+            {
+                let event = r.event(index, now, current, previous);
+                if self.enumerating.contains(&r.token) {
+                    self.deferred.push(event);
+                } else {
+                    events.push(event);
+                }
+            }
         }
     }
 }
@@ -555,10 +650,10 @@ fn host() -> Box<dyn Source> {
 fn host() -> Box<dyn Source> {
     struct Nothing;
     impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
+        fn pad(&mut self, _: usize, _: u64) -> Option<PadState> {
             None
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: u64) -> Vec<KeyState> {
             Vec::new()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
@@ -635,12 +730,13 @@ extern "system" fn current_reading(
             .history
             .back()
             .filter(|r| r.kind() & kind != 0)
+            .map(|r| (i, r))
     };
     let found = if device.is_null() {
         (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
             .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
+            .max_by_key(|(_, r)| r.timestamp)
     } else {
         match hub.index(device) {
             None => return fail(out, E_INVALIDARG),
@@ -651,13 +747,27 @@ extern "system" fn current_reading(
     tracing::trace!(
         kind = format_args!("{kind:#x}"),
         device = ?hub.index(device),
-        sequence = found.map(|r| r.sequence),
+        sequence = found.map(|(_, r)| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let hr = hand(out, found.map(|(_, r)| r));
+    if hr == S_OK && let Some((i, _)) = found {
+        let source = if i == FALLBACK { KEYBOARD } else { i };
+        hub.looks[source].fetch_add(1, Ordering::Relaxed);
+        // With one pad ([`one_pad`]) the stand-in is every host pad too: a
+        // read of it is a look at each, or a tap on a controller would stay
+        // down until the latch gave up (`LATCH_MAX`).
+        if i == FALLBACK && hub.one_pad {
+            for pad in 0..PADS {
+                hub.looks[pad].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    hr
 }
 
-/// The reading after (`forward`) or before `reference` on its device.
+/// The reading after (`forward`) or before `reference`: on `device`, or with
+/// none given on any device, in time order (ties by device, then sequence).
 fn relative(
     this: This,
     reference: *const Reading,
@@ -672,9 +782,6 @@ fn relative(
     let hub = hub(this);
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
-    // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; the title walks
-    // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
     };
@@ -682,27 +789,38 @@ fn relative(
         return fail(out, E_INVALIDARG);
     }
     let state = hub.state();
-    let history = &state.slots[index].history;
-    if history
+    if state.slots[index]
+        .history
         .front()
         .is_none_or(|oldest| reference.sequence < oldest.sequence)
     {
         return fail(out, REFERENCE_TOO_OLD);
     }
-    let wanted = |r: &&Ref| r.kind() & kind != 0;
-    let found = if forward {
-        history
-            .iter()
-            .filter(|r| r.sequence > reference.sequence)
-            .find(wanted)
+    // On one device this order is its sequence order.
+    let at = (reference.timestamp, index, reference.sequence);
+    let devices = if device.is_null() {
+        0..DEVICES
     } else {
-        history
-            .iter()
-            .rev()
-            .filter(|r| r.sequence < reference.sequence)
-            .find(wanted)
+        index..index + 1
     };
-    hand(out, found)
+    let candidates = devices
+        .flat_map(|i| {
+            let history = &state.slots[i].history;
+            history
+                .iter()
+                .map(move |r| ((r.timestamp, i, r.sequence), r))
+        })
+        .filter(|(_, r)| r.kind() & kind != 0);
+    let found = if forward {
+        candidates
+            .filter(|(key, _)| *key > at)
+            .min_by_key(|(key, _)| *key)
+    } else {
+        candidates
+            .filter(|(key, _)| *key < at)
+            .max_by_key(|(key, _)| *key)
+    };
+    hand(out, found.map(|(_, r)| r))
 }
 extern "system" fn next_reading(
     this: This,
@@ -789,12 +907,17 @@ extern "system" fn register_device(
         context: context as usize,
         callback,
     };
-    let mut found = Vec::new();
+    if !out.is_null() {
+        // SAFETY: checked non-null. Write before inserting the callback so no
+        // invocation can observe an unset token.
+        unsafe { out.write(registration.token) };
+    }
+    let mut batch = Vec::new();
     {
         let mut state = hub.state();
         if enumeration != 0 && status & STATUS_CONNECTED != 0 {
             let now = now();
-            found = (0..DEVICES)
+            batch = (0..DEVICES)
                 .filter(|&i| state.slots[i].connected && registration.matches(&hub.devices, i))
                 .map(|i| registration.event(i, now, STATUS_CONNECTED, 0))
                 .collect();
@@ -802,19 +925,43 @@ extern "system" fn register_device(
         tracing::info!(
             kind = format_args!("{kind:#x}"),
             enumeration,
-            devices = found.len(),
+            devices = batch.len(),
             "input device callback"
         );
         state.callbacks.push(registration);
         if enumeration == ASYNC_ENUMERATION {
-            state.pending.append(&mut found);
+            state.pending.append(&mut batch);
+        } else if !batch.is_empty() {
+            state.enumerating.push(registration.token);
         }
     }
-    if !out.is_null() {
-        // SAFETY: checked non-null.
-        unsafe { out.write(registration.token) };
+    if !batch.is_empty() {
+        loop {
+            hub.deliver(batch);
+            let mut state = hub.state();
+            let mut next = Vec::new();
+            let mut keep = Vec::with_capacity(state.deferred.len());
+            for e in state.deferred.drain(..) {
+                if e.registration.token == registration.token {
+                    next.push(e);
+                } else {
+                    keep.push(e);
+                }
+            }
+            state.deferred = keep;
+            if next.is_empty() || !state.callbacks.iter().any(|c| c.token == registration.token) {
+                if let Some(i) = state
+                    .enumerating
+                    .iter()
+                    .position(|&t| t == registration.token)
+                {
+                    state.enumerating.swap_remove(i);
+                }
+                break;
+            }
+            batch = next;
+        }
     }
-    hub.deliver(found);
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
@@ -832,6 +979,7 @@ fn forget(this: This, token: u64) {
     let mut state = hub(this).state();
     state.callbacks.retain(|r| r.token != token);
     state.pending.retain(|e| e.registration.token != token);
+    state.deferred.retain(|e| e.registration.token != token);
 }
 extern "system" fn stop_callback(this: This, token: u64) {
     forget(this, token);
@@ -966,7 +1114,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     if one_pad {
         // The one pad is every host pad.
         for slot in 0..PADS {
-            if source.pad(slot).is_some() {
+            if source.pad(slot, device.hub().looks[slot].load(Ordering::Relaxed)).is_some() {
                 source.rumble(slot, speed(low), speed(high));
             }
         }
@@ -1060,14 +1208,16 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
-        Value::Pad(state) if !out.is_null() => {
-            // SAFETY: checked non-null.
-            unsafe { out.write(*state) };
-            true
-        }
-        _ => false,
+    if out.is_null() {
+        return false;
     }
+    let (state, is_gamepad) = match &reading(this).value {
+        Value::Pad(state) => (*state, true),
+        Value::Keys(_) => (PadState::default(), false),
+    };
+    // SAFETY: the title passes writable storage for the state.
+    unsafe { out.write(state) };
+    is_gamepad
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
@@ -1177,10 +1327,14 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Key presses the title has not seen yet ([`Latch`]).
+        keys: Latch,
+        /// Button presses, per pad.
+        buttons: [Latch; PADS],
     }
 
     impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize, looks: u64) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1193,13 +1347,28 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            // A button tapped between two of the title's looks stays down
+            // until it has looked.
+            let down: Vec<u32> = (0..32).filter(|bit| pad.buttons & (1 << bit) != 0).collect();
+            pad.buttons = self.buttons[slot]
+                .report(&down, looks, Instant::now())
+                .into_iter()
+                .fold(0, |all, bit| all | (1 << bit));
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    let key = KeyState {
+                        // SAFETY: plain query.
+                        scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                        virtual_key: vk,
+                        ..Default::default()
+                    };
+                    if let Some(&(_, button)) =
+                        super::FALLBACK_BUTTONS.iter().find(|(place, _)| place.held(&key))
+                    {
                         pad.buttons |= button;
                     }
                 }
@@ -1207,7 +1376,7 @@ mod host {
             Some(pad)
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, looks: u64) -> Vec<KeyState> {
             let mut down = scripted();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
@@ -1217,7 +1386,15 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
-                down.extend(held);
+                // A key tapped between two of the title's looks stays down
+                // until it has looked.
+                let held: Vec<u32> = held.into_iter().map(u32::from).collect();
+                let latched = self.keys.report(&held, looks, Instant::now());
+                for vk in latched.into_iter().map(|vk| vk as u8) {
+                    if !down.contains(&vk) {
+                        down.push(vk);
+                    }
+                }
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1335,10 +1512,10 @@ mod tests {
     struct Fake(Arc<Mutex<FakeHost>>);
 
     impl Source for Fake {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize, _: u64) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: u64) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1357,12 +1534,26 @@ mod tests {
         (hub, host)
     }
 
-    fn key(virtual_key: u8) -> KeyState {
+    fn key_at(virtual_key: u8, scan_code: u32) -> KeyState {
         KeyState {
-            scan_code: u32::from(virtual_key) + 0x100,
+            scan_code,
             virtual_key,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_stand_in_pad_follows_key_places_not_letters() {
+        // AZERTY: Z is where a US keyboard has W, Q where it has A, W where
+        // it has Z.
+        let pad = fallback(&[key_at(b'Z', 0x11), key_at(b'Q', 0x1E), key_at(b'W', 0x2C)]);
+        assert_eq!((pad.left_y, pad.left_x, pad.left_trigger), (1.0, -1.0, 1.0));
+        // A is where a US keyboard has Q: the left shoulder, not a stick.
+        let pad = fallback(&[key_at(b'A', 0x10)]);
+        assert_eq!((pad.buttons, pad.left_x), (LEFT_SHOULDER, 0.0));
+        // Keys that are the same on every layout go by virtual key.
+        assert_eq!(fallback(&[key_at(0x20, 0x39)]).buttons, A);
+        assert_eq!(fallback(&[key_at(0x1B, 0x01)]).buttons, MENU);
     }
 
     fn slot<F: Copy, T>(object: *const T, offset: usize) -> F {
@@ -1476,6 +1667,28 @@ mod tests {
     }
 
     #[test]
+    fn only_successful_reads_from_the_input_source_count_toward_a_tap() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        let mut latch = Latch::default();
+        let keyboard_reads = || hub.looks[KEYBOARD].load(Ordering::Relaxed);
+        let now = Instant::now();
+        assert_eq!(latch.report(&[27], keyboard_reads(), now), [27]);
+        for _ in 0..2 {
+            assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+            release(current(hub, GAMEPAD_KIND, 1).unwrap());
+        }
+        assert_eq!(latch.report(&[], keyboard_reads(), now + POLL), [27]);
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        release(current(hub, GAMEPAD_KIND, FALLBACK).unwrap());
+        assert_eq!(latch.report(&[], keyboard_reads(), now + POLL), [27]);
+        release(current(hub, KEYBOARD_KIND, KEYBOARD).unwrap());
+        assert!(latch.report(&[], keyboard_reads(), now + POLL * 2).is_empty());
+    }
+
+    #[test]
     fn pads_connect_report_and_disconnect() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1537,13 +1750,68 @@ mod tests {
     }
 
     #[test]
+    fn with_no_device_readings_are_walked_across_devices_in_time_order() {
+        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+        let any = |hub: &Hub, offset, from, kind| {
+            let mut out = std::ptr::null();
+            let walk = slot::<Walk, _>(&hub.object, offset);
+            result(
+                walk(&hub.object, from, kind, std::ptr::null(), &mut out),
+                out,
+            )
+        };
+        let both = GAMEPAD_KIND | KEYBOARD_KIND;
+        let tick = || std::thread::sleep(Duration::from_millis(2));
+        let (hub, host) = fake();
+        // The first poll: the stand-in pad and the keyboard, at one time.
+        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let no_keys = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        tick();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
+        tick();
+        // A key that is no control of the stand-in pad: the keyboard also
+        // drives the first connected pad, which would add a reading of it.
+        host.lock().unwrap().keys = vec![key_at(b'M', 0x32)];
+        hub.poll();
+        let w = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        tick();
+        host.lock().unwrap().pads[1].as_mut().unwrap().buttons = B;
+        hub.poll();
+        let pad_b = current(hub, GAMEPAD_KIND, 1).unwrap();
+
+        let order = [stand_in, no_keys, pad_a, w, pad_b];
+        for pair in order.windows(2) {
+            assert_eq!(any(hub, 0x28, pair[0], both), Ok(pair[1]));
+            assert_eq!(any(hub, 0x30, pair[1], both), Ok(pair[0]));
+        }
+        assert_eq!(any(hub, 0x30, stand_in, both), Err(READING_NOT_FOUND));
+        assert_eq!(any(hub, 0x28, pad_b, both), Err(READING_NOT_FOUND));
+        // Only gamepads: the keyboard's readings are skipped.
+        assert_eq!(any(hub, 0x28, stand_in, GAMEPAD_KIND), Ok(pad_a));
+        assert_eq!(any(hub, 0x28, pad_a, GAMEPAD_KIND), Ok(pad_b));
+        assert_eq!(any(hub, 0x30, pad_a, GAMEPAD_KIND), Ok(stand_in));
+        // Naming the device keeps the walk on it.
+        assert_eq!(walk(hub, 0x30, pad_a), Err(READING_NOT_FOUND));
+        for r in order {
+            release(r);
+        }
+    }
+
+    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        let keys = vec![
+            key_at(b'W', 0x11),
+            key_at(0x0D, 0x1C),
+            key_at(b'L', 0x26),
+            key_at(b'C', 0x2E),
+        ];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
@@ -1557,8 +1825,9 @@ mod tests {
         release(r);
 
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let mut state = pad(r);
         assert_eq!(
-            pad(r),
+            state,
             PadState {
                 buttons: A,
                 left_y: 1.0,
@@ -1570,6 +1839,11 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let get = slot::<extern "system" fn(*const Reading, *mut PadState) -> bool, _>(r, 0xb0);
+        assert!(!get(r, &mut state));
+        assert_eq!(state, PadState::default());
+        release(r);
     }
 
     #[test]
@@ -1582,7 +1856,7 @@ mod tests {
             Value::Pad(p) => *p,
             Value::Keys(_) => unreachable!(),
         };
-        host.lock().unwrap().keys = vec![key(b'D')];
+        host.lock().unwrap().keys = vec![key_at(b'D', 0x20)];
         hub.poll();
         assert_eq!(pad(hub).left_x, 1.0);
         // A pad is switched on, in any slot: its input arrives, beside the
@@ -1705,5 +1979,154 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn blocking_enumeration_writes_token_first_and_orders_concurrent_poll() {
+        struct Context {
+            hub: &'static Hub,
+            host: Arc<Mutex<FakeHost>>,
+            owner: ThreadId,
+            token_slot: *const u64,
+            triggered: std::sync::atomic::AtomicBool,
+            seen_token: AtomicU64,
+            on_owner_during_enum: std::sync::atomic::AtomicBool,
+            events: Log,
+        }
+
+        extern "system" fn ordered(
+            token: u64,
+            context: *mut c_void,
+            device: *const Device,
+            _timestamp: u64,
+            current: u32,
+            previous: u32,
+        ) {
+            // SAFETY: `Context` outlives `register_device` and all polls in this test.
+            let ctx = unsafe { &*(context as *const Context) };
+            // SAFETY: one of the hub's static devices.
+            let index = unsafe { (*device).index };
+            if !ctx.triggered.swap(true, Ordering::SeqCst) {
+                let on_owner = std::thread::current().id() == ctx.owner;
+                ctx.on_owner_during_enum.store(on_owner, Ordering::SeqCst);
+                // SAFETY: written on the owner thread before registration.
+                let written = unsafe { *ctx.token_slot };
+                ctx.seen_token.store(written, Ordering::SeqCst);
+                assert_eq!(written, token);
+
+                // Trigger a concurrent `poll()` on another thread while blocking
+                // enumeration is in progress: it must defer, not overtake or race.
+                ctx.host.lock().unwrap().pads[1] = Some(PadState::default());
+                let hub = ctx.hub;
+                std::thread::spawn(move || hub.poll()).join().unwrap();
+                // Nothing from the concurrent poll may have run ahead of us.
+                assert!(ctx.events.lock().unwrap().is_empty());
+            }
+            ctx.events.lock().unwrap().push((index, current, previous));
+        }
+
+        let (hub, host) = fake();
+        let mut token = 0u64;
+        let ctx = Context {
+            hub,
+            host: Arc::clone(&host),
+            owner: std::thread::current().id(),
+            token_slot: &raw const token,
+            triggered: std::sync::atomic::AtomicBool::new(false),
+            seen_token: AtomicU64::new(0),
+            on_owner_during_enum: std::sync::atomic::AtomicBool::new(false),
+            events: Log::default(),
+        };
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let register_fn = slot::<Register, _>(&hub.object, 0x48);
+        let hr = register_fn(
+            &hub.object,
+            std::ptr::null(),
+            GAMEPAD_KIND,
+            STATUS_CONNECTED,
+            2,
+            (&raw const ctx).cast_mut().cast(),
+            Some(ordered),
+            &mut token,
+        );
+        assert_eq!(hr, S_OK);
+        assert_ne!(token, 0);
+        assert_eq!(ctx.seen_token.load(Ordering::SeqCst), token);
+        assert!(ctx.on_owner_during_enum.load(Ordering::SeqCst));
+        assert_eq!(
+            *ctx.events.lock().unwrap(),
+            [
+                (FALLBACK, STATUS_CONNECTED, 0),
+                (1, STATUS_CONNECTED, 0),
+                (FALLBACK, 0, STATUS_CONNECTED),
+            ]
+        );
+
+        // Once blocking enumeration finishes, subsequent polls deliver directly.
+        host.lock().unwrap().pads[1] = None;
+        std::thread::spawn(move || hub.poll()).join().unwrap();
+        assert_eq!(
+            ctx.events.lock().unwrap()[3..],
+            [(1, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod latch_tests {
+    use super::*;
+
+    /// A tap that ends before the title looks is still reported, until the
+    /// title has looked [`LATCH_LOOKS`] times.
+    #[test]
+    fn a_tap_between_two_looks_is_kept_until_the_title_has_looked() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        // Down at look 10, up 8 ms later with the title not having looked.
+        assert_eq!(latch.report(&[27], 10, t), [27]);
+        assert_eq!(latch.report(&[], 10, t + POLL), [27]);
+        // One look: still down (a second reading of the same frame may follow).
+        assert_eq!(latch.report(&[], 11, t + POLL * 2), [27]);
+        // Two looks: released.
+        assert!(latch.report(&[], 12, t + POLL * 3).is_empty());
+    }
+
+    /// A held key stays down however often the title looks, and is released
+    /// as soon as it is let go once the title has seen it.
+    #[test]
+    fn a_held_key_is_down_while_held_and_no_longer() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[65], 0, t), [65]);
+        assert_eq!(latch.report(&[65], 50, t + Duration::from_secs(5)), [65]);
+        assert!(latch.report(&[], 50, t + Duration::from_secs(5) + POLL).is_empty());
+    }
+
+    /// With a title that does not look, a tap is not held for ever.
+    #[test]
+    fn a_tap_is_dropped_after_a_while_without_looks() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[13], 3, t), [13]);
+        assert_eq!(latch.report(&[], 3, t + LATCH_MAX / 2), [13]);
+        assert!(latch.report(&[], 3, t + LATCH_MAX + POLL).is_empty());
+    }
+
+    /// Presses are kept apart: one tap ending does not end another key's hold.
+    #[test]
+    fn keys_are_latched_one_by_one() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[1, 2], 0, t), [1, 2]);
+        assert_eq!(latch.report(&[2], 2, t + POLL), [2]);
     }
 }

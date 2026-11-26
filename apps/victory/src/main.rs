@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod defaults;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
@@ -193,6 +194,11 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // The switches the title is played with, before anything reads them
+    // (`defaults`).
+    if std::env::args().nth(1).as_deref() == Some("run") {
+        defaults::apply();
+    }
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
