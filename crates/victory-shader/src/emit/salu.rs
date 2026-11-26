@@ -504,9 +504,13 @@ impl Lower<'_> {
 
     pub(super) fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
-        match self.get(v)? {
-            Val::Bit(x) => Ok(x),
-            _ => Err("SCC without a value"),
+        match self.get(v) {
+            Ok(Val::Bit(x)) => Ok(x),
+            Ok(_) => Err("SCC without a value"),
+            // Of a mask operation whose result lies within EXEC: whether some lane is left
+            // (`upscaler`).
+            Err(LANE_MASK) if self.within_exec(v) => self.scc_some(v),
+            Err(why) => Err(why),
         }
     }
 }

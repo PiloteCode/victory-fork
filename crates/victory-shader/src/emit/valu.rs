@@ -37,6 +37,10 @@ impl Lower<'_> {
             self.lane(inst, Some(true));
             return Ok(());
         }
+        // One lane of what a whole-wave section left (`upscaler`).
+        if let Some((w, shape)) = self.section_read(inst, b, i) {
+            return self.section_read_value(w, shape);
+        }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
             let r = if v.dpp.is_some() {
                 Err("a compare with DPP")

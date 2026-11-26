@@ -3,7 +3,8 @@
 //! module of the lowering so it shares the emitter's state. No program of the title's shader
 //! archive runs them: none of their translations changes with these.
 
-use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why};
+use super::super::wave::Shape;
+use super::{Attr, Bin, Cast, EXEC, Fields, Inst, Lower, Operand, Reg, V, Val, Value, Why};
 
 /// `dx.op.dot4AddPacked.i32` (SM 6.4): an accumulator plus the dot product of the four signed
 /// bytes of two dwords, wrapping.
@@ -70,6 +71,54 @@ impl Lower<'_> {
     fn dot4_add(&mut self, acc: V, a: V, b: V) -> V {
         let i32t = self.s.t.i32;
         self.s.op(self.cur, "dot4AddPacked.i32", Attr::ReadNone, i32t, DOT4_ADD_I8_PACKED, &[acc, a, b])
+    }
+
+    /// Whether the mask operation that sets the SCC value `scc` gives no lane outside EXEC a
+    /// bit (it writes EXEC, or a mask the lanes' paths know as one within EXEC): its SCC as a
+    /// number is then "some lane of the wave is left" (`scc_some`), as the upscaler's programs
+    /// read it (a loop that waits for other groups until every lane saw its flag, or after
+    /// enough rounds; 389db9efb).
+    pub(super) fn within_exec(&self, scc: Value) -> bool {
+        let Some(&b) = self.def_block.get(&scc) else {
+            return false;
+        };
+        let by = self.x.p.blocks[b].insts.iter().find(|i| i.write(Reg::Scc) == Some(scc));
+        by.is_some_and(|i| {
+            i.write(Reg::S(EXEC)).is_some()
+                || matches!(&i.fields, Fields::Sop { dst: Some(Operand::Scalar { code, .. }), .. }
+                    if i.write(Reg::S(*code)).is_some_and(|lo| self.x.st.active.contains(&lo)))
+        })
+    }
+
+    /// For a `v_readlane_b32` (instruction `i` of block `b`) of one lane of a VGPR a
+    /// whole-wave section earlier in the block left, where that lane holds a value of the wave
+    /// ([`super::super::wave::Section::reads`]): the scalar it writes and that value's shape.
+    pub(super) fn section_read(&self, inst: &Inst, b: usize, i: usize) -> Option<(Value, Shape)> {
+        if inst.name() != "v_readlane_b32" {
+            return None;
+        }
+        let &(_, w) = inst.writes.first()?;
+        let sections = self.sections.get(&b)?;
+        sections.values().filter(|s| s.end < i).find_map(|s| s.reads.get(&w).copied()).map(|sh| (w, sh))
+    }
+
+    /// [`Self::section_read`] lowered: the value over the wave's lanes (in the paired form,
+    /// both lanes of every thread, as [`Self::paired_section_inst`] makes it).
+    pub(super) fn section_read_value(&mut self, w: Value, shape: Shape) -> Result<(), Why> {
+        if self.twin.is_none() {
+            let x = self.shape(shape, false)?;
+            self.vals.insert(w, Val::I32(x));
+            return Ok(());
+        }
+        let made = match shape {
+            Shape::Active(..) | Shape::Prefix(..) | Shape::Sum64 { .. } => self.paired_shape(shape),
+            _ => self.both(|l| l.shape(shape, false)),
+        };
+        match made {
+            Ok([lo, hi]) => self.put_lanes(w, Val::I32(lo), Val::I32(hi)),
+            Err(why) => self.put_lanes(w, Val::Missing(why), Val::Missing(why)),
+        }
+        Ok(())
     }
 
     /// The operand `src_scc` of a vector instruction: SCC as 0 or 1.

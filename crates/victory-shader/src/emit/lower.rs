@@ -5395,6 +5395,13 @@ impl<'a> Lower<'a> {
             self.mirror(inst);
             return Ok(());
         }
+        // One lane of what a whole-wave section left (`upscaler`).
+        if let Some((w, shape)) = self.section_read(inst, b, i) {
+            if let Err(why) = self.section_read_value(w, shape) {
+                self.put_lanes(w, Val::Missing(why), Val::Missing(why));
+            }
+            return Ok(());
+        }
         let cross = match name {
             "v_readlane_b32" | "ds_bpermute_b32" => true,
             // (not a waterfall loop's read, the lane's own dword: `Self::valu`)
