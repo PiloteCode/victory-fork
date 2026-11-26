@@ -57,6 +57,9 @@ memory (`VICTORY_TEXTURE_BACK=0` turns it off), linked mesh programs
 (`VICTORY_MESH_LINK=0`), textures made due again after DirectStorage writes
 (`VICTORY_PAGE_WRITES=guards` for the old way), a texture's own bytes ending
 only at a view written after its own (`VICTORY_OWN_BYTES=next` for the old way).
+Builds are made for x86-64-v3 (AVX2, which the title needs anyway;
+`.cargo/config.toml`), release and diag with thin LTO and one codegen unit
+(`Cargo.toml`).
 
 ## Where it stands (2026-11-25)
 
