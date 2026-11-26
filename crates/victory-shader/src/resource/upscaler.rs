@@ -1,8 +1,11 @@
-//! A buffer descriptor made raw before byte accesses, as the FidelityFX
-//! upscaler's compiler does (after avatarmanz's translator, 66afb2b4).
+//! Descriptor forms only the FidelityFX upscaler's compiler makes (its
+//! programs come in `ACCC` parts, see `native::fspx`): a buffer descriptor
+//! made raw before byte accesses, immediate sampler words built with a bit
+//! mask or a 64-bit move. After avatarmanz's translator (66afb2b4).
 
-use super::{Term, Tracer};
-use crate::ir::Value;
+use super::{Term, Tracer, inline};
+use crate::gfx10::{Fields, Operand};
+use crate::ir::{Inst, Value};
 
 /// `s_bfe_u32`'s field operand for a buffer descriptor's stride: offset 16,
 /// width 14 (dword 1 bits 16-29).
@@ -49,12 +52,54 @@ impl Tracer<'_> {
     }
 }
 
+/// Dword `k` of the constant the upscaler's compiler makes an immediate sampler's word with,
+/// where no other copy of a constant does: a mask of S0 bits from bit S1 (`s_bfm_b32` of two
+/// inline constants), and a 64-bit move of a literal below 2^31 (its high dword 0 whether the
+/// hardware extends it with zeros or with its sign).
+pub(super) fn copied_constant(inst: &Inst, k: usize) -> Option<u32> {
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    match (inst.name(), k, &src[..]) {
+        ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) => {
+            let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+            Some(((1u32 << w) - 1) << at)
+        }
+        ("s_mov_b64", _, [Operand::Literal(x)]) if x >> 31 == 0 => Some(if k == 0 { *x } else { 0 }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ShaderError;
     use crate::native::{HwStage, RootParam, RootType};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// Immediate sampler words the upscaler's compiler makes with a bit mask and a 64-bit
+    /// move of a literal.
+    #[test]
+    fn sampler_words_from_bit_masks_and_wide_literals_are_constants() {
+        let code: Vec<u8> = [
+            0xB010_3092, // s_movk_i32 s16, 0x3092
+            0x9211_8C8C, // s_bfm_b32 s17, 12, 12
+            0xBE92_04FF,
+            0x1850_0000, // s_mov_b64 s[18:19], 0x18500000
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let block = &p.blocks[0];
+        let copied = |n: usize, k: usize| super::copied_constant(&block.insts[n], k);
+        assert_eq!(copied(1, 0), Some(0x00FF_F000));
+        assert_eq!(copied(2, 0), Some(0x1850_0000));
+        assert_eq!(copied(2, 1), Some(0));
+        // (s_movk_i32 is folded where it was)
+        assert_eq!(copied(0, 0), None);
+    }
 
     /// The upscaler's byte accesses make a loaded buffer descriptor raw
     /// first (stride cleared, records times stride, bounds in bytes): the

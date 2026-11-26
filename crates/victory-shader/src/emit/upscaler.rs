@@ -4,7 +4,10 @@
 //! archive runs them: none of their translations changes with these.
 
 use super::super::wave::Shape;
-use super::{Attr, Bin, Cast, EXEC, Fields, Inst, Lower, Operand, Reg, V, Val, Value, Why};
+use super::{
+    Attr, Bin, Cast, EXEC, Fields, Inst, Lower, Operand, Reg, Role, Site, Source, V, Val, Value,
+    Why,
+};
 
 /// `dx.op.dot4AddPacked.i32` (SM 6.4): an accumulator plus the dot product of the four signed
 /// bytes of two dwords, wrapping.
@@ -119,6 +122,101 @@ impl Lower<'_> {
             Err(why) => self.put_lanes(w, Val::Missing(why), Val::Missing(why)),
         }
         Ok(())
+    }
+
+    /// Whether the image `src` names is one of 32-bit integers (one channel): the program has
+    /// an integer atomic of one channel on the same table entry, which takes no other view
+    /// (the upscaler counts its groups in a texture so, 389db9ef).
+    pub(super) fn is_counter(&self, src: &Source) -> bool {
+        let entry = |s: &Source| match s {
+            Source::Loaded { load, first } => self
+                .scalar
+                .get(load)
+                .filter(|a| a.dynamic.is_none())
+                .map(|a| (a.param, a.offset + 4 * u32::from(*first))),
+            _ => None,
+        };
+        let Some(this) = entry(src) else {
+            return false;
+        };
+        self.x.res.descriptors.iter().any(|d| {
+            let i = &self.x.p.blocks[d.site.0].insts[d.site.1];
+            d.role == Role::Resource
+                && matches!(i.fields, Fields::Image { dmask: 1, .. })
+                && matches!(
+                    i.name(),
+                    "image_atomic_add"
+                        | "image_atomic_sub"
+                        | "image_atomic_and"
+                        | "image_atomic_or"
+                        | "image_atomic_xor"
+                        | "image_atomic_smin"
+                        | "image_atomic_smax"
+                        | "image_atomic_umin"
+                        | "image_atomic_umax"
+                )
+                && entry(&d.source) == Some(this)
+        })
+    }
+
+    /// An image store of one channel into a counter ([`Self::is_counter`]) of dimension
+    /// `kind` at coordinates `cs`, the value in VGPR `reg` (16 bits with `d16`): through the
+    /// view the atomics take, 32-bit integers. All four channels are written (the validator
+    /// wants them all): the view has the first alone.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn counter_store(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        src: &Source,
+        kind: u32,
+        cs: Vec<V>,
+        reg: u8,
+        d16: bool,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let v = inst.read(Reg::V(reg)).ok_or("image store data")?;
+        let x = self.i32_of(v)?;
+        // A 16-bit integer, extended by the view's sign: the same number either way only if
+        // it is known to be small.
+        if d16 && !self.s.m.int_value(x).is_some_and(|k| (0..0x8000).contains(&k)) {
+            return Err("a 16-bit image store of one channel");
+        }
+        let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+        let at = self.begin_guarded(guard);
+        let mut args = vec![h];
+        args.extend(cs);
+        args.extend([x; 4]);
+        args.push(self.s.m.i8(0xF));
+        let void = self.s.t.void;
+        self.s.op(self.cur, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Half `high` of source `k` of `v_pk_fmac_f16`, in the low 16 bits: a VOP2 operation
+    /// (no op_sel), each half from its own half, whose third source is its destination
+    /// (66afb2b4).
+    pub(super) fn fmac_half(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = if k == 2 { v.dst } else { v.src.get(k).copied() };
+        let op = op.ok_or("a missing operand")?;
+        if matches!(op, Operand::Const(_) | Operand::Literal(_)) {
+            // shortcut: no constant operand seen; what its high half is is not known.
+            return Err("a constant operand of v_pk_fmac_f16");
+        }
+        let x = self.operand(inst, &op)?;
+        let c = self.cur;
+        let x = if high {
+            let k16 = self.s.m.i32(16);
+            self.s.m.bin(c, Bin::LShr, x, k16)
+        } else {
+            x
+        };
+        let m = self.s.m.i32(0xFFFF);
+        Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
     /// The operand `src_scc` of a vector instruction: SCC as 0 or 1.

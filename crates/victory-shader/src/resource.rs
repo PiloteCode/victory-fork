@@ -18,7 +18,7 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Meets, Structured};
 
-mod raw;
+mod upscaler;
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
@@ -1170,7 +1170,7 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // A buffer descriptor made raw for byte accesses ([`raw`]).
+        // A buffer descriptor made raw for byte accesses ([`upscaler`]).
         if !inst.name().contains("format")
             && let Some(raw) = self.made_raw(&words)
         {
@@ -2384,6 +2384,9 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     };
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
+    }
+    if let Some(k) = upscaler::copied_constant(inst, k) {
+        return Some(Moved::Const(k));
     }
     let src = src.first()?;
     match (inst.name(), *src) {
