@@ -1656,6 +1656,18 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         split(base, len);
         view = map_view();
     }
+    // Unmapping one-page views leaves a placeholder each, and one view of
+    // several pages needs a single placeholder of its size: the range is
+    // joined into one and tried once more (fxceless#1060 by gmanka, our
+    // 7fbde388).
+    if view.Value as usize != base && len > PAGE {
+        const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+        // SAFETY: acts only on placeholders in the title's reservation.
+        let joined = unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) } != 0;
+        if joined {
+            view = map_view();
+        }
+    }
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -2102,6 +2114,16 @@ mod tests {
         assert!(map_alias(b as u64, 0, PAGE as u64));
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
+
+        // The first two slots at b now have separate placeholders after
+        // unmap. A contiguous replacement must join them before mapping.
+        assert!(write_physical(&pages[1..2], 0, &[42]));
+        assert_eq!(XMemMapPhysicalPages(b, 2, pages.as_ptr()), b);
+        // SAFETY: the two pages were just mapped read-write.
+        unsafe {
+            assert_eq!(b.cast::<u8>().read(), 1);
+            assert_eq!(at(b, 1).cast::<u8>().read(), 42);
+        }
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
