@@ -217,6 +217,9 @@ impl Lower<'_> {
         if let Some(r) = self.valu_official(inst, name, guard) {
             return r;
         }
+        if let Some(r) = self.valu_upscaler(inst, name, guard) {
+            return r;
+        }
         match name {
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out

@@ -118,6 +118,11 @@ mod export;
 #[path = "official.rs"]
 mod official;
 
+/// Forms only the FidelityFX upscaler's compiler makes (byte dot products, `src_scc`), a
+/// child module so it shares the emitter's state.
+#[path = "upscaler.rs"]
+mod upscaler;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -3812,6 +3817,7 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.source(v)
             }
+            Operand::Const(upscaler::SRC_SCC) => self.src_scc(inst),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),

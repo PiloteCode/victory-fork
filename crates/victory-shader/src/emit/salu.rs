@@ -502,7 +502,7 @@ impl Lower<'_> {
         (r, carry)
     }
 
-    fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
+    pub(super) fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
         match self.get(v)? {
             Val::Bit(x) => Ok(x),
