@@ -67,9 +67,10 @@ and off unless set:
 
 On by the layer's own default, as in our tree: texture read-back into title
 memory (`VICTORY_TEXTURE_BACK=0` turns it off), linked mesh programs
-(`VICTORY_MESH_LINK=0`), textures made due again after DirectStorage writes
-(`VICTORY_PAGE_WRITES=guards` for the old way), a texture's own bytes ending
-only at a view written after its own (`VICTORY_OWN_BYTES=next` for the old way).
+(`VICTORY_MESH_LINK=0`). Off unless asked for: textures made due again after
+DirectStorage writes (`VICTORY_PAGE_WRITES=1`) and such a write naming the
+textures behind views the title wrote before (`VICTORY_OWN_BYTES=newer`); the
+levels a texture holds always end at the next texture placed inside it.
 Builds are made for x86-64-v3 (AVX2, which the title needs anyway;
 `.cargo/config.toml`), release and diag with thin LTO and one codegen unit
 (`Cargo.toml`).
