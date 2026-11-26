@@ -875,6 +875,24 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
         line.push_str(&format!("\t{name}={n}"));
     }
+    // 16-bit typed buffer accesses (d16), 16-bit image accesses, and the table places the
+    // program moves halves through as integers (`HostShader::half_views`, #927).
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let d16 = insts()
+        .filter(|i| i.name().starts_with("buffer_") && i.name().contains("_format_d16_"))
+        .count();
+    let d16_image = insts()
+        .filter(|i| matches!(i.fields, Fields::Image { d16: true, .. }))
+        .count();
+    // Of those, the loads and stores (no sampler: the ones that can name an integer view).
+    let d16_image_load = insts()
+        .filter(|i| matches!(i.fields, Fields::Image { d16: true, .. }))
+        .filter(|i| i.name().starts_with("image_load") || i.name().starts_with("image_store"))
+        .count();
+    line.push_str(&format!(
+        "\tc_d16={d16}\tc_d16_image={d16_image}\tc_d16_image_load={d16_image_load}\thalf_views={}",
+        shader.half_views.len()
+    ));
     line.push('\n');
     let _ = lock(out).write_all(line.as_bytes());
 }

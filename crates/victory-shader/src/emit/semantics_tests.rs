@@ -313,6 +313,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     })
 }
 
@@ -555,6 +556,12 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// Runs probes on the hardware adapter and WARP; returns the failures
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
+    check_each(probes).into_iter().map(|(f, _)| f).collect()
+}
+
+/// [`check`]'s failures, each with whether only the card is off: WARP gives the model's
+/// results and the hardware adapter does not (a driver's rewrite of what the program says).
+fn check_each(probes: &[Probe]) -> Vec<(String, bool)> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
         .into_iter()
@@ -570,7 +577,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{what}: not lowered: {e}");
-                failures.push(format!("{what}: not lowered: {e}"));
+                failures.push((format!("{what}: not lowered: {e}"), false));
                 continue;
             }
         };
@@ -578,7 +585,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
             && let Err(e) = val.validate(&mut shader.dxil.clone())
         {
             eprintln!("{what}: invalid DXIL: {e}");
-            failures.push(format!("{what}: invalid DXIL: {e}"));
+            failures.push((format!("{what}: invalid DXIL: {e}"), false));
             continue;
         }
         let mut results: Vec<(&str, Vec<[u32; 4]>)> = Vec::new();
@@ -588,7 +595,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
                 Err(e) => {
                     // A removed device takes the rest with it: make a new one.
                     eprintln!("{what}: {label}: {e}");
-                    failures.push(format!("{what}: {label}: {e}"));
+                    failures.push((format!("{what}: {label}: {e}"), false));
                     *h = Host::new(*warp).expect("the device again");
                 }
             }
@@ -608,8 +615,14 @@ fn check(probes: &[Probe]) -> Vec<String> {
         let (mut wrong, mut apart) = (vec![0usize; results.len()], 0usize);
         let mut all = Vec::new();
         for (i, &input) in p.inputs.iter().enumerate() {
+            // The words the two adapters must agree on: where the console's results are
+            // modelled, those the model gives (the others are scratch registers whose value
+            // no source fixes: a v_max_f32 of +0 and a negative denormal is +0 on the RTX
+            // 5090, -0 on WARP, whose FMax does not order the flushed zeros), else all four.
+            let mut words = 4;
             if let Some(model) = &p.model {
                 let want = model(input);
+                words = want.len();
                 for (k, (label, r)) in results.iter().enumerate() {
                     if !want.iter().zip(&r[i]).all(|(&w, &g)| same(p.kind, w, g)) {
                         wrong[k] += 1;
@@ -620,8 +633,9 @@ fn check(probes: &[Probe]) -> Vec<String> {
                     }
                 }
             }
-            let agree =
-                |x: &[u32; 4], y: &[u32; 4]| x.iter().zip(y).all(|(&a, &b)| same(p.kind, a, b));
+            let agree = |x: &[u32; 4], y: &[u32; 4]| {
+                x.iter().zip(y).take(words).all(|(&a, &b)| same(p.kind, a, b))
+            };
             if results.len() == 2 && !agree(&results[0].1[i], &results[1].1[i]) {
                 apart += 1;
                 if apart <= 4 {
@@ -658,7 +672,10 @@ fn check(probes: &[Probe]) -> Vec<String> {
             }
         }
         if wrong.iter().any(|&n| n > 0) || apart > 0 {
-            failures.push(format!("{summary}\n{}", bad.join("\n")));
+            let card_only = p.model.is_some()
+                && results.iter().any(|(l, _)| *l == "hardware")
+                && results.iter().zip(&wrong).all(|((l, _), &n)| *l == "hardware" || n == 0);
+            failures.push((format!("{summary}\n{}", bad.join("\n")), card_only));
         }
     }
     failures
@@ -1311,13 +1328,20 @@ fn a_legacy_square_is_the_consoles() {
 
 /// The legacy multiply's shorter forms (`legacy.rs`): the product alone where every zero
 /// meets a finite value of the right sign (`VICTORY_LEGACY_PLAIN`), and the forms that add
-/// +0 (`VICTORY_LEGACY_ZERO`): `(x + 0) * k`, `(0 - x) * -k` and `x * y + 0`. Each against
-/// the console's results over zeros, infinities, NaNs, denormals, products that underflow and
-/// overflow, in `v_mul_legacy_f32`, `v_mac_legacy_f32` and `v_mad_legacy_f32`, with the
-/// switches on (and checked to change the program) and with both off.
+/// +0 (`VICTORY_LEGACY_ZERO`): `(x + 0) * k` and `x * y + 0`. Each against the console's
+/// results over zeros, infinities, NaNs, denormals, products that underflow and overflow, in
+/// `v_mul_legacy_f32`, `v_mac_legacy_f32` and `v_mad_legacy_f32`, with the switches on (and
+/// checked to change the program where a form applies) and with both off.
+///
+/// The forms of a switch that is off by default (`VICTORY_LEGACY_ZERO`) are run on their own:
+/// where only the card is off (WARP gives the console's results), the mismatch is reported on
+/// stderr (and in `VICTORY_SEMANTICS_REPORT`), not failed, as a measurement of the driver. A
+/// mismatch of the default forms, or WARP's, fails.
 #[test]
 fn legacy_short_forms_are_the_consoles() {
-    use super::lower::legacy::{TEST_PLAIN, TEST_SHORT, TEST_ZERO};
+    use super::lower::legacy::{TEST_LOOPS, TEST_PLAIN, TEST_SHORT, TEST_ZERO};
+    // (VICTORY_LEGACY_LOOPS as by default, whatever the environment says)
+    TEST_LOOPS.set(Some(true));
     let set = |plain: bool, zero: bool| {
         TEST_PLAIN.set(Some(plain));
         TEST_ZERO.set(Some(zero));
@@ -1330,16 +1354,25 @@ fn legacy_short_forms_are_the_consoles() {
     let mut constants: Vec<(Vec<u32>, u32)> = inline.iter().map(|&(c, k)| (vec![u32::from(c)], k)).collect();
     constants.extend(literal.iter().map(|&k| (vec![255, k], k)));
     let mut probes = Vec::new();
+    // The probes no short form applies to (a negative constant times any value: `legacy.rs`).
+    let mut long = Vec::new();
     for (src, k) in &constants {
         let k = *k;
         let lit: Vec<u32> = src.get(1).copied().into_iter().collect();
         // v_mul_legacy_f32 v5, k, v1
         let mut body = vec![vop2(0x07, 5, src[0] as u16, 1)];
         body.extend(&lit);
+        let negative = k >> 31 != 0;
+        if negative {
+            long.push(body.clone());
+        }
         probes.push(probe(body, unary(F32_EDGES), F32, move |i| vec![mul_legacy(k, i[0])]));
         // v_mov_b32 v5, v3; v_mac_legacy_f32 v5, k, v1
         let mut body = vec![vop1(0x01, 5, v(3)), vop2(0x06, 5, src[0] as u16, 1)];
         body.extend(&lit);
+        if negative {
+            long.push(body.clone());
+        }
         let abc = triples(F32_EDGES, &[0], F32_THIRD);
         probes.push(probe(body, abc, F32, move |i| vec![mad_legacy(k, i[0], i[2])]));
         // v_cvt_f32_u32 v6, v1; v_mul_legacy_f32 v5, k, v6 (a converted integer)
@@ -1380,23 +1413,136 @@ fn legacy_short_forms_are_the_consoles() {
         let x = med3(i[0], 0, 0x3F80_0000);
         vec![mul_legacy(mul_legacy(x, x), mad(x, 0xC000_0000, 0x4080_0000))]
     }));
-    // Each probe's program changes with the switches (a short form is taken), and gives the
-    // console's results with them and without.
-    let before = TEST_SHORT.get();
-    set(true, true);
-    for p in &probes {
-        let on = lower_program(&program(&p.body, false)).expect("lowered").dxil;
-        set(false, false);
-        let off = lower_program(&program(&p.body, false)).expect("lowered").dxil;
-        set(true, true);
-        assert_ne!(on, off, "{}: a short form", disassembly(&p.body, false));
+    // A value only ever a zero (v_med3_f32 v6, v1, 0, 0) times anything: +0 for every input, a
+    // constant with `VICTORY_LEGACY_LOOPS` (the product alone would keep v2's chain alive; the
+    // clean-up folds the default form's select only for a literal zero).
+    let mut body = vop3(0x157, 6, [v(1), int(0), int(0)], NONE).to_vec();
+    body.push(vop2(0x07, 5, v(6), 2));
+    probes.push(probe(body, pairs(F32_EDGES, F32_EDGES), F32, |i| vec![mul_legacy(med3(i[0], 0, 0), i[1])]));
+    // `0 - x` of x = v_med3_f32(v1, 0, 1) times 0.5: by IEEE never -0, so the product alone
+    // would do, but the card's driver makes `0 - x` the negation, -0 of +0: the default forms
+    // keep the select (`VICTORY_LEGACY_LOOPS`'s facts follow the card); `(x + 0) * 0.5` of
+    // VICTORY_LEGACY_ZERO still applies.
+    let mut body = vop3(0x157, 6, [v(1), int(0), 242], NONE).to_vec();
+    body.push(vop2(0x04, 7, int(0), 6));
+    body.push(vop2(0x07, 5, 240, 7));
+    let select_kept = body.clone();
+    probes.push(probe(body, unary(F32_EDGES), F32, |i| {
+        let x = med3(i[0], 0, 0x3F80_0000);
+        vec![mul_legacy(0x3F00_0000, add(0, x ^ 0x8000_0000))]
+    }));
+    // A product carried round a loop (four passes): p = 1; p = p * x with x = min(max(v1,
+    // 0), 1). Its join is filled after the lowering: only the facts settled over the loop
+    // know p stays within [+0, 1] (`VICTORY_LEGACY_LOOPS`).
+    let mut body = vec![vop2(0x10, 7, int(0), 1), vop2(0x0F, 7, 242, 7), vop1(0x01, 6, 242)];
+    body.push(sop1(0x03, 20, int(4)));
+    body.push(vop2(0x07, 6, v(6), 7));
+    body.push(sop2(0x01, 20, s(20), int(1)));
+    body.push(sopc(0x07, s(20), int(0)));
+    body.push(0xBF85_FFFC); // s_cbranch_scc1 (back to the multiply)
+    body.push(vop1(0x01, 5, v(6)));
+    let looped = body.clone();
+    probes.push(probe(body, unary(F32_EDGES), F32, |i| {
+        let x = min_max(false, min_max(true, 0, i[0]), 0x3F80_0000);
+        let mut p = 0x3F80_0000;
+        for _ in 0..4 {
+            p = mul_legacy(p, x);
+        }
+        vec![p]
+    }));
+    {
+        set(true, false);
+        TEST_LOOPS.set(Some(false));
+        let without = lower_program(&program(&looped, false)).expect("lowered").dxil;
+        TEST_LOOPS.set(Some(true));
+        let with = lower_program(&program(&looped, false)).expect("lowered").dxil;
+        assert_ne!(without, with, "the product carried round the loop is shortened once the join is filled");
     }
+    // Each probe's program changes with the switches where a short form applies, and gives
+    // the console's results with them and without.
+    let before = TEST_SHORT.get();
+    let lowered = |p: &Probe, plain: bool, zero: bool| {
+        set(plain, zero);
+        lower_program(&program(&p.body, false)).expect("lowered").dxil
+    };
+    let mut zero_form = Vec::new();
+    for p in &probes {
+        let on = lowered(p, true, true);
+        let (default, off) = (lowered(p, true, false), lowered(p, false, false));
+        let what = disassembly(&p.body, false);
+        if long.contains(&p.body) {
+            assert_eq!(on, off, "{what}: no short form");
+        } else {
+            assert_ne!(on, off, "{what}: a short form");
+        }
+        if p.body == select_kept {
+            assert_eq!(default, off, "{what}: the default forms keep the select");
+        }
+        zero_form.push(on != default);
+    }
+    TEST_PLAIN.set(None);
+    TEST_ZERO.set(None);
     assert!(TEST_SHORT.get() > before);
-    for (plain, zero) in [(true, false), (true, true), (false, false)] {
+    assert!(zero_form.contains(&true), "VICTORY_LEGACY_ZERO changes some probe");
+    for (plain, zero) in [(true, false), (false, false)] {
         set(plain, zero);
         let failures = check(&probes);
         TEST_PLAIN.set(None);
         TEST_ZERO.set(None);
+        assert_clean(failures);
+    }
+    // VICTORY_LEGACY_ZERO's forms (off by default): the card's mismatches reported only.
+    let zero_forms: Vec<Probe> =
+        probes.into_iter().zip(zero_form).filter_map(|(p, z)| z.then_some(p)).collect();
+    set(true, true);
+    let failures = check_each(&zero_forms);
+    TEST_PLAIN.set(None);
+    TEST_ZERO.set(None);
+    TEST_LOOPS.set(None);
+    let (card, other): (Vec<_>, Vec<_>) = failures.into_iter().partition(|(_, card)| *card);
+    for (f, _) in &card {
+        eprintln!("VICTORY_LEGACY_ZERO (off by default), on the card only:\n{f}");
+    }
+    assert_clean(other.into_iter().map(|(f, _)| f).collect());
+}
+
+/// Guarded writes read without their guard in a program of the plain form
+/// (`VICTORY_WAVE_RAW_ALL=1`): under `v_cmpx_lt_f32 0, v1` a chain of writes and reads of
+/// v5..v7, EXEC restored after; lanes outside the guard keep their old values, lanes inside
+/// get the console's results, with the switch (checked to change the program) and without.
+#[test]
+fn guarded_writes_read_raw_in_the_plain_form() {
+    use super::lower::guarded::TEST_RAW_ALL;
+    let body = vec![
+        vopc(0x11, int(0), 1),         // v_cmpx_lt_f32 0, v1
+        vop2(0x03, 6, v(1), 2),        // v_add_f32 v6, v1, v2
+        vop2(0x08, 5, v(6), 6),        // v_mul_f32 v5, v6, v6
+        vop2(0x04, 6, v(6), 2),        // v_sub_f32 v6, v6, v2
+        vop2(0x03, 7, v(6), 5),        // v_add_f32 v7, v6, v5
+        sop1(0x03, EXEC_LO as u8, 193), // s_mov_b32 exec_lo, -1
+    ];
+    let xs: Vec<u32> = F32_EDGES.iter().copied().filter(|&x| !denormal(x)).collect();
+    let inputs = pairs(&xs, &xs);
+    let model = |i: [u32; 4]| {
+        if nan(i[0]) || fl(ftz(i[0])) <= 0.0 {
+            return vec![i[3], i[3], i[3]];
+        }
+        let s = add(i[0], i[1]);
+        let v5 = mul(s, s);
+        let v6 = add(s, i[1] ^ 0x8000_0000);
+        vec![v5, v6, add(v6, v5)]
+    };
+    let lowered = |on: bool| {
+        TEST_RAW_ALL.set(Some(on));
+        let d = lower_program(&program(&body, false)).expect("lowered").dxil;
+        TEST_RAW_ALL.set(None);
+        d
+    };
+    assert_ne!(lowered(true), lowered(false), "reads without the guard");
+    for on in [true, false] {
+        TEST_RAW_ALL.set(Some(on));
+        let failures = check(&[probe(body.clone(), inputs.clone(), F32, model)]);
+        TEST_RAW_ALL.set(None);
         assert_clean(failures);
     }
 }

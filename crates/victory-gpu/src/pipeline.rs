@@ -285,7 +285,7 @@ fn translate(container: &[u8], thread_limited: bool) -> Result<Translated, Strin
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views);
     Ok(Translated {
         host,
         threads,

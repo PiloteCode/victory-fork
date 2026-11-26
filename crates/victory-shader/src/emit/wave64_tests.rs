@@ -140,6 +140,7 @@ fn lowered_on(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     })
 }
 
@@ -228,7 +229,8 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
 /// stored by every thread (dwords 0 and 1). With `VICTORY_WAVE_EXCHANGE2` the exchanges take
 /// the two pairs of exchange dwords in turn and the first one's second meeting goes; with
 /// `VICTORY_WAVE_BASE_DIRECT` (a group of one dimension) each host wave takes its first
-/// thread index as its base instead of an LDS counter. Every combination validates, each
+/// thread index as its base instead of an LDS counter; with `VICTORY_WAVE_BASE_FREE` the
+/// counter goes without its reset and the group's meeting. Every combination validates, each
 /// switch changes the program, and on a host of 32-lane waves each stores the console's sums
 /// (2016 and 992).
 #[test]
@@ -258,14 +260,16 @@ fn exchanges_in_a_row_take_two_pairs_in_turn_and_meet_once_each() {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered_with = |two: bool, direct: bool| {
+    let lowered_with = |two: bool, direct: bool, free: bool| {
         let was = (
             lower::TEST_HOST_WAVE.replace(Some(32)),
             lower::TEST_EXCHANGE2.replace(Some(two)),
             lower::TEST_BASE_DIRECT.replace(Some(direct)),
+            lower::TEST_BASE_FREE.replace(Some(free)),
         );
         lower::TEST_MEETINGS_DROPPED.set(0);
         lower::TEST_BASES_DIRECT.set(0);
+        lower::TEST_BASES_FREE.set(0);
         let lowered = lower::lower(&lower::Parts {
             native: &native,
             p: &p,
@@ -280,6 +284,7 @@ fn exchanges_in_a_row_take_two_pairs_in_turn_and_meet_once_each() {
         lower::TEST_HOST_WAVE.set(was.0);
         lower::TEST_EXCHANGE2.set(was.1);
         lower::TEST_BASE_DIRECT.set(was.2);
+        lower::TEST_BASE_FREE.set(was.3);
         let lowered = lowered.expect("lower");
         assert_eq!((lowered.form, lowered.wave_size), (super::forms::EXCHANGE, Some(32)), "exchange2 {two}, direct {direct}");
         let shader = HostShader {
@@ -292,25 +297,30 @@ fn exchanges_in_a_row_take_two_pairs_in_turn_and_meet_once_each() {
             root_srvs: lowered.root_srvs,
             root_uavs: lowered.root_uavs,
             root_indexed_views: res.root_indexed_views.clone(),
+            half_views: Vec::new(),
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();
             v.validate(&mut copy).expect("DXIL validation failed");
         }
-        (shader, lower::TEST_MEETINGS_DROPPED.get(), lower::TEST_BASES_DIRECT.get())
+        (shader, lower::TEST_MEETINGS_DROPPED.get(), lower::TEST_BASES_DIRECT.get(), lower::TEST_BASES_FREE.get())
     };
-    let (once, dropped_off, direct_off) = lowered_with(false, false);
-    let (twice, dropped_on, _) = lowered_with(true, false);
-    let (direct, _, direct_on) = lowered_with(false, true);
-    let (both, dropped_both, direct_both) = lowered_with(true, true);
-    assert_eq!((dropped_off, direct_off), (0, 0), "without the switches every exchange meets twice");
+    let (once, dropped_off, direct_off, free_off) = lowered_with(false, false, false);
+    let (twice, dropped_on, _, _) = lowered_with(true, false, false);
+    let (direct, _, direct_on, _) = lowered_with(false, true, false);
+    let (both, dropped_both, direct_both, _) = lowered_with(true, true, false);
+    let (free, _, _, free_on) = lowered_with(false, false, true);
+    assert_eq!((dropped_off, direct_off, free_off), (0, 0, 0), "without the switches every exchange meets twice");
     assert!(dropped_on > 0, "with the first, an exchange followed by another in its block meets once");
     assert!(direct_on > 0 && direct_both > 0 && dropped_both > 0, "with the second, the wave base needs no LDS");
-    for (other, name) in [(&twice, "pairs in turn"), (&direct, "direct bases"), (&both, "both")] {
+    assert!(free_on > 0, "with the third, the counter needs no meeting");
+    for (other, name) in [(&twice, "pairs in turn"), (&direct, "direct bases"), (&both, "both"), (&free, "free counter")] {
         assert_ne!(once.dxil, other.dxil, "{name}");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for (shader, name) in [(&once, "two meetings"), (&twice, "pairs in turn"), (&direct, "direct bases"), (&both, "both")] {
+    for (shader, name) in
+        [(&once, "two meetings"), (&twice, "pairs in turn"), (&direct, "direct bases"), (&both, "both"), (&free, "free counter")]
+    {
         let Ok(host) = Host::new(false) else {
             eprintln!("no SM 6.6 hardware device; not run");
             return;
@@ -390,6 +400,7 @@ fn an_lds_read_after_a_read_needs_no_meeting_of_its_own() {
             root_srvs: lowered.root_srvs,
             root_uavs: lowered.root_uavs,
             root_indexed_views: res.root_indexed_views.clone(),
+            half_views: Vec::new(),
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();

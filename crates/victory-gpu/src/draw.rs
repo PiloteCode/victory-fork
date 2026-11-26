@@ -41,10 +41,20 @@ struct TableGroup {
     indexed: Vec<RootIndexedView>,
     // Descriptor number -> first declaration, matching the bind-time search.
     by_descriptor: Vec<(u32, usize)>,
+    /// The dwords of the descriptors the shader moves halves through as
+    /// unsigned integers (`HostShader::half_views`, #927); counted in
+    /// `max_dword`, so a fresh table reaches them.
+    half: Vec<u32>,
 }
 
 impl TablePlan {
-    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+    /// `half`: the shader's `HostShader::half_views` (root parameter,
+    /// dword).
+    pub(crate) fn new(
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
+    ) -> Self {
         let mut slots: Vec<_> = used
             .iter()
             .filter(|u| u.root == RootType::Table)
@@ -62,6 +72,7 @@ impl TablePlan {
                 entries: Vec::new(),
                 by_descriptor: Vec::new(),
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
+                half: half.iter().filter(|h| h.0 == slot).map(|h| h.1).collect(),
             })
             .collect();
         let mut direct = Vec::new();
@@ -82,6 +93,10 @@ impl TablePlan {
         for group in &mut groups {
             group.by_descriptor.sort_unstable();
             group.by_descriptor.dedup_by_key(|item| item.0);
+            // The descriptors moved as halves may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927): the table reaches them.
+            group.max_dword = group.half.iter().fold(group.max_dword, |m, &at| m.max(at));
         }
         Self { groups, direct }
     }
@@ -3786,11 +3801,26 @@ impl State {
         compute: bool,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
+        // Tables with a 16-bit float or signed buffer view where the shader
+        // moves halves as unsigned integers (`TableGroup::half`, #927): made
+        // afresh, that view in the unsigned format of the same layout
+        // (`descriptor::half_views`); the title's own slot keeps the title's
+        // format for the shaders that read it as floats. (The title's views
+        // there are unsigned already.)
+        let mut twins = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
             let slot = group.slot;
+            let root = self.roots_ref(compute).get(usize::from(slot));
+            let twinned = !group.half.is_empty()
+                && matches!(root, Some(&Root::Table(table))
+                    if crate::descriptor::half_views::twinned_table(table, &group.half));
+            if twinned {
+                twins[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+            }
             let needs_snapshot = group.has_cbv
-                || match self.roots_ref(compute).get(usize::from(slot)) {
+                || twinned
+                || match root {
                     Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
                         heap.host()
                             .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
@@ -3840,6 +3870,16 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // A descriptor moved as halves without an entry of its own is
+            // made and readied as one picked by index is (#927).
+            selected.extend(
+                group
+                    .half
+                    .iter()
+                    .map(|&at| at / 8)
+                    .filter(|&k| group.entry(k).is_none()),
+            );
+            let twinned = selected_slot(&twins, slot);
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
@@ -3857,6 +3897,13 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                }
+                // (Another table than the same slots made for a shader that
+                // reads them in the title's formats.)
+                if twinned {
+                    for &at in &group.half {
+                        h.add([at, u32::MAX, 0x7477_696e]);
+                    }
                 }
                 (table, n, h.0)
             };
@@ -3946,9 +3993,14 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                // Where the shader moves halves, a 16-bit float or signed
+                // view is made as its unsigned twin, not copied as the list
+                // made it for others.
+                let twin_here = twinned && group.half.contains(&(k * 8));
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
+                    && !twin_here
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
@@ -4015,7 +4067,12 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let twin = if twin_here {
+                            crate::descriptor::half_views::half_view(&view)
+                        } else {
+                            None
+                        };
+                        host.make_at(index, twin.as_ref().unwrap_or(&view));
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
