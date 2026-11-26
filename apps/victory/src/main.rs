@@ -33,6 +33,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
@@ -69,8 +70,9 @@ enum Command {
     /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found (and per pack pipeline).
-        #[arg(long)]
+        /// Print one line per container found (and per pack pipeline), and
+        /// show why paths were skipped.
+        #[arg(short, long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
@@ -82,6 +84,9 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
+    ///
+    /// VICTORY_HOST_WAVE (or VICTORY_HOST_MAX_WAVE) translates as for a host
+    /// of waves that wide, including with --warm.
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -123,13 +128,19 @@ enum Command {
         keys: bool,
     },
     /// Translate every shader found (as `translate` finds them) into the
-    /// shader cache, so that no run has to: a few minutes, once per change
-    /// of the translator.
+    /// shader cache, so that no run has to: a few minutes, once per version
+    /// of the translator. Translations an earlier build of the same version
+    /// cached are made again, and those that came out different counted.
+    /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Also write every shader that does not translate to this file,
+        /// one line each: hash, where it was found, why.
+        #[arg(long)]
+        list: Option<PathBuf>,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -245,6 +256,7 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            // (`translate` itself also reads `VICTORY_HOST_MAX_WAVE`)
             if let Some(n) = host_wave {
                 victory_shader::emit::set_host_max_wave(n);
             }
@@ -255,7 +267,7 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, hashes, jobs)
         }
         Command::TranslateDiff { old, new, keys } => translate_diff::run(&old, &new, keys),
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {
