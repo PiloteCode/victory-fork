@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+/// Buffer views shown to a shader that moves 16-bit channels as unsigned integers (#927).
+pub(crate) mod half_views;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
