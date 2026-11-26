@@ -2561,9 +2561,50 @@ fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
     (lo, hi)
 }
 
+/// Where thread `i` of `threads` starts in `[from, to)` of a copy that
+/// begins at title address `start`, for the compare of [`Shadow::differing`]
+/// (`threads` itself: `to`). Cut on piece boundaries, so that every thread
+/// sees whole pieces; the first starts at `from`.
+///
+/// The first cut was `at - (start + at) % PIECE`, which wrapped below zero
+/// when the copy does not start on a piece and `from` lies before the
+/// copy's first piece boundary: its slice, the first of a large range, was
+/// never compared, and what shaders wrote there was missed. (Found by
+/// stellarr-studio/kelvaroq's review, its patch 0009, GPL-3.0-or-later.)
+fn compare_cut(start: usize, (from, to): (usize, usize), threads: usize, i: usize) -> usize {
+    if i >= threads {
+        return to;
+    }
+    let at = from + (to - from) / threads * i;
+    at.saturating_sub((start + at) % PIECE).max(from)
+}
+
 #[cfg(test)]
 mod piece_tests {
-    use super::{PIECE, piece_at, pieces_of};
+    use super::{PIECE, compare_cut, piece_at, pieces_of};
+
+    /// The compare's cuts start at `from`, end at `to`, rise, and fall on
+    /// piece boundaries in between, wherever the copy and the range start
+    /// (kelvaroq patch 0009: a copy that starts off a piece wrapped the
+    /// first cut).
+    #[test]
+    fn compare_cuts_start_at_from_rise_and_fall_on_pieces() {
+        for start in [0, 0x1000, PIECE - 4, 3 * PIECE + 0x2340] {
+            for from in [0, 0x40, PIECE / 2, 5 * PIECE + 8] {
+                for len in [PIECE, 16 << 20, (40 << 20) + 0x1234, 129 << 20] {
+                    let to = from + len;
+                    let threads = (len / (16 << 20)).clamp(1, 8);
+                    let cuts: Vec<usize> = (0..=threads).map(|i| compare_cut(start, (from, to), threads, i)).collect();
+                    assert_eq!(cuts[0], from, "start {start:#x} from {from:#x} len {len:#x}");
+                    assert_eq!(cuts[threads], to);
+                    assert!(cuts.windows(2).all(|w| w[0] <= w[1]), "{cuts:x?}");
+                    for &c in &cuts[1..threads] {
+                        assert!(c == from || (start + c) % PIECE == 0, "cut {c:#x} of {cuts:x?}");
+                    }
+                }
+            }
+        }
+    }
 
     /// The pieces cover a copy without gaps, each cut where the compare
     /// cuts (at multiples of 64 KiB of title memory).
@@ -3323,14 +3364,7 @@ impl Shadow {
         if threads == 1 {
             return scan(from, to);
         }
-        // Cut on piece boundaries, so that every thread sees whole pieces.
-        let cut = |i: usize| {
-            if i == threads {
-                return to;
-            }
-            let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
-        };
+        let cut = |i: usize| compare_cut(start, (from, to), threads, i);
         let scan = &scan;
         std::thread::scope(|s| {
             let parts: Vec<_> = (0..threads)
