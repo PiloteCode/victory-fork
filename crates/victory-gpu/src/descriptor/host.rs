@@ -607,13 +607,18 @@ pub(crate) enum Own {
     Whole,
 }
 
-/// [`Own`] as `VICTORY_OWN_BYTES` says.
+/// [`Own`] as `VICTORY_OWN_BYTES` says. Unset: [`Own::Next`], this tree's own
+/// rule; `newer` asks for [`Own::Newer`]. (In this tree the newer rule put
+/// texel noise on textures that the next rule shows whole: the posters and
+/// the shirt of the prologue's first playable scene, RTX 5090, runs
+/// integ-w12c against integ-w12d, same build. So it waits behind its switch
+/// until that is understood.)
 fn own_rule() -> Own {
     static RULE: std::sync::OnceLock<Own> = std::sync::OnceLock::new();
     *RULE.get_or_init(|| match std::env::var("VICTORY_OWN_BYTES").as_deref() {
         Ok("0") => Own::Whole,
-        Ok("next") => Own::Next,
-        _ => Own::Newer,
+        Ok("newer") => Own::Newer,
+        _ => Own::Next,
     })
 }
 
