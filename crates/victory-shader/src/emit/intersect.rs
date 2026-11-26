@@ -146,11 +146,14 @@ impl<'a> Lower<'a> {
             let zero = self.s.m.i32(0);
             self.s.m.cmp(c, pred::NE, word, zero)
         };
-        let reads = Some(match guard {
-            Some(g) => self.s.m.bin(c, Bin::And, g, built),
-            None => built,
-        });
-        let at = match nodes {
+        // Resolve the operands before entering divergent control flow. A
+        // lookup in the title-memory directory also writes the fault buffer,
+        // so emit that part only in the block that actually tests nodes.
+        enum Source {
+            Buffer { handle: V, byte: V },
+            Title { low: V, high: V },
+        }
+        let source = match nodes {
             BvhNodes::Resource => {
                 let src = self
                     .descriptors
@@ -162,7 +165,7 @@ impl<'a> Lower<'a> {
                 let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
                 let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);
                 let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
-                NodeAt::Buffer { handle, byte }
+                Source::Buffer { handle, byte }
             }
             BvhNodes::Memory { .. } => {
                 let Operand::Scalar { code, .. } = *rsrc else {
@@ -176,16 +179,7 @@ impl<'a> Lower<'a> {
                     *w = self.i32_of(v)?;
                 }
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
-                // One look for the node's copy, before the branches: a
-                // node is 64 bytes on 64, so its first half lies in one
-                // 64 KiB page whatever its kind.
-                let (handle, byte) = self.bvh_memory(low, high, reads);
-                NodeAt::Memory {
-                    handle,
-                    byte,
-                    low,
-                    high,
-                }
+                Source::Title { low, high }
             }
         };
         let zero = self.s.m.i32(0);
@@ -200,9 +194,17 @@ impl<'a> Lower<'a> {
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         let (tested, nothing) = (self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(head, Term::CondBr(built, tested, nothing));
+        self.cur = tested;
+        let at = match source {
+            Source::Buffer { handle, byte } => NodeAt::Buffer { handle, byte },
+            Source::Title { low, high } => {
+                let (handle, byte) = self.bvh_memory(low, high, None);
+                NodeAt::Memory { handle, byte, low, high }
+            }
+        };
         self.s
             .m
-            .terminate(tested, Term::CondBr(is_box, box_block, leaf_block));
+            .terminate(self.cur, Term::CondBr(is_box, box_block, leaf_block));
         self.s
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));

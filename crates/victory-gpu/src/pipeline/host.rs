@@ -20,19 +20,19 @@ use crate::host::host;
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
-    blend: D3D12_BLEND_DESC,
-    sample_mask: u32,
-    rasterizer: D3D12_RASTERIZER_DESC,
-    depth: D3D12_DEPTH_STENCIL_DESC,
-    depth_bounds: bool,
+    pub(super) blend: D3D12_BLEND_DESC,
+    pub(super) sample_mask: u32,
+    pub(super) rasterizer: D3D12_RASTERIZER_DESC,
+    pub(super) depth: D3D12_DEPTH_STENCIL_DESC,
+    pub(super) depth_bounds: bool,
     /// Input elements, their names pointing into `names`.
-    inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-    names: Vec<CString>,
-    strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
+    pub(super) inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
+    pub(super) names: Vec<CString>,
+    pub(super) strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
-    depth_format: DXGI_FORMAT,
-    samples: DXGI_SAMPLE_DESC,
+    pub(super) depth_format: DXGI_FORMAT,
+    pub(super) samples: DXGI_SAMPLE_DESC,
 }
 
 impl Default for GraphicsState {
@@ -91,7 +91,77 @@ impl Default for GraphicsState {
     }
 }
 
+/// Integer render target formats: D3D12 cannot blend into them.
+fn integer_format(f: DXGI_FORMAT) -> bool {
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// The title's blend state as the host takes it: blending off on integer
+/// render targets. The console ignores blending there, and titles leave it
+/// on (the world sets it on an `R8_UINT` target), but D3D12 does not allow
+/// it: vkd3d-proton refuses such a pipeline with `E_INVALIDARG` ("using
+/// integer format is not supported"), and its draws are lost. With one
+/// description for every target, each target gets its own copy so the
+/// others keep theirs.
+fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let per_target = blend.IndependentBlendEnable.as_bool();
+    let blends = |i: usize| {
+        blend.RenderTarget[if per_target { i } else { 0 }]
+            .BlendEnable
+            .as_bool()
+    };
+    if !(0..count).any(|i| integer_format(targets.RTFormats[i]) && blends(i)) {
+        return *blend;
+    }
+    let mut host = *blend;
+    if !per_target {
+        host.IndependentBlendEnable = true.into();
+        host.RenderTarget = [blend.RenderTarget[0]; 8];
+    }
+    for i in 0..count {
+        if integer_format(targets.RTFormats[i]) {
+            host.RenderTarget[i].BlendEnable = false.into();
+        }
+    }
+    host
+}
+
 impl GraphicsState {
+    /// Whether the draws are a pass over the screen: no vertex input, no
+    /// depth or stencil, a target. Such passes fill tables once; their shaders
+    /// are few. (After Belobug/VIctory-Belobug-AMD 18e57db8.)
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.targets.NumRenderTargets > 0
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -207,38 +277,6 @@ impl GraphicsState {
         )
     }
 
-    /// The depth, stencil, cull and first target's blend state, as the
-    /// frame listing shows them after a draw (`depth_bounds`: whether the
-    /// host pipeline keeps the depth bounds test).
-    fn listed(&self, depth_bounds: bool) -> String {
-        let (d, r, b) = (&self.depth, &self.rasterizer, &self.blend.RenderTarget[0]);
-        let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
-            format!(
-                "fail {} depth-fail {} pass {} func {}",
-                f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
-            )
-        };
-        let bounds = if depth_bounds { " bounds true" } else { "" };
-        format!(
-            "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
-            d.DepthEnable.as_bool(),
-            d.DepthWriteMask.0,
-            d.DepthFunc.0,
-            d.StencilEnable.as_bool(),
-            d.StencilReadMask,
-            d.StencilWriteMask,
-            face(&d.FrontFace),
-            face(&d.BackFace),
-            r.CullMode.0,
-            r.FrontCounterClockwise.as_bool(),
-            b.BlendEnable.as_bool(),
-            b.SrcBlend.0,
-            b.DestBlend.0,
-            b.BlendOp.0,
-            b.RenderTargetWriteMask
-        )
-    }
-
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
         D3D12_DEPTH_STENCIL_DESC1 {
@@ -252,17 +290,6 @@ impl GraphicsState {
             BackFace: d.BackFace,
             DepthBoundsTestEnable: self.depth_bounds.into(),
         }
-    }
-
-    /// Whether this is a pass over the screen: triangles with no vertex
-    /// input and no depth or stencil test (`crate::pipeline::make` makes
-    /// such pipelines first). The title fills its lighting tables with such
-    /// draws, once.
-    pub(crate) fn screen_pass(&self) -> bool {
-        self.inputs.is_empty()
-            && (self.depth_format == DXGI_FORMAT_UNKNOWN
-                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
-            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -356,8 +383,7 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
-    /// Vertex (or mesh), then pixel stage, then the title's geometry stage;
-    /// or the compute stage.
+    /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
@@ -386,8 +412,8 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
-    /// A host pipeline for vertex (or mesh), pixel and geometry shaders with
-    /// the graphics state `g`, or for one compute shader.
+    /// A host pipeline for vertex and pixel shaders with the graphics
+    /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
@@ -488,11 +514,11 @@ impl HostPipeline {
                 for &slot in slots {
                     let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
                     // Ours, not the title's, stay root descriptors: the
-                    // table of strides, the directory of title memory by
-                    // address and its fault notes, the loop notes.
+                    // table of strides, the table of view addresses, the
+                    // directory of title memory by address and its fault
+                    // notes, the loop notes.
                     let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS
-                            || slot == victory_shader::emit::SLOT_LOOPS
+                        slot == victory_shader::emit::SLOT_FAULTS || slot == victory_shader::emit::SLOT_LOOPS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_VIEW_ADDRESSES
@@ -683,9 +709,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
-                // The world's draws are mostly mesh dispatches: the listing
-                // showed no depth or stencil state for them.
-                state: g.listed(depth_bounds),
+                state: String::new(),
             });
         }
 
@@ -814,7 +838,34 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
-            state: g.listed(depth_bounds),
+            state: {
+                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
+                let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+                    format!(
+                        "fail {} depth-fail {} pass {} func {}",
+                        f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+                    )
+                };
+                let bounds = if depth_bounds { " bounds true" } else { "" };
+                format!(
+                    "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
+                    d.DepthEnable.as_bool(),
+                    d.DepthWriteMask.0,
+                    d.DepthFunc.0,
+                    d.StencilEnable.as_bool(),
+                    d.StencilReadMask,
+                    d.StencilWriteMask,
+                    face(&d.FrontFace),
+                    face(&d.BackFace),
+                    r.CullMode.0,
+                    r.FrontCounterClockwise.as_bool(),
+                    b.BlendEnable.as_bool(),
+                    b.SrcBlend.0,
+                    b.DestBlend.0,
+                    b.BlendOp.0,
+                    b.RenderTargetWriteMask
+                )
+            },
         })
     }
 }
@@ -921,8 +972,8 @@ type LinkedMesh = (victory_shader::emit::HostShader, Option<victory_shader::emit
 /// `None` when `ms` fits, or the pair does not link (then the pipeline is made of the shared
 /// translations, as before). `VICTORY_MESH_LINK=0` turns it off.
 fn linked(ms: &Arc<Shader>, ps: Option<&Arc<Shader>>) -> Option<Arc<LinkedMesh>> {
-    static PAIRS: std::sync::Mutex<Option<std::collections::HashMap<(String, String), Option<Arc<LinkedMesh>>>>> =
-        std::sync::Mutex::new(None);
+    type Pairs = std::collections::HashMap<(String, String), Option<Arc<LinkedMesh>>>;
+    static PAIRS: std::sync::Mutex<Option<Pairs>> = std::sync::Mutex::new(None);
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LINK").is_none_or(|v| v != "0")) {
         return None;
@@ -1046,59 +1097,6 @@ fn mesh_pipeline(
     }
 }
 
-/// The title's blend state with blending off for its integer render targets, which D3D12
-/// refuses to blend and the console's color block does not blend. A pipeline that blends an
-/// integer target is `E_INVALIDARG`, also when target 0's blend stands for every target
-/// (`IndependentBlendEnable` clear): measured on an RTX 5090 with `PS_WindshieldWiperMask`,
-/// which writes a uint to target 2 (blending target 0 for all of them: refused; targets 0
-/// and 1 alone: made). Its mesh pipeline was refused in every run that drew it. A state
-/// that blends no integer target, or uses a logic operation, is left as the title gave it.
-fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
-    let integer = |k: usize| {
-        matches!(
-            targets.RTFormats[k],
-            DXGI_FORMAT_R32G32B32A32_UINT
-                | DXGI_FORMAT_R32G32B32A32_SINT
-                | DXGI_FORMAT_R32G32B32_UINT
-                | DXGI_FORMAT_R32G32B32_SINT
-                | DXGI_FORMAT_R16G16B16A16_UINT
-                | DXGI_FORMAT_R16G16B16A16_SINT
-                | DXGI_FORMAT_R32G32_UINT
-                | DXGI_FORMAT_R32G32_SINT
-                | DXGI_FORMAT_R10G10B10A2_UINT
-                | DXGI_FORMAT_R8G8B8A8_UINT
-                | DXGI_FORMAT_R8G8B8A8_SINT
-                | DXGI_FORMAT_R16G16_UINT
-                | DXGI_FORMAT_R16G16_SINT
-                | DXGI_FORMAT_R32_UINT
-                | DXGI_FORMAT_R32_SINT
-                | DXGI_FORMAT_R8G8_UINT
-                | DXGI_FORMAT_R8G8_SINT
-                | DXGI_FORMAT_R16_UINT
-                | DXGI_FORMAT_R16_SINT
-                | DXGI_FORMAT_R8_UINT
-                | DXGI_FORMAT_R8_SINT
-        )
-    };
-    let n = (targets.NumRenderTargets as usize).min(8);
-    let independent = blend.IndependentBlendEnable.as_bool();
-    let of = |k: usize| &blend.RenderTarget[if independent { k } else { 0 }];
-    if blend.RenderTarget.iter().any(|t| t.LogicOpEnable.as_bool())
-        || !(0..n).any(|k| integer(k) && of(k).BlendEnable.as_bool())
-    {
-        return *blend;
-    }
-    let mut b = *blend;
-    if !independent {
-        b.IndependentBlendEnable = true.into();
-        b.RenderTarget = [blend.RenderTarget[0]; 8];
-    }
-    for k in (0..n).filter(|&k| integer(k)) {
-        b.RenderTarget[k].BlendEnable = false.into();
-    }
-    b
-}
-
 /// The bytes of shader code (none for an absent stage).
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
@@ -1162,38 +1160,6 @@ mod tests {
 
     use super::*;
 
-    /// Triangles with no vertex input and no depth or stencil test are a
-    /// pass over the screen; lines, a vertex input or a depth test are not.
-    #[test]
-    fn a_screen_pass_is_told_by_its_state() {
-        let triangles = || GraphicsState {
-            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-            ..GraphicsState::default()
-        };
-        assert!(triangles().screen_pass(), "no depth target");
-        let lines = GraphicsState {
-            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
-            ..GraphicsState::default()
-        };
-        assert!(!lines.screen_pass());
-        let tested = GraphicsState {
-            depth_format: DXGI_FORMAT_D32_FLOAT,
-            ..triangles()
-        };
-        assert!(!tested.screen_pass(), "a depth target with its test on (the default)");
-        let mut untested = GraphicsState {
-            depth_format: DXGI_FORMAT_D32_FLOAT,
-            ..triangles()
-        };
-        untested.depth.DepthEnable = false.into();
-        assert!(untested.screen_pass(), "a depth target with no test");
-        let fed = GraphicsState {
-            inputs: vec![D3D12_INPUT_ELEMENT_DESC::default()],
-            ..triangles()
-        };
-        assert!(!fed.screen_pass(), "a vertex input");
-    }
-
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
@@ -1239,77 +1205,6 @@ mod tests {
         }
     }
 
-    /// Target 0's blend standing for every target, over a float and a uint target: each target
-    /// gets target 0's blend, but the uint one blends nothing. Independent blends lose only
-    /// the integer targets' blending; states that blend no integer target stay as they are.
-    #[test]
-    fn integer_targets_are_not_blended() {
-        let mut targets = D3D12_RT_FORMAT_ARRAY {
-            NumRenderTargets: 3,
-            ..Default::default()
-        };
-        targets.RTFormats[..3].copy_from_slice(&[DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT]);
-        let mut all = GraphicsState::default().blend;
-        all.RenderTarget[0].BlendEnable = true.into();
-        all.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        let b = host_blend(&all, &targets);
-        assert!(b.IndependentBlendEnable.as_bool());
-        let on: Vec<bool> = b.RenderTarget[..3].iter().map(|t| t.BlendEnable.as_bool()).collect();
-        assert_eq!(on, [true, true, false]);
-        assert_eq!(b.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
-        let mut each = all;
-        each.IndependentBlendEnable = true.into();
-        each.RenderTarget[2] = each.RenderTarget[0];
-        let b = host_blend(&each, &targets);
-        let on: Vec<bool> = b.RenderTarget[..3].iter().map(|t| t.BlendEnable.as_bool()).collect();
-        assert_eq!(on, [true, false, false]);
-        // nothing to change: the same state back
-        let mut floats = targets;
-        floats.RTFormats[2] = DXGI_FORMAT_R16_FLOAT;
-        let same = host_blend(&all, &floats);
-        assert!(!same.IndependentBlendEnable.as_bool());
-        assert_eq!(format!("{same:?}"), format!("{all:?}"));
-    }
-
-    /// A pixel shader writing a float to target 0 and a uint to target 1 (as the windshield
-    /// wiper mask writes one to target 2), under target 0's blend for every target: the host
-    /// refuses that state (`E_INVALIDARG`), and makes the pipeline with the uint target's
-    /// blending off.
-    #[test]
-    fn a_pipeline_that_blends_an_integer_target_is_made_without() {
-        let Some(host) = host() else {
-            return; // no host GPU here
-        };
-        if !host.mesh_shaders() {
-            eprintln!("no host mesh shader support; skipped");
-            return;
-        }
-        let Some(dxc) = dxc() else {
-            eprintln!("no PC dxc.exe; skipped");
-            return;
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
-        let ps = compile(
-            &dxc,
-            dir.path(),
-            "struct O { float4 c : SV_Target0; uint m : SV_Target1; };
-             O main() { O o; o.c = 1; o.m = 7; return o; }",
-            "ps_6_5",
-        );
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
-        let mut g = GraphicsState::default();
-        g.depth.DepthEnable = false.into();
-        g.targets.NumRenderTargets = 2;
-        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
-        g.blend.RenderTarget[0].BlendEnable = true.into();
-        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        g.blend.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-        let name = super::super::library::name("mesh blend test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made");
-    }
-
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
     #[test]
@@ -1344,158 +1239,66 @@ mod tests {
         );
     }
 
+    fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
+        let mut t = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: formats.len() as u32,
+            ..Default::default()
+        };
+        t.RTFormats[..formats.len()].copy_from_slice(formats);
+        t
+    }
+
+    fn blending(independent: bool) -> D3D12_BLEND_DESC {
+        let mut b = GraphicsState::default().blend;
+        b.IndependentBlendEnable = independent.into();
+        for t in &mut b.RenderTarget {
+            t.BlendEnable = true.into();
+            t.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        }
+        b
+    }
+
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let t = targets(&[
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        for independent in [false, true] {
+            let host = host_blend(&blending(independent), &t);
+            assert!(host.IndependentBlendEnable.as_bool());
+            assert!(host.RenderTarget[0].BlendEnable.as_bool());
+            assert!(host.RenderTarget[1].BlendEnable.as_bool());
+            assert!(!host.RenderTarget[2].BlendEnable.as_bool());
+            // The rest of the target's state is the title's.
+            assert_eq!(host.RenderTarget[2].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+            assert_eq!(host.RenderTarget[0].DestBlend, D3D12_BLEND_INV_SRC_ALPHA);
+        }
+    }
+
+    #[test]
+    fn blend_states_without_integer_blending_are_kept() {
+        // No integer target.
+        let b = blending(false);
+        let t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R11G11B10_FLOAT]);
+        assert_eq!(host_blend(&b, &t), b);
+        // An integer target that does not blend.
+        let mut b = blending(true);
+        b.RenderTarget[1].BlendEnable = false.into();
+        let t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT]);
+        assert_eq!(host_blend(&b, &t), b);
+        // Integer formats past the targets in use.
+        let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
         float2 p = float2((i << 1) & 2, i & 2);
         return float4(p * 2.0 - 1.0, 0.5, 1.0);
     }";
-
-    /// A triangle over the whole target, from a mesh shader.
-    const MS_FULL: &str = "struct V { float4 p : SV_Position; };
-        [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
-        void main(out vertices V v[3], out indices uint3 t[1]) {
-            SetMeshOutputCounts(3, 1);
-            v[0].p = float4(-1, -1, 0.5, 1);
-            v[1].p = float4(-1, 3, 0.5, 1);
-            v[2].p = float4(3, -1, 0.5, 1);
-            t[0] = uint3(0, 1, 2);
-        }";
-
-    /// The depth bounds test through a mesh pipeline (the title's world draws are
-    /// mesh draws; the test above makes a vertex pipeline): one triangle over four
-    /// texels whose depths are 0.1, 0.4, 0.6 and 0.9, under bounds 0.3 and 0.7 set
-    /// on the list, colours the two middle texels only; the same pipeline state
-    /// without the test colours all four.
-    #[test]
-    fn a_mesh_pipeline_keeps_only_the_pixels_within_the_depth_bounds() {
-        use windows::Win32::Foundation::RECT;
-        use windows::core::Interface;
-        let Some(host) = host() else {
-            return; // no host GPU here
-        };
-        if !host.depth_bounds() || !host.mesh_shaders() {
-            eprintln!("no depth bounds test or mesh shaders on the host GPU; skipped");
-            return;
-        }
-        let Some(dxc) = dxc() else {
-            eprintln!("no PC dxc.exe; skipped");
-            return;
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let ms = compile(&dxc, dir.path(), MS_FULL, "ms_6_5");
-        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
-        let texture = |format, flags, state| {
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: 4,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Flags: flags,
-                ..Default::default()
-            };
-            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-            let mut out: Option<ID3D12Resource> = None;
-            // SAFETY: plain creation.
-            unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut out) }
-                .unwrap();
-            out.unwrap()
-        };
-        let back = {
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: 256,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-            let mut out: Option<ID3D12Resource> = None;
-            // SAFETY: plain creation.
-            unsafe {
-                host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut out)
-            }
-            .unwrap();
-            out.unwrap()
-        };
-        for bounds in [true, false] {
-            let mut g = GraphicsState::default();
-            g.depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-            g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-            g.depth_bounds = bounds;
-            g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
-            g.targets.NumRenderTargets = 1;
-            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-            g.depth_format = DXGI_FORMAT_D32_FLOAT;
-            let name = super::super::library::name("mesh depth-bounds test", &root_blob, &[&ms, &ps], &g.describe());
-            let pso = mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, bounds, &name).expect("made");
-            let target = texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            let depth = texture(DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-            let list = host.new_list().unwrap();
-            let (rtv, dsv) = (host.rtv(Some(&target), None), host.dsv(&depth, None));
-            // SAFETY: an open list of ours, live resources, views just made.
-            unsafe {
-                let l = &list.list;
-                l.ClearRenderTargetView(rtv, &[0.0; 4], None);
-                for (x, d) in [0.1f32, 0.4, 0.6, 0.9].into_iter().enumerate() {
-                    let x = x as i32;
-                    let column = [RECT { left: x, top: 0, right: x + 1, bottom: 1 }];
-                    l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, d, 0, Some(&column));
-                }
-                l.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
-                l.RSSetViewports(&[D3D12_VIEWPORT { Width: 4.0, Height: 1.0, MaxDepth: 1.0, ..Default::default() }]);
-                l.RSSetScissorRects(&[RECT { left: 0, top: 0, right: 4, bottom: 1 }]);
-                l.SetGraphicsRootSignature(&root);
-                l.SetPipelineState(&pso);
-                crate::draw::depth_bounds(&list, 0.3, 0.7);
-                l.cast::<ID3D12GraphicsCommandList6>().unwrap().DispatchMesh(1, 1, 1);
-                l.ResourceBarrier(&[crate::host::transition(
-                    &target,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-                let to = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&back),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                            Offset: 0,
-                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                                Width: 4,
-                                Height: 1,
-                                Depth: 1,
-                                RowPitch: 256,
-                            },
-                        },
-                    },
-                };
-                let from = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&target),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-                };
-                l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-            }
-            list.close();
-            host.execute(&[&list]);
-            let mut data = std::ptr::null_mut();
-            // SAFETY: the copy has run (the submission is waited for); four texels.
-            let red: Vec<u8> = unsafe {
-                back.Map(0, None, Some(&mut data)).unwrap();
-                let red = std::slice::from_raw_parts(data.cast::<u8>(), 16).chunks(4).map(|t| t[0]).collect();
-                back.Unmap(0, None);
-                red
-            };
-            let want = if bounds { vec![0, 255, 255, 0] } else { vec![255; 4] };
-            assert_eq!(red, want, "depth bounds test {bounds}");
-        }
-    }
 
     /// A graphics pipeline with `DepthBoundsTestEnable` loads back from the
     /// pipeline library and culls or passes fragments according to

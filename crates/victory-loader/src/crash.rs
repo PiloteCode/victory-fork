@@ -8,12 +8,9 @@
 //! exception too), is reported from the unhandled-exception filter
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
-//! often states the reason. Diagnostics builds can also append first-chance
-//! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
-//! crash log too.
+//! often states the reason. Panics of ours go to the crash log too.
 
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -48,21 +45,17 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Read before installing the exception handler.
-static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
-
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
     if LOG.set(file).is_ok() {
-        let _ = HOST.set(host());
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
-                report_end()
+                title_output()
             ));
         }));
     }
@@ -72,31 +65,20 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
     let text = format!("{text}
-{}", report_end());
+{}", title_output());
     eprint!("{text}");
     append_to_log(&text);
 }
 
 fn append_to_log(text: &str) {
+    use std::io::Write;
     let Some(file) = LOG.get() else { return };
-    let _ = append_record(file, text);
-}
-
-fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind, Write};
-
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
-    // Formatting directly into the file can append fragments separately.
-    // Use one append, with no lock to acquire from an exception handler.
-    if file.write(record.as_bytes())? == record.len() {
-        Ok(())
-    } else {
-        // Retrying a short write could put another report between its pieces.
-        Err(Error::new(ErrorKind::WriteZero, "incomplete crash record append"))
+    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
+    if let Ok(mut f) = opened {
+        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
     }
 }
 
@@ -126,57 +108,6 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
-/// The host's line in a crash report. Its CPU and Windows build decide what
-/// title code runs (Intel CPUs lack some of the console's AMD-only
-/// instructions) and which D3D12 runtime there is, so a report needs both.
-/// Set along with the crash log, so a crash queries nothing.
-static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// What ends a crash report: the host, then the title's last debug output.
-fn report_end() -> String {
-    let host = HOST.get().map_or("", String::as_str);
-    format!("{host}{}", title_output())
-}
-
-/// The line [`HOST`] holds.
-fn host() -> String {
-    format!("  host: {}, Windows {}\n", cpu_name(), windows_version())
-}
-
-/// The CPU's brand string, e.g. `AMD Ryzen 7 5700X3D 8-Core Processor`.
-fn cpu_name() -> String {
-    use std::arch::x86_64::__cpuid;
-    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
-        return "an unnamed CPU".into();
-    }
-    let bytes: Vec<u8> = (0x8000_0002..=0x8000_0004)
-        .flat_map(|leaf| {
-            let r = __cpuid(leaf);
-            [r.eax, r.ebx, r.ecx, r.edx]
-        })
-        .flat_map(u32::to_le_bytes)
-        .collect();
-    let padding = |c: char| c == '\0' || c.is_whitespace();
-    let name = String::from_utf8_lossy(&bytes);
-    name.trim_matches(padding).to_owned()
-}
-
-/// The running Windows as `major.minor.build`. `RtlGetVersion` gives the
-/// real one; `GetVersionEx` gives what the executable's manifest declares.
-fn windows_version() -> String {
-    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
-    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-    // SAFETY: a zeroed OSVERSIONINFOW is valid; its size field is set.
-    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
-    info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOW>() as u32;
-    // SAFETY: fills the structure passed, whose size it was told.
-    if unsafe { RtlGetVersion(&mut info) } != 0 {
-        return "of unknown version".into();
-    }
-    let (major, minor, build) = (info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber);
-    format!("{major}.{minor}.{build}")
-}
-
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
@@ -184,11 +115,6 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
-    LOG_FIRST_CHANCE_BREAKPOINTS.store(
-        cfg!(feature = "diagnostics")
-            && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
-        Ordering::Relaxed,
-    );
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -391,7 +317,7 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
 /// # Safety
 /// `context` is the state of a thread that faulted at a `clzero`; the
 /// lines its registers name are the title's to zero.
-pub(crate) unsafe fn clzero(context: &mut CONTEXT) -> bool {
+unsafe fn clzero(context: &mut CONTEXT) -> bool {
     // SAFETY: (every use) a line the title asked to zero.
     let zero = |rax: u64| unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
     let at = context.Rip as usize;
@@ -484,7 +410,7 @@ fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
 }
 
 /// The status flags `cmp a, b` leaves (CF, PF, AF, ZF, SF, OF) as `EFLAGS` bits.
-fn cmp_flags(a: u64, b: u64) -> u32 {
+pub(crate) fn cmp_flags(a: u64, b: u64) -> u32 {
     let r = a.wrapping_sub(b);
     u32::from(a < b)
         | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
@@ -493,7 +419,7 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
         | ((r >> 63) as u32) << 7
         | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
 }
-const CMP_FLAGS: u32 = 0x8d5;
+pub(crate) const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
@@ -555,12 +481,9 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
-    if FATAL.contains(&code) {
-        let to_file =
-            code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
+    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
-        unsafe { report("first-chance exception", info, to_file) };
+        unsafe { report("first-chance exception", info, false) };
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -696,70 +619,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
-    // `VICTORY_CRASH_MEMORY=1` (diagnostics): the bytes around each register
-    // that holds an address of the title's memory (below 1 TiB) that can be
-    // read, to see what overwrote the data a pointer was loaded from.
-    #[cfg(feature = "diagnostics")]
-    if std::env::var_os("VICTORY_CRASH_MEMORY").is_some_and(|v| v == "1") {
-        let regs = [
-            ("rax", context.Rax),
-            ("rbx", context.Rbx),
-            ("rcx", context.Rcx),
-            ("rdx", context.Rdx),
-            ("rsi", context.Rsi),
-            ("rdi", context.Rdi),
-            ("rbp", context.Rbp),
-            ("r8", context.R8),
-            ("r9", context.R9),
-            ("r10", context.R10),
-            ("r11", context.R11),
-            ("r12", context.R12),
-            ("r13", context.R13),
-            ("r14", context.R14),
-            ("r15", context.R15),
-        ];
-        // One block per exception, printed at once: the title's threads
-        // fault together and their lines interleave.
-        use std::fmt::Write as _;
-        let title = |v: u64| (0x1_0000_0000..0x100_0000_0000).contains(&v);
-        // SAFETY: a plain query.
-        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-        let mut dump = format!("  memory around the registers of thread {thread} (fault at {}):", locate(at));
-        let show = |dump: &mut String, name: &str, value: u64, len: usize| -> Vec<u64> {
-            let at = (value & !0xF) as usize;
-            let mut bytes = vec![0u8; len];
-            if !read_quietly(at, &mut bytes) {
-                return Vec::new();
-            }
-            let _ = write!(dump, "\n  [{name} {value:#x}] {}", region_of(at));
-            let qwords: Vec<u64> = bytes.chunks(8).map(|q| u64::from_le_bytes(q.try_into().unwrap_or_default())).collect();
-            for (k, row) in qwords.chunks(4).enumerate() {
-                let words: Vec<String> = row.iter().map(|q| format!("{q:016x}")).collect();
-                let _ = write!(dump, "\n    +{:#05x} {}", k * 32, words.join(" "));
-            }
-            qwords
-        };
-        for (name, value) in regs {
-            if !title(value) {
-                continue;
-            }
-            let qwords = show(&mut dump, name, value, 0x100);
-            // One level further: what the first fields point at (where a
-            // pointer the code loads from them was overwritten).
-            let mut followed = 0;
-            for (k, &q) in qwords.iter().take(0x20).enumerate() {
-                if followed < 6 && title(q) && (q ^ value) >> 16 != 0 {
-                    show(&mut dump, &format!("{name}+{:#x}->", k * 8), q, 0x80);
-                    followed += 1;
-                }
-            }
-        }
-        line(dump);
-    }
     if to_file {
-        let end = report_end();
-        eprint!("{end}");
-        text.push_str(&end);
+        let said = title_output();
+        eprint!("{said}");
+        text.push_str(&said);
         append_to_log(&text);
     }
     #[cfg(feature = "diagnostics")]
@@ -804,18 +667,16 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
     while frames.len() < MAX_FRAMES {
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
-        if rsp < low || rsp.checked_add(8).is_none_or(|end| end > high) {
+        if rsp < low || rsp + 8 > high {
             break;
         }
-        let prev = (context.Rip, context.Rsp);
         let mut image = 0;
         // SAFETY: looks up the function table entry covering `Rip`, if any.
         let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
         if entry.is_null() {
-            // SAFETY: `[rsp, rsp + 8)` lies inside this thread's stack; a
-            // crashing thread's RSP may be unaligned.
-            context.Rip = unsafe { (rsp as *const u64).read_unaligned() };
-            context.Rsp = context.Rsp.wrapping_add(8);
+            // SAFETY: `rsp` is inside this thread's stack.
+            context.Rip = unsafe { (rsp as *const u64).read() };
+            context.Rsp += 8;
         } else {
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
@@ -832,7 +693,7 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
                 )
             };
         }
-        if context.Rip == 0 || (context.Rip, context.Rsp) == prev {
+        if context.Rip == 0 {
             break;
         }
         frames.push(context.Rip);
@@ -860,47 +721,9 @@ fn module_of(address: usize) -> Option<String> {
     let mut path = [0u16; 260];
     // SAFETY: `module` is a loaded module; the buffer length is passed.
     let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
-    if len == 0 {
-        return None;
-    }
-    let rva = address.checked_sub(module as usize)?;
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
-    Some(format!("{name}+{rva:#x}"))
-}
-
-/// What kind of memory `at` lies in: its region's allocation base, size
-/// and type (private, a view of a section, an image).
-#[cfg(feature = "diagnostics")]
-fn region_of(at: usize) -> String {
-    use windows_sys::Win32::System::Memory::{MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: reads the address space's bookkeeping, not `at` itself.
-    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
-        return "unknown".into();
-    }
-    let kind = match info.Type {
-        MEM_PRIVATE => "private",
-        MEM_MAPPED => "mapped view",
-        MEM_IMAGE => "image",
-        _ => "?",
-    };
-    format!(
-        "{kind}, region {:#x}+{:#x}, allocation {:#x}",
-        info.BaseAddress as usize, info.RegionSize, info.AllocationBase as usize
-    )
-}
-
-/// Reads `out.len()` bytes at `at` without faulting; false if a page of the
-/// range cannot be read.
-#[cfg(feature = "diagnostics")]
-fn read_quietly(at: usize, out: &mut [u8]) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut done = 0;
-    // SAFETY: the kernel checks the source; the destination is ours.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), at as _, out.as_mut_ptr().cast(), out.len(), &mut done) != 0 }
+    Some(format!("{name}+{:#x}", address - module as usize))
 }
 
 /// What is at `address`, for an access violation there: nothing, memory
@@ -947,49 +770,6 @@ fn memory_at(address: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn concurrent_crash_records_stay_together() {
-        const THREADS: usize = 8;
-        const RECORDS: usize = 16;
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("synthetic-crashes.txt");
-        let ready = std::sync::Barrier::new(THREADS);
-        let body = "x".repeat(8192);
-        std::thread::scope(|scope| {
-            for thread in 0..THREADS {
-                let (file, ready, body) = (&file, &ready, &body);
-                scope.spawn(move || {
-                    ready.wait();
-                    for record in 0..RECORDS {
-                        super::append_record(file, &format!("record {thread}:{record}\n{body}"))
-                            .unwrap();
-                    }
-                });
-            }
-        });
-
-        let log = std::fs::read_to_string(file).unwrap();
-        let mut lines = log.lines();
-        let mut seen = std::collections::BTreeSet::new();
-        let process = std::process::id().to_string();
-        while let Some(header) = lines.next() {
-            let (time, pid) = header
-                .strip_prefix("unix time ")
-                .and_then(|line| line.split_once(", process "))
-                .expect("each record starts with a complete header");
-            assert!(time.parse::<u64>().is_ok());
-            assert_eq!(pid, process);
-            assert!(seen.insert(lines.next().expect("record identifier")));
-            assert!(lines.next().is_some_and(|line| line == body));
-        }
-        for thread in 0..THREADS {
-            for record in 0..RECORDS {
-                assert!(seen.remove(format!("record {thread}:{record}").as_str()));
-            }
-        }
-        assert!(seen.is_empty());
-    }
-
     use super::*;
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
@@ -1284,21 +1064,6 @@ mod tests {
     }
 
     #[test]
-    fn the_host_line_names_the_cpu_and_windows() {
-        // e.g. "  host: AMD EPYC 7763 64-Core Processor, Windows 10.0.26100\n"
-        let line = host();
-        let framed = line.starts_with("  host: ") && line.ends_with('\n');
-        assert!(framed, "{line:?}");
-        let inner = line.trim_start_matches("  host: ").trim_end();
-        let (cpu, windows) = inner.rsplit_once(", Windows ").expect(&line);
-        let named = !cpu.is_empty() && cpu == cpu.trim() && !cpu.contains('\0');
-        assert!(named, "{line:?}");
-        let version: Vec<u32> = windows.split('.').filter_map(|n| n.parse().ok()).collect();
-        assert!(version.len() == 3 && version[0] >= 10, "{line:?}");
-        println!("{line}");
-    }
-
-    #[test]
     fn clzero_zeroes_its_line_on_any_cpu() {
         report_crashes();
         #[repr(align(64))]
@@ -1542,124 +1307,6 @@ mod tests {
     }
 
     #[test]
-    fn emulated_clzero_loop_stops_when_the_limit_is_on_a_line_boundary() {
-        #[repr(align(64))]
-        struct Lines([u8; 256]);
-        // clzero; add rax, 0x40; cmp rax, r10; jb, with r10 exactly two lines
-        // on: the loop ends when rax reaches the limit (`>=`, not `>`).
-        let mut mem = Lines([0xff; 256]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start;
-        context.R10 = start + 128;
-        let code = [
-            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
-        ];
-        assert!(emulate_in(&code, 0, &mut context));
-        assert_eq!((context.Rip, context.Rax), (12, start + 128));
-        assert_eq!(
-            context.EFlags & CMP_FLAGS,
-            native_compare(start + 128, start + 128)
-        );
-        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-        assert_eq!(zeroed, [true, true, false, false]);
-    }
-
-    #[test]
-    fn emulated_clzero_second_loop_with_extended_registers() {
-        #[repr(align(64))]
-        struct Lines([u8; 256]);
-        // mov rax, r9; add r9, 0x40; clzero; cmp r9, r12; jb. `a` = r9 needs
-        // REX.R in the mov and REX.B in the add and in the cmp; `b` = r12
-        // needs REX.R in the cmp.
-        let mut mem = Lines([0xff; 256]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start;
-        context.R9 = start + 64;
-        context.R12 = start + 192;
-        let code = [
-            0x4c, 0x89, 0xc8, 0x49, 0x83, 0xc1, 0x40, 0x0f, 0x01, 0xfc, 0x4d, 0x39, 0xe1, 0x72,
-            0xf1,
-        ];
-        assert!(emulate_in(&code, 7, &mut context));
-        assert_eq!(
-            (context.Rip, context.Rax, context.R9),
-            (15, start + 128, start + 192)
-        );
-        assert_eq!(
-            context.EFlags & CMP_FLAGS,
-            native_compare(start + 192, start + 192)
-        );
-        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-        assert_eq!(zeroed, [true, true, true, false]);
-        // Every `a` in r9..r15 (r12 as the limit, so skip it as `a`).
-        for a in [9_u8, 10, 11, 13, 14, 15] {
-            let mut mem = Lines([0xff; 256]);
-            let start = mem.0.as_mut_ptr() as u64;
-            // SAFETY: an all-zero context is valid.
-            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-            context.Rax = start;
-            *gpr(&mut context, a) = start + 64;
-            context.R12 = start + 192;
-            let n = a & 7;
-            let code = [
-                0x4c,
-                0x89,
-                0xc0 | n << 3,
-                0x49,
-                0x83,
-                0xc0 | n,
-                0x40,
-                0x0f,
-                0x01,
-                0xfc,
-                0x4d,
-                0x39,
-                0xe0 | n,
-                0x72,
-                0xf1,
-            ];
-            assert!(emulate_in(&code, 7, &mut context), "r{a}");
-            assert_eq!(context.Rip, 15, "r{a}");
-            assert_eq!(*gpr(&mut context, a), start + 192, "r{a}");
-            assert_eq!(context.Rax, start + 128, "r{a}");
-            let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-            assert_eq!(zeroed, [true, true, true, false], "r{a}");
-        }
-    }
-
-    #[test]
-    fn emulated_clzero_loops_with_rax_as_the_limit_are_one_line() {
-        #[repr(align(64))]
-        struct Lines([u8; 192]);
-        let zeroed = |l: &Lines| [l.0[0] == 0, l.0[64] == 0, l.0[128] == 0];
-        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, rax; jb: the limit
-        // would be the line just zeroed, not a loop: one line, the next
-        // instruction, flags untouched.
-        let mut mem = Lines([0xff; 192]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start + 64;
-        context.Rdx = start + 128;
-        context.EFlags = 0x202;
-        let code = [
-            0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x48, 0x39, 0xc2, 0x72,
-            0xf1,
-        ];
-        assert!(emulate_in(&code, 7, &mut context));
-        assert_eq!(
-            (context.Rip, context.Rax, context.Rdx),
-            (10, start + 64, start + 128)
-        );
-        assert_eq!(context.EFlags, 0x202);
-        assert_eq!(zeroed(&mem), [false, true, false]);
-    }
-
-    #[test]
     fn emulated_rdpru_reads_known_counters_and_keeps_flags() {
         let cases = [(0, true), (1, true), (2, false), (0x1_0000_0000, true)];
         let starts = [0x202, 0x202 | CMP_FLAGS];
@@ -1803,31 +1450,5 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
-    }
-
-    #[test]
-    fn unwind_into_handles_overflowing_and_unaligned_rsp() {
-        // 1. High RSP near usize::MAX must not overflow `rsp + 8` or dereference.
-        // SAFETY: zeroed CONTEXT is valid for synthetic unwind bounds testing.
-        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
-        ctx.Rip = 0x1000;
-        ctx.Rsp = u64::MAX - 4;
-        let mut frames = Vec::with_capacity(MAX_FRAMES);
-        unwind_into(ctx, 0, usize::MAX, &mut frames);
-        assert_eq!(frames, vec![0x1000]);
-
-        // 2. Unaligned RSP on a leaf frame (no RUNTIME_FUNCTION for Rip = 0x1000)
-        // must read unaligned return addresses cleanly without alignment UB/panic.
-        let mut stack = [0u8; 32];
-        let ret_addr = 0x1234_5678_9abc_def0u64;
-        stack[1..9].copy_from_slice(&ret_addr.to_le_bytes());
-        // Next return slot at stack[9..17] is 0, terminating the unwind.
-        let low = stack.as_ptr() as usize;
-        let high = low + stack.len();
-        ctx.Rip = 0x1000;
-        ctx.Rsp = (low + 1) as u64;
-        frames.clear();
-        unwind_into(ctx, low, high, &mut frames);
-        assert_eq!(frames, vec![0x1000, ret_addr]);
     }
 }

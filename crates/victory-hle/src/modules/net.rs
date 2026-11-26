@@ -465,7 +465,6 @@ pub extern "system" fn sendto(
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
-    victory_gpu::kernel_will_read(buf as usize, len.max(0) as usize);
     host!("ws2_32.dll", "sendto": extern "system" fn(Socket, *const u8, i32, i32, *const u8, i32) -> i32)(
         s, buf, len, flags, to, to_len,
     )
@@ -485,33 +484,9 @@ pub extern "system" fn WSASendTo(
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
-    send_buffers_visible(buffers, count);
     host!("ws2_32.dll", "WSASendTo": extern "system" fn(Socket, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32)(
         s, buffers, count, sent, flags, to, to_len, overlapped, completion,
     )
-}
-
-/// A `WSABUF`: bytes, then where they are.
-#[repr(C)]
-struct SendBuffer {
-    len: u32,
-    buf: *const u8,
-}
-
-/// The kernel reads the title's send buffers: what the GPU side keeps on
-/// the card there (`VICTORY_COPYBACK=lazy`) comes back first, since the
-/// kernel's read of a page kept closed fails rather than faulting.
-fn send_buffers_visible(buffers: *const c_void, count: u32) {
-    if buffers.is_null() {
-        return;
-    }
-    for i in 0..count as usize {
-        // SAFETY: the title passes `count` `WSABUF`s.
-        let b = unsafe { &*buffers.cast::<SendBuffer>().add(i) };
-        if !b.buf.is_null() {
-            victory_gpu::kernel_will_read(b.buf as usize, b.len as usize);
-        }
-    }
 }
 
 /// A connection-oriented socket, whose sends go to the peer `connect` vetted.
@@ -524,15 +499,11 @@ fn stream(s: Socket) -> bool {
     getsockopt(s, SOL_SOCKET, SO_TYPE, &mut kind, &mut len) == 0 && kind == SOCK_STREAM
 }
 
-/// A `WSAMSG`: the destination, the buffers, the control data, flags.
+/// The start of a `WSAMSG`: the destination.
 #[repr(C)]
 struct MessageName {
     name: *const u8,
     len: i32,
-    buffers: *const c_void,
-    count: u32,
-    control: SendBuffer,
-    flags: u32,
 }
 
 pub extern "system" fn WSASendMsg(
@@ -549,13 +520,6 @@ pub extern "system" fn WSASendMsg(
         && !reachable("network datagram blocked", m.name, m.len)
     {
         return SOCKET_ERROR;
-    }
-    // SAFETY: as above.
-    if let Some(m) = unsafe { message.cast::<MessageName>().as_ref() } {
-        send_buffers_visible(m.buffers, m.count);
-        if !m.control.buf.is_null() {
-            victory_gpu::kernel_will_read(m.control.buf as usize, m.control.len as usize);
-        }
     }
     host!("ws2_32.dll", "WSASendMsg": extern "system" fn(Socket, *const c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32)(
         s, message, flags, sent, overlapped, completion,

@@ -95,7 +95,7 @@ impl Lower<'_> {
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
-            if super::super::lean_math() >= 1 {
+            if Self::wide_scalar_loads() {
                 let b = self.cur;
                 raw = self.raw_dwords(b, h, addr, count).into_iter().map(|x| (x, zero)).collect();
             }
@@ -137,7 +137,7 @@ impl Lower<'_> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            if super::super::lean_math() >= 1 {
+            if Self::wide_scalar_loads() {
                 let dwords = self.raw_dwords(c, h, addr, count);
                 for (k, x) in dwords.into_iter().enumerate() {
                     self.write(inst, Reg::S(code + k as u8), x, None);
@@ -250,11 +250,37 @@ impl Lower<'_> {
         Ok(())
     }
 
+    /// Whether the dwords of one console load are read by one call for up
+    /// to four of them (`bitcode::opt::WIDE` of `VICTORY_SHADER_OPT`: 64,
+    /// not in the default), not by a call each. Upstream's switch, for the
+    /// scalar buffer loads here and the `global_load_dwordx2` to `x4` of
+    /// `lower.rs`.
+    pub(super) fn wide_loads() -> bool {
+        super::super::shader_opt() & super::super::bitcode::opt::WIDE != 0
+    }
+
+    /// [`Self::wide_loads`] for the scalar buffer loads of this file, which
+    /// `VICTORY_LEAN_MATH` (fxceless #995's switch) asks for too: it had
+    /// this form for them before upstream did, and one form serves both
+    /// ([`Self::raw_dwords`]). What that switch gives is as it was.
+    fn wide_scalar_loads() -> bool {
+        Self::wide_loads() || super::super::lean_math() >= 1
+    }
+
     /// `count` dwords from byte `addr` of raw view `h`, as a scalar buffer
     /// load reads them: one host load for each four (DXIL's raw loads take
     /// up to four dwords at a 4-byte alignment), where one per dword was.
-    /// The address is the same in every lane.
-    fn raw_dwords(&mut self, b: usize, h: V, addr: V, count: u32) -> Vec<V> {
+    /// (A scalar buffer load's address is the same in every lane; a global
+    /// load's, `lower.rs`, is the lane's own, as its loads a dword at a
+    /// time were: the loads are emitted in block `b` either way.) They are
+    /// the dwords of ONE
+    /// console load, which the console reads as one (address plus 4, 8, ...
+    /// without wrapping at 32 bits): the same bytes as a call a dword
+    /// reads. Loads of different console instructions are never joined:
+    /// the program computes their offsets in 32-bit registers, and `x - 4`
+    /// and `x` at `x = 0` are one dword out of the view and its first one,
+    /// where one call from `x - 4` on would read both out of it.
+    pub(super) fn raw_dwords(&mut self, b: usize, h: V, addr: V, count: u32) -> Vec<V> {
         let mut out = Vec::with_capacity(count as usize);
         let mut k = 0;
         while k < count {

@@ -8,8 +8,8 @@
 //! the title read those two kinds), and boats sank.
 //!
 //! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated
-//! `<width>x<height>f<format>`; `1` for the four water formats found by
-//! the upstream trace), a list in which shaders write one copies it
+//! `<width>x<height>f<format>`; unset or `1`: the four water formats found by
+//! the upstream trace; `0`: none), a list in which shaders write one copies it
 //! into a read-back buffer of ours when it closes, and once the list has run
 //! the texels are tiled into the texture's title memory in the console's
 //! layout, as the console's GPU would have left them.
@@ -31,16 +31,9 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
-        // On by default since wave 9 (one general test: no cost in the save's
-        // gameplay, and without it boats sink and the first boat mission
-        // fails); `=0` turns it off, a list picks other kinds. The crate's
-        // own tests run without it unless they ask.
         let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
-            Ok("0") => String::new(),
-            Ok("1") => DEFAULT.to_owned(),
+            Ok("1") | Err(_) => DEFAULT.to_owned(),
             Ok(spec) => spec.to_owned(),
-            Err(_) if cfg!(test) => String::new(),
-            Err(_) => DEFAULT.to_owned(),
         };
         let kinds: Vec<(u64, u32, u32)> = list
             .split(',')
@@ -55,11 +48,6 @@ fn kinds() -> &'static [(u64, u32, u32)] {
         }
         kinds
     })
-}
-
-/// Whether any kind of texture is copied back.
-pub(crate) fn on() -> bool {
-    !kinds().is_empty()
 }
 
 /// Whether title texture `resource` is of a kind copied back.

@@ -877,3 +877,83 @@ fn with_every_ray_missing_the_node_test_returns_nothing_in_the_way_on_the_card()
         assert!(ran > 0, "no SM 6.6 device available");
     }
 }
+
+#[test]
+fn disabled_structures_leave_the_page_fault_buffer_untouched() {
+    // Box32 at page 11 of an empty directory. Only the address and the
+    // execution mask matter here. The actual node has no backing copy.
+    const PAGE: u32 = 11;
+    const MARKER: u32 = 0xabcd_ef01;
+    let (shader, _) = build(true, WHOLE).expect("the title-memory program lowers");
+    let mut records = vec![0; (NODES / 4) as usize];
+    for record in records.chunks_exact_mut((RECORD / 4) as usize) {
+        record[0] = (PAGE << 13) | 5;
+        record[12] = 1;
+    }
+    let base = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_MEMORY_BASE))
+        .expect("base slot for the title-memory views")
+        .index as usize;
+    let mut initial = vec![0; super::MEMORY_FAULTS as usize];
+    initial[0] = MARKER;
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("WARP", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline_bounded(&shader)
+            .expect("compute pipeline");
+        for built in [false, true] {
+            let mut args = constants(&shader, built);
+            args[base] = 2;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(args)),
+                            (1, Root::Uav(initial.clone())),
+                            (
+                                2,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![0; ((PAGE + 1) * 2) as usize],
+                                },
+                            ),
+                        ],
+                        views: &[
+                            View::Buffer {
+                                data: &records,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(4 * THREADS),
+                            View::RawUav(32),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("BVH dispatch");
+            let faults = out.last().expect("root fault UAV");
+            if built {
+                assert_eq!(
+                    faults[1 + PAGE as usize],
+                    PAGE,
+                    "missing page was requested"
+                );
+            } else {
+                assert!(out[0].iter().all(|&child| child == bvh::NONE));
+                assert_eq!(faults[0], MARKER, "disabled traversal wrote the fault sink");
+                assert_eq!(faults, &initial);
+            }
+        }
+    }
+}

@@ -1,19 +1,10 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **the structure builder works, off by default for its
-cost** (`VICTORY_BVH_BUILDER=1` runs it; with it the opening's frame went
-from 385 to 752 ms). Its first frame in the game is some
-12,000 dispatches in the user-save scenario. In run rt-int1 the title died
-one frame later, its threads reading pointers of all ones out of pages that
-held what the builder wrote: the builder dispatches its box rehydration by
-thread counts, which the layer took for group counts, and those stages
-wrote empty nodes over gigabytes past their structures (see "Dispatches by
-thread counts" below). With the fix, run integ-general-2-rt2-builder had
-the builder on for 420 s of save gameplay: no fault, every stage run, some
-200 builder dispatches a frame once the world is up, and 88 ms more card
-time a frame in the same scene (160 ms against 72). The ray-traced passes
-now walk structures the builder made; whether they light as the console
-does is still to be compared picture by picture.
+Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
+indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
+card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
+default. **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
+for next to nothing (below).
 
 ## What the title does
 
@@ -46,14 +37,11 @@ shaders and emulates the one instruction.
 
 ## What this fork adds
 
-1. **The builder programs translate** (all 52). They pass buffer addresses in
-   a spilled parameter table rather than in descriptors. Added: the spilled
-   user-data table, root unordered-access views (translator and host binding),
-   byte and 16-bit buffer accesses, and several control-flow shapes. On a GPU
-   with 32-lane waves, three of them (prefix sums over groups of 256 and 512
-   threads, whose 64-lane waves read lanes across their halves) run in the
-   paired form: one host wave for each console wave, each thread two of its
-   lanes.
+1. **The builder programs translate** (all 52, with host pipelines on the RX
+   7900 XTX; the title creates 53 such pipelines). They pass buffer addresses in a spilled parameter table
+   rather than in descriptors. Added: the spilled user-data table, root
+   unordered-access views (translator and host binding), byte and 16-bit buffer
+   accesses, and several control-flow shapes.
 2. **Title memory by raw address from shaders.** A directory with one entry per
    64 KiB of title address space leads a shader to the layer's host copy of
    that memory; loads, stores, atomic add/sub and float min/max go through it.
@@ -63,164 +51,116 @@ shaders and emulates the one instruction.
    for box nodes; a watertight ray/triangle test for triangle nodes; both forms
    of the instruction. A plain Rust reference lives in
    `crates/victory-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
-   over 313 ray/node cases and compare with the reference bit for bit.
+   over 311 ray/node cases and compare with the reference bit for bit.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
    64-lane waves running on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
    every builder pipeline the title has created has a host pipeline; otherwise
-   none run (off by default, `VICTORY_BVH_BUILDER=1` turns the builder on;
-   `VICTORY_BVH_QUARANTINE=1`
+   none run (`VICTORY_BVH_BUILDER=1` asks for it; `VICTORY_BVH_QUARANTINE=1`
    also keeps the builder's stores out of title memory, for a first test). A
    partly working builder wrote garbage bounds into title memory and crashed
-   the title. While the builder does not run (before its first dispatch,
-   turned off, or without `VICTORY_BVH_BUILDER=1`), every node test of the
-   trace programs answers no hit without reading the node (a host word,
-   `USER_STRUCTURES`): their rays see an empty scene instead of whatever
-   bytes lie where the structures would be, which with the builder off made
-   screen-aligned dark tiles on sunlit hair and lit squares in shadow, and
-   changed the hair's light from run to run. `VICTORY_BVH_NO_HIT=0` lets
-   them walk those bytes, as before.
-6. **What running the builder in the game took so far** (2026-11-25, each a
-   commit of its own):
-   - *List upload memory where shaders reach it.* The builder writes the
-     tables its stages read into list upload memory and hands them the
-     addresses; its header stage (InitHeaders) reads its records by address.
-     The blocks of the process heap the layer gave out lay at 1.5-1.8 TiB,
-     past the console's 40 bits and the directory (below 128 GiB): the records
-     read as zeros and no structure header was written. Upload memory now
-     comes from 4 MiB chunks of one write-watched reservation below 128 GiB
-     (`list.rs`, `upload`), named before every builder dispatch.
-   - *The structures' sizes, copied on the card.* The title copies each
-     structure's compacted size out of the builder's buffer with
-     `CopyBufferRegion` in the list that computed it. Done on the CPU at
-     submission, the copy took what the buffer held before the list's
-     shaders ran; in lists whose shaders store by address it now runs on the
-     card behind them (`HostList::copy_on_card`).
-   - *Copies of title memory by address kept current where named.* Every list
-     that ran a builder stage refreshed and compared all numbered copies
-     (1,023 windows, 4 GiB): with the stages bound and not run that alone made
-     a median 975 ms a frame against 353 without the builder. A list now
-     refreshes the copies its dispatches name (and the upload memory's) and
-     declares written only those, and only for programs that store through an
-     address (`VICTORY_MEMORY_ALL=1`: as before). Low dwords of address pairs
-     are no longer also taken as addresses in 256-byte units (717 of the 802
-     windows named that way in the first frame were), and there are 2,047
-     numbers: the first frame ran out of the 1,023.
-   - *Remaps after the flights.* `CopyPageMappingsBatchX` waits for flights
-     whose shaders may write the range it maps.
-   - *DirectStorage's writes into physical pages, seen wherever the pages are
-     shown.* The title streams its pre-built structures into pool pages and
-     maps them into its tiled heap. A write through another view than the
-     guarded address never reached the host copies, which kept what the pages
-     held before. The integration branch has this report from upstream
-     (`xmem.rs`, `pages_written`; `watch.rs`, `title_memory_written`,
-     `VICTORY_PAGE_WRITES`) and guards every view of a page together
-     (`VICTORY_VIEW_GUARD`), so a write the title's CPU makes through one view
-     is seen at the others.
-   - *Dispatches by thread counts.* `DispatchX(x, y, z, flags)` passes the
-     console's dispatch initiator bits as its flags. The builder sets
-     `USE_THREAD_DIMENSIONS` (0x20; with 0x8000 for wave32 programs) on four
-     of its dispatch calls: header copies (DecompressHeader), the box
-     rehydration of pre-built structures (Box32Rehydration,
-     Box16Rehydration) and triangle reloads (ReloadTriangles,
-     ReloadProcedurals). Then x, y and z count threads: the last group is cut
-     short, and no thread past the count is launched. The layer took them for
-     group counts. The box stages rebuild one level of a tree a dispatch, in
-     place, one node a thread, group g writing its 64 nodes at g times 8 KiB
-     (4 KiB for 16-bit boxes), and a lane count read off EXEC
-     (`WaveAllBitCount`) places each node's compressed payload. In rt-int1's
-     first frame they ran 272,948 and 47,026 groups where 5,983 and 4,217
-     were wanted, and wrote 2.2 GiB of empty nodes past their levels; where
-     that was put back, it lay over the title's own objects, which share
-     those pages at a CPU view 24 GiB lower. Every crash site of rt-int1
-     (title +0x2bd385b, +0x27c195d, +0x4f38ba5, +0x4e51965) lies in such an
-     overrun. (The copies and reloads check their counts themselves: for
-     them it cost time only, 236,385 groups of ReloadTriangles for 7,410.)
-     `dispatch_x` now makes groups of the program's console size out of the
-     counts. Where a last group is cut short, the pipeline runs in a form of
-     its program translated for that
-     (`victory_shader::emit::translate_thread_limited`, made at its first such
-     dispatch): the host passes the counts (`USER_THREAD_LIMIT`), and the
-     threads past them leave in the entry block, so that wave operations, a
-     ballot of EXEC on entry and the title's barriers count the launched
-     threads only, as the console's partial wave does. The two host waves of
-     a console wave64 program that exchange first tell each other whether
-     they have a launched thread (one with none leaves whole, its exchange
-     dword holding 0). The paired and approximate forms are refused (a host
-     thread holding two console lanes cannot leave for one of them): a
-     builder stage without the form turns the builder off.
-   - *Addresses in the records of upload memory.* LeafRehydration reads its
-     geometry descriptions (48-byte `D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC`
-     records) through a root SRV in list upload memory and loads vertices
-     and indices through the addresses in them, which no root argument
-     names: in rt-int1, 638 of the 2,139 such addresses lay in no copy when
-     the stage ran, and those leaves read zeros. Before a dispatch, the
-     block of upload memory each of the shader's root SRVs points into is
-     looked through (16 KiB at most) for 8-byte title addresses, which are
-     named like the dispatch's own (`memory.rs`).
-7. **Four more sun-shadow trace programs translate.** They take the address
-   of their structure out of a descriptor they pick from the view heap; the
-   host keeps a table of view addresses by heap slot (`SLOT_VIEW_ADDRESSES`).
-   The game's scene in the user-save scenario uses the checkerboard variant,
-   which translated before.
-8. **Diagnostics.** `VICTORY_BVH_TRACE=<file>` traces every dispatch of the
-   builder and of the programs that reach memory by address, the list upload
-   memory they read, every range put back into title memory, page mappings
-   (with their ranges) and copies; `VICTORY_BVH_DRY=1` binds the builder's
-   dispatches without running them; `VICTORY_BVH_CHECK=<hash of the header
-   stage>[,<hash of the header decompression>]` walks the structures they
-   start, in title memory, from the frame after the shaders' writes over
-   their header were put back, and reports bad nodes (`V` lines for
-   those built on the card, `V rebuilt` for those rebuilt in place from what
-   was streamed; the nodes of those are in a space of their own, the leaf
-   rehydration's vertices scaled by powers of two such as 2^18, so their
-   root is not held to the header's bounds); `VICTORY_CRASH_MEMORY=1` adds the title memory
-   around the registers (and one pointer further) to a crash report. With the
-   user's own `XboxBvhBuilder.dll`, `VICTORY_TEST_BVH_DLL` runs the builder's
-   wave64 programs in their picked and paired forms on the card and compares
-   them (they agree).
+   the title.
+
+## The structures (from dumps of the arenas, `VICTORY_MEMORY_DUMP`)
+
+- Header, 64 bytes: dword 0 the version 6 in the low half and marks in the high
+  (0x8000 bottom level, 0x4 compacted, 0x2 rehydrated, 0x100 still packed),
+  dword 1 the size in 64-byte nodes, 3 the number of elements, 4-9 the bounds,
+  10 the offset of the box nodes, 12 the root's node pointer, 13 the offset of
+  the elements, 14 the offset of the parent table (from the header; the static
+  ones' index counts the leaves too, so it is negative).
+- An instance is 128 bytes at the top level's offset 13: a 3x4 matrix in dwords
+  0-11, id and mask, flags, the root pointer (bit 30 set for static ones), the
+  bottom level's address in 256-byte units.
+- The static world's structures are shipped **packed ("dehydrated")** and
+  unpacked in place, once, by DecompressHeader, Box32/Box16Rehydration and
+  LeafRehydration when they have been streamed in (3,000 in the opening).
+- Dynamic ones are built, their compacted size read back by the title from a
+  small buffer, and copied to a place of that size.
+
+## How title memory by address is held (`memory.rs`)
+
+Pages of 64 KiB in arenas on the card, whole title buffers in their own copies,
+pages with small title buffers as windows of title memory. The module's
+comment has the rules. In short: what the builder stores stays on the card
+(only small title buffers it was given to write come back); a packed structure
+goes up whole when the builder comes to it; title buffers take its stores only
+after it was given them as an unordered access view.
+
+| variable | does |
+|---|---|
+| `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
+| `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
+| `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
+| `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
+| `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
+| `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
+| `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
+| `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
+
+Every ten seconds the log has a line "title memory by address: ..." with pages,
+dispatches, faults and what came.
 
 ## Known gaps
 
-- Before the fix for dispatches by thread counts (rt-int1 and before) the
-  title died one frame after the builder's first frame, 13 access
-  violations on several threads reading pointers of all ones or of
-  infinities, each faulting object 24 GiB below a tiled-heap range the box
-  rehydration had overrun. Since the fix: none in 420 s (run
-  integ-general-2-rt2-builder).
-- The trees are not all known to be valid. In run integ-general-2-rt2-builder
-  the walk (`VICTORY_BVH_CHECK`) flagged some 10% of nodes, but it read most
-  of them before the builder's writes were put back (a structure rebuilt in
-  frame 3255 was walked at the start of 3256 still in its streamed form),
-  and held the rebuilt structures' roots to bounds in another space (the
-  leaf rehydration's scale); both are fixed in the walk since, and a run
-  with it has to say what is left. The walk reads title memory, which holds
-  only what was put back: a node in a window no dispatch named reads as it
-  was, and a structure the title rebuilds every frame may change under it.
-- What a stage reaches only through addresses in title memory (not in
-  upload memory), such as the structures a top-level build's instances
-  name, is not made ready unless something else named it; an access that
-  finds no copy reads 0 and is noted for the next frame (`F` lines of the
-  trace), which comes too late for a structure built once.
-- Copy numbers are never given back: the builder named some 1,450 windows in
-  six minutes (rt-dry1), and 2,047 numbers run out in a longer session.
-- One shadow-mask trace program (FullAdaptive) stops at a lane mask read as
-  data.
-- An access to a title page that has no host copy is lost (a read gives zero, a
-  store is dropped).
+- Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
+  275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
+  structure's compacted size, reads it one or two frames later without looking
+  whether it is there, takes memory of that size and has the structure copied
+  into it. Our submissions land up to two frames late; the title read what the
+  slot held before, another structure's size, and the copy wrote over the
+  neighbours. Waiting for a submission that asks (`VICTORY_BVH_SIZES_WAIT=1`)
+  did not mend it and costs some 20 ms a frame (light-15): the title asks in
+  every frame, and what it read was as old as before. Open.
+- What a structure that was written over says of its size sent the builder's
+  copy of it through gigabytes of other structures; bounded now
+  (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
+  before, 90 after (the dorm).
+- The card's time in the dorm with the builder (timing run light-13, title's
+  commands 84 ms): `CopyForBVHUpdate` 13.3 ms in 63 dispatches (before the
+  bound), traces 24 ms (`RaytraceVBuffer` 7.9, screen probes 6.4, irradiance
+  cache 3.5, primary probes 2.3, shadows 1.6).
+- Captures made on 2026-11-25 (builder on or off) hang the card in a replay
+  (cause unknown; do not try).
+- Five shadow-mask trace programs do not translate (a structure's address out
+  of a descriptor picked from the heap by a computed index: the host would have
+  to give a table of addresses by slot). The title did not create them in any
+  run so far.
+- An access to a page that is not there is lost (a read gives zero, a store is
+  dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
-  of two boxes entered at the same distance, the result for a ray exactly
-  through an edge, and what a child that is not there returns when the ray
-  enters its box (here: a miss); that `USE_THREAD_DIMENSIONS` launches exactly
-  the counted threads, the last group cut short (the flags carry no
-  `PARTIAL_TG_EN`, but the box stages place their payloads by the lanes in
-  EXEC, which only a cut short wave makes right).
-- Cost: with the builder on, 88 ms more card time a frame in the window
-  scene of the save gameplay (160 ms against 72, run
-  integ-general-2-rt2-builder, its trace on). Its cost to the frame, which
-  the submitting thread bounds, is still to be measured without the trace.
+  of two boxes entered at the same distance, and the result for a ray exactly
+  through an edge.
+
+## Without rays: the stand-in (`crates/victory-gpu/src/ambient.rs`)
+
+Without structures every ray misses. The title's program that resolves the
+diffuse light of its screen probes (`CS_ScreenProbes_TemporalResolve_*`, list
+184 of a frame) then leaves the sky's light outdoors, nothing indoors, and in
+blocks of tiles what the probes' memory held. `VICTORY_AMBIENT=<share>` raises
+it to an estimate right after that program: the title keeps, for its own screen
+traces, the light visible surfaces send out (`CS_CacheScreenSpaceRadiance`,
+1280x720, the frame before); its mean in 64x36 cells is gathered at 160x90
+points, each cell weighted by the share of the surroundings it covers, as a
+directional value; each pixel takes it between the points by depth, with its
+normal and a shade in creases. So level and tint follow the hour, the room and
+its lamps. What the program left counts up to four times the estimate.
+
+Where it can be put, and the crease shade, are beloooo's (VIctory-Belobug-AMD
+06031237, 4f45ab88, cd9f78ce); `VICTORY_AMBIENT=constant:<level>` is that
+fork's constant.
+
+| variable | does |
+|---|---|
+| `VICTORY_AMBIENT=<share>` | the estimate, 1 all of it (unset: the title's own) |
+| `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
+| `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
+| `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+
+It is off while the builder runs.
 
 ## Where to look
 
@@ -231,9 +171,3 @@ shaders and emulates the one instruction.
   and raw addresses.
 - `crates/victory-gpu/src/pipeline.rs`, `draw.rs`: the builder rule and the
   host side of root views and title memory.
-- `crates/victory-gpu/src/memory.rs`: title memory by address (directory,
-  numbered copies, what a dispatch names).
-- `crates/victory-gpu/src/bvhtrace.rs`: the builder's trace and the
-  structure walk.
-- `crates/victory-hle/src/modules/xmem.rs`: physical pages, their views, and
-  the addresses a write into them shows at.

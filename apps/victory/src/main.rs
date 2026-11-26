@@ -4,14 +4,19 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod defaults;
 mod inspect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod replay;
 mod run;
 mod shader;
 mod translate;
 mod translate_diff;
+#[cfg(windows)]
+mod warm;
 
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -98,17 +103,13 @@ enum Command {
         #[arg(long)]
         jobs: Option<NonZeroUsize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
-        /// hex digits a run's log names a shader by, anywhere in a line);
-        /// the containers with those hashes are translated into the
-        /// cache for the detected adapter. Set `VICTORY_HOST_WAVE` and
-        /// `VICTORY_VIEW_LIMIT` to warm for a different host.
+        /// hex digits a run's log names a shader by, anywhere in a line),
+        /// or `all`; the containers with those hashes are translated into
+        /// the cache for the detected adapter and nothing else is done. Set
+        /// `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT` to warm for a
+        /// different host.
         #[arg(long)]
         warm: Option<PathBuf>,
-        /// Upstream's warm-up: every container found, the same as `--warm
-        /// all` (upstream's pipeline pre-build, `--cache --pipelines`, is
-        /// not in this fork).
-        #[arg(long, conflicts_with_all = ["validate", "list", "hashes", "pipelines", "warm"])]
-        cache: bool,
     },
     /// Compare two `translate --list` outputs (two builds over the same
     /// shaders): the programs one validates and the other does not, with
@@ -120,6 +121,37 @@ enum Command {
         /// Also name each program (container hash and stage).
         #[arg(long)]
         keys: bool,
+    },
+    /// Translate every shader found (as `translate` finds them) into the
+    /// shader cache, so that no run has to: a few minutes, once per change
+    /// of the translator.
+    Shaders {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
+    /// Make the host pipelines of every pipeline the title ever created
+    /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
+    /// driver's cache on disk has them before a run needs one: once per change
+    /// of the translator or the driver. Goes on where it was stopped.
+    #[cfg(windows)]
+    Warm {
+        /// Processes at once (default: two thirds of the logical cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// At most this many pipelines.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Those made before too.
+        #[arg(long)]
+        again: bool,
+        /// Only the pipelines earlier runs drew with.
+        #[arg(long)]
+        used: bool,
+        /// (What the processes it starts are given.)
+        #[arg(long, hide = true)]
+        these: Option<String>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -141,6 +173,10 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Run a captured frame's GPU work again (diagnostics builds; see
+    /// docs/replay.md).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -158,6 +194,11 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // The switches the title is played with, before anything reads them
+    // (`defaults`).
+    if std::env::args().nth(1).as_deref() == Some("run") {
+        defaults::apply();
+    }
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -191,11 +232,12 @@ fn main() -> Result<()> {
             hashes,
             jobs,
             warm,
-            cache,
         } => {
             let view_limit = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok());
             let host_wave = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok());
-            if (warm.is_some() || cache) && (view_limit.is_none() || host_wave.is_none()) {
+            // The warm-up keys translations on what the adapter tells the
+            // translator, as a run does: the host is opened for what is not set.
+            if warm.is_some() && (view_limit.is_none() || host_wave.is_none()) {
                 victory_hle::modules::d3d12x::prepare_shader_warm().map_err(anyhow::Error::msg)?;
             }
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
@@ -210,27 +252,25 @@ fn main() -> Result<()> {
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
-            if cache {
-                return translate::warm(paths, Path::new("all"), jobs);
-            }
             translate::run(paths, validate, pipelines, list, hashes, jobs)
         }
         Command::TranslateDiff { old, new, keys } => translate_diff::run(&old, &new, keys),
+        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        #[cfg(windows)]
+        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
-            title_args: _,
+            title_args,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
-            if code != 0 {
-                // Preserve all 32 bits of the Windows process status.
-                std::process::exit(code as i32);
-            }
-            Ok(())
+            victory_hle::runtime::set_title_args(title_args);
+            run::run(&exe, unimplemented, strict, execute, console)
         }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
 }
@@ -251,7 +291,6 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
-    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

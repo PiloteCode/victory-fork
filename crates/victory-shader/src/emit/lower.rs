@@ -1899,7 +1899,7 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<crate::resource::Address> = self
                     .x
                     .res
                     .scalar
@@ -1912,9 +1912,15 @@ impl<'a> Lower<'a> {
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                // After the instructions with `VICTORY_CODE_TABLE_TAIL=1`
+                // (`super::code_table`).
+                let first = if super::code_table::tail_on() {
+                    super::code_table::start(self.x.p, &addresses, lowest)
+                } else {
+                    lowest
+                };
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -2020,6 +2026,15 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
+            // (`smem.rs`: this tree's one form of the load, which takes
+            // the block.)
+            let b = self.cur;
+            for (k, x) in self.raw_dwords(b, h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {

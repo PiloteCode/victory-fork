@@ -1,65 +1,45 @@
-//! The translator's fingerprint, for the key of translated shaders kept on
-//! disk (`src/shader_cache.rs`): what decides a translation's result, read
-//! at build time. That is the translator's sources (`victory-shader`), the
-//! encoding of a cache entry (`src/shader_cache.rs`), the cache itself
-//! (`victory-pipeline`), the locked dependency versions and the toolchain.
-//! What is only known when the translator runs (its settings, whether its
-//! debugging switches are built in) is added to the key there.
-//!
-//! The key was the BLAKE3 of our executable: every rebuild, whatever it
-//! changed, threw away the thousands of translations a world had cached and
-//! the next start translated them all again.
+//! Fingerprints the shader translator, so that cached translations
+//! (`src/shader_cache.rs`) last until the translator itself changes and not
+//! only until the next build of anything.
 
 use std::path::{Path, PathBuf};
 
-fn main() {
-    let gpu = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("set by cargo"));
-    let root = gpu.join("..").join("..");
-    let mut files = Vec::new();
-    for dir in ["crates/victory-shader/src", "crates/victory-pipeline/src"] {
-        let dir = root.join(dir);
-        println!("cargo:rerun-if-changed={}", dir.display());
-        sources(&dir, &mut files);
-    }
-    for file in [
-        "crates/victory-shader/Cargo.toml",
-        "crates/victory-pipeline/Cargo.toml",
-        "crates/victory-gpu/src/shader_cache.rs",
-        "Cargo.lock",
-        "rust-toolchain.toml",
-    ] {
-        files.push(root.join(file));
-    }
-    files.sort();
-    // FNV-1a over each file's path (from the root) and bytes.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut eat = |bytes: &[u8]| {
-        for &b in bytes {
-            hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-        }
-    };
-    for file in &files {
-        println!("cargo:rerun-if-changed={}", file.display());
-        let name = file.strip_prefix(&root).unwrap_or(file).to_string_lossy().replace('\\', "/");
-        eat(name.as_bytes());
-        eat(&[0]);
-        eat(&std::fs::read(file).unwrap_or_default());
-        eat(&[0]);
-    }
-    println!("cargo:rustc-env=VICTORY_TRANSLATOR_FINGERPRINT={hash:016x}");
-}
-
-/// The `.rs` files under `dir`, at any depth.
-fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.is_dir() {
-            sources(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
+            files(&path, out);
+        } else {
             out.push(path);
         }
     }
+}
+
+fn main() {
+    let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let crates = here.join("..");
+    let root = crates.join("..");
+    // The translator, what it is built from, and the form entries are kept in.
+    let mut all = vec![
+        crates.join("victory-shader/Cargo.toml"),
+        here.join("src/shader_cache.rs"),
+        root.join("Cargo.lock"),
+        root.join("rust-toolchain.toml"),
+    ];
+    let source = crates.join("victory-shader/src");
+    println!("cargo:rerun-if-changed={}", source.display());
+    files(&source, &mut all);
+    all.sort();
+    let mut hash = blake3::Hasher::new();
+    for path in &all {
+        println!("cargo:rerun-if-changed={}", path.display());
+        // Names and line endings as they are in every checkout.
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let bytes: Vec<u8> = std::fs::read(path).unwrap_or_default().into_iter().filter(|&b| b != 13).collect();
+        hash.update(name.as_bytes());
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(&bytes);
+    }
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-env=VICTORY_TRANSLATOR={}", hash.finalize().to_hex());
 }
