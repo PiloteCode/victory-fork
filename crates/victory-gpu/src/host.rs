@@ -4675,6 +4675,17 @@ impl Host {
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
+                // A removed device answers UINT64_MAX for every fence, also
+                // for work that never ran: the fetch is then no fetch, and its
+                // buffer's stale bytes must not be merged into title memory
+                // (fxceless#964, by avt0m4t48 for the copy lanes of its tree:
+                // our be46efef). The removal ends the run (`fail`).
+                let ran = |fence: &ID3D12Fence| -> windows::core::Result<()> {
+                    if fence.GetCompletedValue() == u64::MAX {
+                        self.device.GetDeviceRemovedReason()?;
+                    }
+                    Ok(())
+                };
                 if let Some(queue) = &copy_queue {
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
@@ -4683,6 +4694,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    ran(&fence)?;
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -4698,6 +4710,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                ran(&fence)?;
                 Ok(after)
             })()
         };
