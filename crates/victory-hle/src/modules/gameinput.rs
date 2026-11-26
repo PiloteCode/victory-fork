@@ -754,6 +754,14 @@ extern "system" fn current_reading(
     if hr == S_OK && let Some((i, _)) = found {
         let source = if i == FALLBACK { KEYBOARD } else { i };
         hub.looks[source].fetch_add(1, Ordering::Relaxed);
+        // With one pad ([`one_pad`]) the stand-in is every host pad too: a
+        // read of it is a look at each, or a tap on a controller would stay
+        // down until the latch gave up (`LATCH_MAX`).
+        if i == FALLBACK && hub.one_pad {
+            for pad in 0..PADS {
+                hub.looks[pad].fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
     hr
 }
