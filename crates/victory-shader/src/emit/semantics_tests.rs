@@ -615,8 +615,14 @@ fn check_each(probes: &[Probe]) -> Vec<(String, bool)> {
         let (mut wrong, mut apart) = (vec![0usize; results.len()], 0usize);
         let mut all = Vec::new();
         for (i, &input) in p.inputs.iter().enumerate() {
+            // The words the two adapters must agree on: where the console's results are
+            // modelled, those the model gives (the others are scratch registers whose value
+            // no source fixes: a v_max_f32 of +0 and a negative denormal is +0 on the RTX
+            // 5090, -0 on WARP, whose FMax does not order the flushed zeros), else all four.
+            let mut words = 4;
             if let Some(model) = &p.model {
                 let want = model(input);
+                words = want.len();
                 for (k, (label, r)) in results.iter().enumerate() {
                     if !want.iter().zip(&r[i]).all(|(&w, &g)| same(p.kind, w, g)) {
                         wrong[k] += 1;
@@ -627,8 +633,9 @@ fn check_each(probes: &[Probe]) -> Vec<(String, bool)> {
                     }
                 }
             }
-            let agree =
-                |x: &[u32; 4], y: &[u32; 4]| x.iter().zip(y).all(|(&a, &b)| same(p.kind, a, b));
+            let agree = |x: &[u32; 4], y: &[u32; 4]| {
+                x.iter().zip(y).take(words).all(|(&a, &b)| same(p.kind, a, b))
+            };
             if results.len() == 2 && !agree(&results[0].1[i], &results[1].1[i]) {
                 apart += 1;
                 if apart <= 4 {
