@@ -549,7 +549,7 @@ pub fn translate_thread_limited(container: &[u8]) -> Result<HostShader, ShaderEr
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
-        .part(FourCC::DXIL)
+        .native_part()
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()

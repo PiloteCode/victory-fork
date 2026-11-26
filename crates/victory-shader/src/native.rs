@@ -74,6 +74,8 @@
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{u32_at, u64_at};
 
+mod fspx;
+
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
@@ -471,8 +473,12 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data; empty for the PC layout.
+/// The native programs in a `DXIL` part's data, or the one in an `ACCC`
+/// part's ([`fspx`]); empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+    if part.starts_with(fspx::MAGIC) {
+        return Ok(vec![fspx::program(part)?]);
+    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
