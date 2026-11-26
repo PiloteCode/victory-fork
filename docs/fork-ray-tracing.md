@@ -92,9 +92,7 @@ after it was given them as an unordered access view.
 | variable | does |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
-| `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
-| `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
@@ -117,7 +115,7 @@ dispatches, faults and what came.
   every frame, and what it read was as old as before. Open.
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
-  (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
+  (in that fork's translator, not this branch's). Pages touched that are not there: 2,500 a frame
   before, 90 after (the dorm).
 - The card's time in the dorm with the builder (timing run light-13, title's
   commands 84 ms): `CopyForBVHUpdate` 13.3 ms in 63 dispatches (before the

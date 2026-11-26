@@ -187,12 +187,10 @@ something is wrong. `-RayTracing` turns the title's ray-traced indirect light on
 In this branch `target\diag\victory.exe run <exe> --execute` alone plays with the
 script's switches too (above), all but the stand-in light (`VICTORY_AMBIENT`).
 
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
+On a hybrid-graphics PC the RX 7900 XTX fork prefers a high-performance
+adapter, with a switch to name one; that choice lives in its translator
+(`victory_shader::emit::host`), which this branch does not have: here the
+runtime opens the default adapter, as VIctory does.
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

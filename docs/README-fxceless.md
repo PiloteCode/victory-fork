@@ -116,8 +116,8 @@ Tools and diagnostics:
   makes), so a new build starts warm unless the version moved. Entries an
   earlier build of the same version made are served; `victory shaders`
   translates them again and says how many came out different
-  (`VICTORY_SHADER_FRESH=1` does so in a run, `VICTORY_SHADER_KEY=source`
-  keys by the translator's source as before).
+  (in the RX 7900 XTX fork, by two switches of its own; this branch keys
+  the cache by the translator's fingerprint instead).
 - Counters, all off or diagnostics-only: `VICTORY_WALLS_TRACE`,
   `VICTORY_CARD_ACCOUNTING`, and a census of the copies the texture sweep
   never lets go. (A counter of title bytes a copy-back was about to put back
