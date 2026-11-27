@@ -2,6 +2,8 @@
 
 **An Xbox Series (Scarlett) compatibility layer for Windows, tuned for NVIDIA cards.**
 
+[![CI](https://github.com/PiloteCode/PiloteBox/actions/workflows/ci.yml/badge.svg)](https://github.com/PiloteCode/PiloteBox/actions/workflows/ci.yml)
+
 PiloteBox runs an Xbox Series title's own x64 code natively on a Windows PC. It
 is not an emulator of the processor: the title's code runs as it is. What
 PiloteBox supplies is everything around it: a loader for the title's image, the
