@@ -187,7 +187,15 @@ mod tests {
 
     /// A resource record: type, root type, table offset, register,
     /// descriptor dwords, user-data dword, root slot.
-    fn resource(kind: u8, root: u8, offset: u32, register: u32, dwords: u8, ud: u8, slot: u8) -> [u8; RECORD] {
+    fn resource(
+        kind: u8,
+        root: u8,
+        offset: u32,
+        register: u32,
+        dwords: u8,
+        ud: u8,
+        slot: u8,
+    ) -> [u8; RECORD] {
         let mut r = [0; RECORD];
         r[0] = TAG_RESOURCE;
         r[4] = kind;
@@ -221,10 +229,10 @@ mod tests {
         let mut view = [0; RECORD];
         view[0] = TAG_VIEW;
         let records = [
-            resource(2, 1, 0, 0, 4, 0, 0),  // b0, a root view
-            resource(0, 3, 0, 0, 8, 2, 1),  // t0, a table
+            resource(2, 1, 0, 0, 4, 0, 0), // b0, a root view
+            resource(0, 3, 0, 0, 8, 2, 1), // t0, a table
             view,
-            resource(3, 3, 8, 0, 8, 2, 1),  // u0, the same table
+            resource(3, 3, 8, 0, 8, 2, 1),    // u0, the same table
             resource(1, 4, 0, 0, 4, 0xFF, 2), // s0, an immediate sampler
         ];
         let part = blob(&[
@@ -234,7 +242,9 @@ mod tests {
             (KIND_METADATA, metadata(2, &records)),
         ]);
         let programs = crate::native_programs(&part).unwrap();
-        let [p] = &programs[..] else { panic!("one program: {programs:?}") };
+        let [p] = &programs[..] else {
+            panic!("one program: {programs:?}")
+        };
         assert_eq!(p.stage, HwStage::Cs);
         assert!(!p.wave64);
         assert_eq!(p.vgprs, 12 * 8);
@@ -246,12 +256,20 @@ mod tests {
                 threads: [8, 8, 1]
             })
         );
-        let roots: Vec<_> = p.layout.iter().map(|r| (r.root, r.sgprs, r.user_data, r.slot)).collect();
+        let roots: Vec<_> = p
+            .layout
+            .iter()
+            .map(|r| (r.root, r.sgprs, r.user_data, r.slot))
+            .collect();
         assert_eq!(
             roots,
             [(RootType::Descriptor, 2, 0, 0), (RootType::Table, 1, 2, 1)]
         );
-        let kinds: Vec<_> = p.used.iter().map(|u| (u.kind, u.table_offset_dwords, u.dwords)).collect();
+        let kinds: Vec<_> = p
+            .used
+            .iter()
+            .map(|u| (u.kind, u.table_offset_dwords, u.dwords))
+            .collect();
         assert_eq!(
             kinds,
             [
@@ -285,7 +303,10 @@ mod tests {
             ])
         };
         assert!(program(&good(2)).is_ok());
-        assert_eq!(program(&good(3)), Err(Malformed("FSPX code size disagrees")));
+        assert_eq!(
+            program(&good(3)),
+            Err(Malformed("FSPX code size disagrees"))
+        );
         let mut version = good(2);
         version[4] = 2;
         assert_eq!(program(&version), Err(Malformed("unknown FSPX version")));
@@ -304,6 +325,9 @@ mod tests {
             (KIND_CODE, CODE.to_vec()),
             (KIND_METADATA, metadata(2, &[odd])),
         ]);
-        assert_eq!(program(&unknown), Err(Malformed("unknown FSPX metadata record")));
+        assert_eq!(
+            program(&unknown),
+            Err(Malformed("unknown FSPX metadata record"))
+        );
     }
 }

@@ -65,7 +65,9 @@ pub(super) fn copied_constant(inst: &Inst, k: usize) -> Option<u32> {
             let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
             Some(((1u32 << w) - 1) << at)
         }
-        ("s_mov_b64", _, [Operand::Literal(x)]) if x >> 31 == 0 => Some(if k == 0 { *x } else { 0 }),
+        ("s_mov_b64", _, [Operand::Literal(x)]) if x >> 31 == 0 => {
+            Some(if k == 0 { *x } else { 0 })
+        }
         _ => None,
     }
 }

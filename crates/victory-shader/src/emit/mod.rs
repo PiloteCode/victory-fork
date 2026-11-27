@@ -131,6 +131,8 @@ mod shader;
 mod split;
 mod threading;
 mod trip;
+#[cfg(all(test, windows))]
+mod upscaler_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]

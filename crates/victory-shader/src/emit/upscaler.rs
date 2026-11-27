@@ -18,7 +18,12 @@ pub(super) const SRC_SCC: u8 = 253;
 impl Lower<'_> {
     /// The byte dot products (`v_dot4_i32_i8`, `v_dot4c_i32_i8`); `None` for any other
     /// instruction.
-    pub(super) fn valu_upscaler(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
+    pub(super) fn valu_upscaler(
+        &mut self,
+        inst: &Inst,
+        name: &str,
+        guard: Option<V>,
+    ) -> Option<Result<(), Why>> {
         Some(match name {
             "v_dot4c_i32_i8" => self.dot4c(inst, guard),
             "v_dot4_i32_i8" => self.dot4(inst, guard),
@@ -63,8 +68,15 @@ impl Lower<'_> {
             let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
             let top = self.s.m.bin(c, Bin::LShr, x, k16);
             let bottom = self.s.m.bin(c, Bin::And, x, low);
-            let high = self.s.m.bin(c, Bin::Shl, if hi { top } else { bottom }, k16);
-            xs.push(self.s.m.bin(c, Bin::Or, if lo { top } else { bottom }, high));
+            let high = self
+                .s
+                .m
+                .bin(c, Bin::Shl, if hi { top } else { bottom }, k16);
+            xs.push(
+                self.s
+                    .m
+                    .bin(c, Bin::Or, if lo { top } else { bottom }, high),
+            );
         }
         let acc = self.src(inst, 2)?;
         let r = self.dot4_add(acc, xs[0], xs[1]);
@@ -73,7 +85,14 @@ impl Lower<'_> {
 
     fn dot4_add(&mut self, acc: V, a: V, b: V) -> V {
         let i32t = self.s.t.i32;
-        self.s.op(self.cur, "dot4AddPacked.i32", Attr::ReadNone, i32t, DOT4_ADD_I8_PACKED, &[acc, a, b])
+        self.s.op(
+            self.cur,
+            "dot4AddPacked.i32",
+            Attr::ReadNone,
+            i32t,
+            DOT4_ADD_I8_PACKED,
+            &[acc, a, b],
+        )
     }
 
     /// Whether the mask operation that sets the SCC value `scc` gives no lane outside EXEC a
@@ -85,7 +104,10 @@ impl Lower<'_> {
         let Some(&b) = self.def_block.get(&scc) else {
             return false;
         };
-        let by = self.x.p.blocks[b].insts.iter().find(|i| i.write(Reg::Scc) == Some(scc));
+        let by = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.write(Reg::Scc) == Some(scc));
         by.is_some_and(|i| {
             i.write(Reg::S(EXEC)).is_some()
                 || matches!(&i.fields, Fields::Sop { dst: Some(Operand::Scalar { code, .. }), .. }
@@ -102,7 +124,11 @@ impl Lower<'_> {
         }
         let &(_, w) = inst.writes.first()?;
         let sections = self.sections.get(&b)?;
-        sections.values().filter(|s| s.end < i).find_map(|s| s.reads.get(&w).copied()).map(|sh| (w, sh))
+        sections
+            .values()
+            .filter(|s| s.end < i)
+            .find_map(|s| s.reads.get(&w).copied())
+            .map(|sh| (w, sh))
     }
 
     /// [`Self::section_read`] lowered: the value over the wave's lanes (in the paired form,
@@ -179,7 +205,13 @@ impl Lower<'_> {
         let x = self.i32_of(v)?;
         // A 16-bit integer, extended by the view's sign: the same number either way only if
         // it is known to be small.
-        if d16 && !self.s.m.int_value(x).is_some_and(|k| (0..0x8000).contains(&k)) {
+        if d16
+            && !self
+                .s
+                .m
+                .int_value(x)
+                .is_some_and(|k| (0..0x8000).contains(&k))
+        {
             return Err("a 16-bit image store of one channel");
         }
         let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
@@ -189,7 +221,14 @@ impl Lower<'_> {
         args.extend([x; 4]);
         args.push(self.s.m.i8(0xF));
         let void = self.s.t.void;
-        self.s.op(self.cur, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
+        self.s.op(
+            self.cur,
+            "textureStore.i32",
+            Attr::NoUnwind,
+            void,
+            67,
+            &args,
+        );
         self.end_guarded(at, &[]);
         Ok(())
     }
