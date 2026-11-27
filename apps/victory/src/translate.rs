@@ -10,9 +10,7 @@ use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
-use victory_shader::{
-    Container, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
-};
+use victory_shader::{Container, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs};
 use victory_shader::{io, resource};
 
 use crate::shader::{MAX_FILE, Source, sources};
