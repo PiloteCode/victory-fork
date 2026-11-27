@@ -3955,8 +3955,10 @@ mod meter_tests {
     /// stopped every run on the card at the first 5 s line (integ-p15a-def).
     #[test]
     fn the_meter_makes_every_line() {
-        super::meter_text(60.0, 60.0, 16.7, 1000.0, true, 300.0);
-        super::meter_text(60.0, 60.0, 16.7, 1000.0, false, 0.0);
+        crate::every_line::with_every_line(|| {
+            super::meter_text(60.0, 60.0, 16.7, 1000.0, true, 300.0);
+            super::meter_text(60.0, 60.0, 16.7, 1000.0, false, 0.0);
+        });
     }
 }
 

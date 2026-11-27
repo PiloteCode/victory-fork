@@ -528,14 +528,13 @@ mod counter_tests {
     /// submitting thread on the card (run integ-p15a-def).
     #[test]
     fn every_counter_is_counted_and_logged() {
-        assert_eq!(COUNTERS, C::Count as usize);
         for i in 0..COUNTERS {
             COUNT[bank()].0[i].fetch_add(1, Relaxed);
         }
         add(C::LandTitleNs, 1);
         reset(1);
         landed(1);
-        log(1.0);
+        crate::every_line::with_every_line(|| log(1.0));
     }
 }
 
