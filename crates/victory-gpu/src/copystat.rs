@@ -153,8 +153,10 @@ pub(crate) enum C {
     LandSubmitNs,
     LandOursNs,
     LandTitleNs,
+    /// Not a counter: how many there are. New ones go above it.
+    Count,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = C::Count as usize;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -516,6 +518,26 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
 #[global_allocator]
 static HEAP: Counting = Counting;
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    /// Every counter can be added to, and the lines read each of them: a
+    /// counter past the banks' length panicked the meter's thread and the
+    /// submitting thread on the card (run integ-p15a-def).
+    #[test]
+    fn every_counter_is_counted_and_logged() {
+        assert_eq!(COUNTERS, C::Count as usize);
+        for i in 0..COUNTERS {
+            COUNT[bank()].0[i].fetch_add(1, Relaxed);
+        }
+        add(C::LandTitleNs, 1);
+        reset(1);
+        landed(1);
+        log(1.0);
+    }
+}
 
 #[cfg(test)]
 mod command_tests {

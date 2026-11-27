@@ -3949,6 +3949,18 @@ fn past_lag<T>(landed: &mut Vec<T>, lag: usize, ran: impl FnMut(&mut T)) -> Vec<
 }
 
 #[cfg(test)]
+mod meter_tests {
+    /// The frame meter's lines, those of every 5 s with them, are made once
+    /// without a panic: a counter of the diagnostics past its array's length
+    /// stopped every run on the card at the first 5 s line (integ-p15a-def).
+    #[test]
+    fn the_meter_makes_every_line() {
+        super::meter_text(60.0, 60.0, 16.7, 1000.0, true, 300.0);
+        super::meter_text(60.0, 60.0, 16.7, 1000.0, false, 0.0);
+    }
+}
+
+#[cfg(test)]
 mod landed_tests {
     use super::past_lag;
     use crate::descriptor::host::HostHeap;
@@ -10265,6 +10277,260 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// The frame meter's lines ([`Meter::frame`], made by [`meter_lines`]):
+/// those of every second over `frames` frames, and with `five` those of
+/// every 5 s (their copy counters over `copy_stats_frames`). On its own so
+/// that a test makes every line once.
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+fn meter_text(frames: f64, fps: f64, ms: f64, draws: f64, five: bool, copy_stats_frames: f64) {
+    // Of a frame, ms preparing submissions and ms waiting for the GPU.
+    let [cpu, gpu] = [0, 1].map(|i| {
+        SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+    });
+    let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
+        let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
+        PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+    });
+    let [back_ms, back_mb] = [0, 1].map(|i| {
+        COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+    });
+    let dropped = crate::draw::take_dropped() as f64 / frames;
+    let indirect = crate::list::take_indirect() as f64 / frames;
+    let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
+    let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+    let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+    let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
+    tracing::info!(
+        "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
+    );
+    crate::shadow::exact_line(frames);
+    crate::descriptor::sync_line(frames);
+    late_line(frames);
+    crate::queue::behind_line(frames);
+    card_clock_line(frames, ms);
+    upq::line(frames);
+    rec::line(frames);
+    #[cfg(feature = "diagnostics")]
+    spans::line(frames);
+    crate::shadow::back_line(frames);
+    #[cfg(feature = "diagnostics")]
+    split_line(frames);
+    {
+        let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if passes + compares > 0.0 {
+            tracing::info!(
+                "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
+                 ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                if rehash_runs() { "on" } else { "off" }
+            );
+        }
+    }
+    {
+        let [own, asking, still, all] =
+            [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        if all >= 1.0 {
+            tracing::info!(
+                "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+                 is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
+                 hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+            );
+        }
+        let [through, left, filled, short] =
+            [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if through + left + filled > 0.0 {
+            tracing::info!(
+                "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                 {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
+                 {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
+                 with less than was mapped (looked at again)"
+            );
+        }
+    }
+    {
+        let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if copies > 0.0 {
+            tracing::info!(
+                "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
+                 (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
+                if join_copies() { "on" } else { "off" }
+            );
+        }
+    }
+    // Passes over the heap's buffer views for shaders that pick them by index.
+    let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
+    let picked_ms =
+        crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+    // Copies between depth textures and their colour twins, each way.
+    let [twin_to_depth, twin_to_colour] =
+        [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    // Depth planes drawn from their twins.
+    let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+    // Copies in the card's memory (`crate::shadow::cards`).
+    let card = crate::shadow::card_stats();
+    let sync = cardsync::taken(frames);
+    #[cfg(feature = "diagnostics")]
+    let slow = crate::watch::slow_asks();
+    // Over the same frames as the counts above.
+    #[cfg(feature = "diagnostics")]
+    let drops = crate::pipeline::take_drops();
+    if !five {
+        return;
+    }
+        tracing::info!(
+            "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
+            crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
+        );
+        crate::tiles::status();
+        {
+            let [queued, due, away, partly, oldest] =
+                [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+            let [same, parts, tails] =
+                [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
+            tracing::info!(
+                "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
+                 {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
+                 the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
+                 as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
+                 {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
+                 {} ranges of memory mapped, unmapped or written under texture views ({} compacted), {} slots made due by them, \
+                 {} made slots found unmapped and made null",
+                crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
+                crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
+                crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
+                crate::descriptor::host::STALE[0].load(Ordering::Relaxed),
+                crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
+                crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
+                crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
+                crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+            );
+        }
+        tracing::info!(
+            "slots of textures made while lists sent before them ran, shown once those had run (VICTORY_SHOW_NEW_LATER={}), since the start: {}",
+            u8::from(crate::descriptor::host::show_new_later()),
+            crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
+        );
+        tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
+        if let Some(line) = crate::texstore::line() {
+            tracing::info!("{line}");
+        }
+        if crate::resource::held_only() {
+            let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
+            let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
+            tracing::info!(
+                "textures from the first level viewed (VICTORY_HELD_LEVELS=0: whole), since the start: {copies} host copies of the \
+                 levels viewed alone ({} MB on the card, {} MB of title memory whole), {grown} replaced by one with more levels, \
+                 {flipped} slots made from their new view after its upload had run ({missed} written again first); {} uploads left \
+                 out as the host copy held those bytes (VICTORY_TEXTURE_SAME=0: made); {} MB of texture blocks free; \
+                 {} looks for textures to let go, {:.2} ms each, the longest {:.1}",
+                bytes >> 20,
+                whole >> 20,
+                crate::draw::HEAP_TEXTURES_SAME.load(Ordering::Relaxed),
+                crate::pool::texture_room() >> 20,
+                crate::resource::SWEPT_US[0].load(Ordering::Relaxed),
+                crate::resource::SWEPT_US[1].load(Ordering::Relaxed) as f64
+                    / 1e3
+                    / crate::resource::SWEPT_US[0].load(Ordering::Relaxed).max(1) as f64,
+                crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
+            );
+        }
+        {
+            let mode = crate::watch::page_writes();
+            let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
+            let [kept, compacted, slots, uploaded] =
+                [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
+            let [behind, oldest, refreshed] =
+                [0, 1, 2].map(|i| crate::descriptor::host::PAGE_BEHIND[i].load(Ordering::Relaxed));
+            tracing::info!(
+                "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({compacted} compacted);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({}),                      {refreshed} made due for it; textures older than the title's last write now: {behind} slots (the oldest write                      {oldest} frames ago) (VICTORY_PAGE_WRITES: unset or guards the guards alone, 1 the guards and the slots, 0 counts                      only, slots, all)",
+                bytes >> 20,
+                if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
+                if mode & 4 != 0 {
+                    "told as well"
+                } else if mode & 2 != 0 {
+                    "their texture slots told"
+                } else {
+                    "counted only"
+                },
+                if mode & 2 != 0 { "made due again" } else { "left as they were" }
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(
+            "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
+            slow[0] as f64 / frames,
+            slow[1] as f64 / 1e3 / frames,
+            slow[2] as f64 / 1e3
+        );
+        if crate::shadow::cards() {
+            let per_frame = |i: usize| card[i] as f64 / frames;
+            tracing::info!(
+                "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
+                 {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
+                 ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
+                card[7],
+                card[8] >> 20,
+                card[9] >> 20,
+                per_frame(0) / 1e6,
+                per_frame(1),
+                per_frame(2),
+                per_frame(3),
+                per_frame(4) / 1e6,
+                per_frame(5),
+                per_frame(6) / 1e3
+            );
+            cardsync::log(&sync);
+        }
+        tracing::info!(
+            "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
+             {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
+             GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+             dropped {dropped:.0} without a host pipeline ({making} being made) and \
+             {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+             textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
+             {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+            picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
+            picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
+            picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
+            picked_away = crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),
+            du0 = crate::resource::DEPTH_UNORDERED[0].load(Ordering::Relaxed),
+            du1 = crate::resource::DEPTH_UNORDERED[1].load(Ordering::Relaxed),
+            du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
+            du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
+            refused = format!(
+                "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
+                crate::shadow::OWN_MADE.load(Ordering::Relaxed),
+                crate::resource::TWINS[0].load(Ordering::Relaxed),
+                crate::resource::TWINS[1].load(Ordering::Relaxed),
+                crate::resource::PLANES[1].load(Ordering::Relaxed),
+                crate::resource::PLANES[2].load(Ordering::Relaxed)
+            ),
+            making = crate::pipeline::making(),
+            placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
+            objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
+        );
+        #[cfg(feature = "diagnostics")]
+        {
+            let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "what shaders wrote put into title memory per frame (VICTORY_EXACT_BACK): {:.0} pieces in {:.0} writes, {:.1} MB; {:.0} pieces joined over gaps",
+                put[0],
+                put[1],
+                put[2] / 1e6,
+                put[3]
+            );
+            traffic::line(copy_stats_frames);
+            crate::loop_notes::log();
+            crate::copystat::log(copy_stats_frames);
+            for (why, n) in drops.iter().take(40) {
+                tracing::info!(
+                    "dropped {:.1}/frame without a host pipeline: {why}",
+                    *n as f64 / frames
+                );
+            }
+        }
+}
+
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
@@ -10340,254 +10606,9 @@ impl Meter {
         }
         #[cfg(feature = "diagnostics")]
         let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };
-        meter_lines(move || {
-            // Of a frame, ms preparing submissions and ms waiting for the GPU.
-            let [cpu, gpu] = [0, 1].map(|i| {
-                SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-            });
-            let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-                let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-                PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-            });
-            let [back_ms, back_mb] = [0, 1].map(|i| {
-                COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-            });
-            let dropped = crate::draw::take_dropped() as f64 / frames;
-            let indirect = crate::list::take_indirect() as f64 / frames;
-            let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
-            let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
-            let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
-            let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
-            tracing::info!(
-                "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
-            );
-            crate::shadow::exact_line(frames);
-            crate::descriptor::sync_line(frames);
-            late_line(frames);
-            crate::queue::behind_line(frames);
-            card_clock_line(frames, ms);
-            upq::line(frames);
-            rec::line(frames);
-            #[cfg(feature = "diagnostics")]
-            spans::line(frames);
-            crate::shadow::back_line(frames);
-            #[cfg(feature = "diagnostics")]
-            split_line(frames);
-            {
-                let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                if passes + compares > 0.0 {
-                    tracing::info!(
-                        "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                         ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                        if rehash_runs() { "on" } else { "off" }
-                    );
-                }
-            }
-            {
-                let [own, asking, still, all] =
-                    [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-                if all >= 1.0 {
-                    tracing::info!(
-                        "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
-                         is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                         hold still (the runtime remapping it); the rest is reading, hashing and detiling"
-                    );
-                }
-                let [through, left, filled, short] =
-                    [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                if through + left + filled > 0.0 {
-                    tracing::info!(
-                        "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                         {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
-                         {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
-                         with less than was mapped (looked at again)"
-                    );
-                }
-            }
-            {
-                let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                if copies > 0.0 {
-                    tracing::info!(
-                        "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
-                         (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
-                        if join_copies() { "on" } else { "off" }
-                    );
-                }
-            }
-            // Passes over the heap's buffer views for shaders that pick them by index.
-            let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
-            let picked_ms =
-                crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
-            // Copies between depth textures and their colour twins, each way.
-            let [twin_to_depth, twin_to_colour] =
-                [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            // Depth planes drawn from their twins.
-            let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
-            // Copies in the card's memory (`crate::shadow::cards`).
-            let card = crate::shadow::card_stats();
-            let sync = cardsync::taken(frames);
-            #[cfg(feature = "diagnostics")]
-            let slow = crate::watch::slow_asks();
-            // Over the same frames as the counts above.
-            #[cfg(feature = "diagnostics")]
-            let drops = crate::pipeline::take_drops();
-            if !five {
-                return;
-            }
-                tracing::info!(
-                    "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
-                    crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
-                );
-                crate::tiles::status();
-                {
-                    let [queued, due, away, partly, oldest] =
-                        [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
-                    let [same, parts, tails] =
-                        [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
-                    tracing::info!(
-                        "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
-                         {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
-                         the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
-                         as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
-                         {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
-                         {} ranges of memory mapped, unmapped or written under texture views ({} compacted), {} slots made due by them, \
-                         {} made slots found unmapped and made null",
-                        crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
-                        crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
-                        crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
-                        crate::descriptor::host::STALE[0].load(Ordering::Relaxed),
-                        crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
-                        crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
-                        crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                        crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
-                    );
-                }
-                tracing::info!(
-                    "slots of textures made while lists sent before them ran, shown once those had run (VICTORY_SHOW_NEW_LATER={}), since the start: {}",
-                    u8::from(crate::descriptor::host::show_new_later()),
-                    crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
-                );
-                tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
-                if let Some(line) = crate::texstore::line() {
-                    tracing::info!("{line}");
-                }
-                if crate::resource::held_only() {
-                    let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
-                    let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
-                    tracing::info!(
-                        "textures from the first level viewed (VICTORY_HELD_LEVELS=0: whole), since the start: {copies} host copies of the \
-                         levels viewed alone ({} MB on the card, {} MB of title memory whole), {grown} replaced by one with more levels, \
-                         {flipped} slots made from their new view after its upload had run ({missed} written again first); {} uploads left \
-                         out as the host copy held those bytes (VICTORY_TEXTURE_SAME=0: made); {} MB of texture blocks free; \
-                         {} looks for textures to let go, {:.2} ms each, the longest {:.1}",
-                        bytes >> 20,
-                        whole >> 20,
-                        crate::draw::HEAP_TEXTURES_SAME.load(Ordering::Relaxed),
-                        crate::pool::texture_room() >> 20,
-                        crate::resource::SWEPT_US[0].load(Ordering::Relaxed),
-                        crate::resource::SWEPT_US[1].load(Ordering::Relaxed) as f64
-                            / 1e3
-                            / crate::resource::SWEPT_US[0].load(Ordering::Relaxed).max(1) as f64,
-                        crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
-                    );
-                }
-                {
-                    let mode = crate::watch::page_writes();
-                    let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
-                    let [kept, compacted, slots, uploaded] =
-                        [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
-                    let [behind, oldest, refreshed] =
-                        [0, 1, 2].map(|i| crate::descriptor::host::PAGE_BEHIND[i].load(Ordering::Relaxed));
-                    tracing::info!(
-                        "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({compacted} compacted);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({}),                      {refreshed} made due for it; textures older than the title's last write now: {behind} slots (the oldest write                      {oldest} frames ago) (VICTORY_PAGE_WRITES: unset or guards the guards alone, 1 the guards and the slots, 0 counts                      only, slots, all)",
-                        bytes >> 20,
-                        if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
-                        if mode & 4 != 0 {
-                            "told as well"
-                        } else if mode & 2 != 0 {
-                            "their texture slots told"
-                        } else {
-                            "counted only"
-                        },
-                        if mode & 2 != 0 { "made due again" } else { "left as they were" }
-                    );
-                }
-                #[cfg(feature = "diagnostics")]
-                tracing::info!(
-                    "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
-                    slow[0] as f64 / frames,
-                    slow[1] as f64 / 1e3 / frames,
-                    slow[2] as f64 / 1e3
-                );
-                if crate::shadow::cards() {
-                    let per_frame = |i: usize| card[i] as f64 / frames;
-                    tracing::info!(
-                        "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
-                         {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                         ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
-                        card[7],
-                        card[8] >> 20,
-                        card[9] >> 20,
-                        per_frame(0) / 1e6,
-                        per_frame(1),
-                        per_frame(2),
-                        per_frame(3),
-                        per_frame(4) / 1e6,
-                        per_frame(5),
-                        per_frame(6) / 1e3
-                    );
-                    cardsync::log(&sync);
-                }
-                tracing::info!(
-                    "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                     {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                     GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                     dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                     {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
-                     textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
-                    picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
-                    picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
-                    picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
-                    picked_away = crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),
-                    du0 = crate::resource::DEPTH_UNORDERED[0].load(Ordering::Relaxed),
-                    du1 = crate::resource::DEPTH_UNORDERED[1].load(Ordering::Relaxed),
-                    du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
-                    du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
-                    refused = format!(
-                        "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
-                        crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
-                        crate::shadow::OWN_MADE.load(Ordering::Relaxed),
-                        crate::resource::TWINS[0].load(Ordering::Relaxed),
-                        crate::resource::TWINS[1].load(Ordering::Relaxed),
-                        crate::resource::PLANES[1].load(Ordering::Relaxed),
-                        crate::resource::PLANES[2].load(Ordering::Relaxed)
-                    ),
-                    making = crate::pipeline::making(),
-                    placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
-                    objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
-                );
-                #[cfg(feature = "diagnostics")]
-                {
-                    let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                    tracing::info!(
-                        "what shaders wrote put into title memory per frame (VICTORY_EXACT_BACK): {:.0} pieces in {:.0} writes, {:.1} MB; {:.0} pieces joined over gaps",
-                        put[0],
-                        put[1],
-                        put[2] / 1e6,
-                        put[3]
-                    );
-                    traffic::line(copy_stats_frames);
-                    crate::loop_notes::log();
-                    crate::copystat::log(copy_stats_frames);
-                    for (why, n) in drops.iter().take(40) {
-                        tracing::info!(
-                            "dropped {:.1}/frame without a host pipeline: {why}",
-                            *n as f64 / frames
-                        );
-                    }
-                }
-        });
+        #[cfg(not(feature = "diagnostics"))]
+        let copy_stats_frames = 0.0;
+        meter_lines(move || meter_text(frames, fps, ms, draws, five, copy_stats_frames));
         // This fork's caption: its own name, then the frame's figures (the
         // window's own text is not kept in front of them).
         let name = victory_core::product::NAME;
