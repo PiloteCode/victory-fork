@@ -101,7 +101,9 @@ impl Lower<'_> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            // 16-bit coordinates (a16) are read as `addr_val` reads them (the upscaler's
+            // counters; after avatarmanz's translator, 66afb2b4).
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             // Compare-exchange consumes a replacement followed by a comparand.
@@ -191,7 +193,9 @@ impl Lower<'_> {
             }
             // shortcut: stores are taken to write all four channels of a
             // float format (the console converts by the view's format).
-            if *dmask != 0xF {
+            // One channel goes into a view the program also counts in (`upscaler`).
+            let counter = *dmask == 1 && self.is_counter(src);
+            if *dmask != 0xF && !counter {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -202,6 +206,9 @@ impl Lower<'_> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
+            if counter {
+                return self.counter_store(inst, site, src, kind, cs, reg, *d16, guard);
+            }
             let mut vals = Vec::new();
             for k in 0..4u8 {
                 // d16: two f16 channels per VGPR, low half first.

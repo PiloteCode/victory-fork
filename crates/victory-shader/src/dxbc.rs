@@ -17,6 +17,9 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    /// Native code another compiler made, in place of `DXIL`: an `FSPX`
+    /// program (the title's FidelityFX upscaler's; [`crate::native`]).
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
@@ -108,6 +111,12 @@ impl<'a> Container<'a> {
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
+    }
+
+    /// The part [`crate::native_programs`] reads the console programs from:
+    /// `DXIL`, else `ACCC` (code another compiler made).
+    pub fn native_part(&self) -> Option<&Part<'a>> {
+        self.part(FourCC::DXIL).or_else(|| self.part(FourCC::ACCC))
     }
 }
 
