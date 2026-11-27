@@ -613,10 +613,10 @@ fn card_limits() -> (u64, u64) {
         // switch of its own says a size.
         let mut max_bytes = max_bytes;
         if let Some(set) = placement::set() {
-            if env_mb("VICTORY_CARD_BUFFERS_MIN_MB").is_none() && std::env::var_os("VICTORY_CARD_BUFFERS_MIN_KB").is_none() {
+            if std::env::var("VICTORY_CARD_BUFFERS_MIN_MB").ok().as_deref().and_then(parse_mib).is_none() && std::env::var_os("VICTORY_CARD_BUFFERS_MIN_KB").is_none() {
                 min_bytes = set.buffers_least;
             }
-            if env_mb("VICTORY_CARD_BUFFERS_MB").is_none() {
+            if explicit_card_buffers_mb().is_none() {
                 max_bytes = set.buffers_most;
             }
         }
