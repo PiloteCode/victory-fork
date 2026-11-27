@@ -150,6 +150,9 @@ fn lowered(code: &[u32], threads: u32, used: Vec<UsedResource>) -> HostShader {
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: l.half_views,
+        atomic_views: l.atomic_views,
+        written_views: l.written_views,
+        picked_views: l.picked_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -435,4 +438,49 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             f32::from_bits(read(&as_halves_old)),
         );
     }
+}
+
+/// The places a program uses buffers with atomics through and writes (`HostShader::atomic_views`
+/// and `written_views`) are the descriptors it loads from fixed places of a table, as for
+/// halves: a `buffer_atomic_add` through the descriptor at byte 0x20 and a `buffer_store_dword`
+/// through the one at 0x40 name dwords 8 (atomic, and written) and 16 (written); a load through
+/// a third names nothing. The atomic's descriptor loaded at an offset the program computes
+/// names its table only (`picked_views`, both bits). The lists change nothing written: the
+/// program's DXIL is the same with any of them.
+#[test]
+fn atomic_and_written_places_are_the_descriptors_the_program_loads() {
+    const ATOMIC_ADD: u32 = 0x32;
+    let used = || {
+        vec![
+            entry(ResourceType::Uav, 0, 4),
+            entry(ResourceType::Uav, 16, 4),
+            entry(ResourceType::Srv, 24, 4),
+        ]
+    };
+    let mut fixed = vec![s_mov_b32(5, 0x80)];
+    fixed.extend_from_slice(&s_load_dwordx4(8, 0x20));
+    fixed.extend_from_slice(&s_load_dwordx4(12, 0x40));
+    fixed.extend_from_slice(&s_load_dwordx4(16, 0x60));
+    fixed.extend_from_slice(&mubuf_idxen(ATOMIC_ADD, 1, 0, 8));
+    fixed.extend_from_slice(&buffer_store_dword(1, 12));
+    fixed.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 2, 0, 16));
+    fixed.push(S_ENDPGM);
+    let s = lowered(&fixed, 32, used());
+    assert_eq!(s.atomic_views, [(1, 8)]);
+    assert_eq!(s.written_views, [(1, 8), (1, 16)]);
+    assert!(s.picked_views.is_empty());
+    let census = super::take_view_census();
+    assert_eq!((census[0], census[3], census[6], census[7]), (1, 1, 0, 0), "{census:?}");
+    let mut runtime = vec![s_mov_b32(5, 0x80), vop1(0x02, 20, vgpr(0))];
+    runtime.extend_from_slice(&s_load_dwordx4_at(8, 20));
+    runtime.extend_from_slice(&s_load_dwordx4(12, 0x40));
+    runtime.extend_from_slice(&mubuf_idxen(ATOMIC_ADD, 1, 0, 8));
+    runtime.extend_from_slice(&buffer_store_dword(1, 12));
+    runtime.push(S_ENDPGM);
+    let s = lowered(&runtime, 32, used());
+    assert!(s.atomic_views.is_empty());
+    assert_eq!(s.written_views, [(1, 16)]);
+    assert_eq!(s.picked_views, [(1, super::PICKED_ATOMIC | super::PICKED_WRITTEN)]);
+    let census = super::take_view_census();
+    assert_eq!((census[1], census[3]), (1, 1), "{census:?}");
 }

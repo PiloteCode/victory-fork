@@ -10,7 +10,7 @@
 //! are ignored anyway).
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
@@ -120,10 +120,13 @@ pub(crate) fn host_shader_thread_limited(container: &[u8]) -> Result<HostShader,
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. A translation made here is also kept for the
+/// caller (`made`): a cache write that fails (a full disk, a locked or
+/// broken entry) still hands it over (f31db60c, TaynanGT's tree), and
+/// `made` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
-    ran: AtomicBool,
+    made: Mutex<Option<HostShader>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -135,9 +138,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let entry = encode(&shader);
+        *self.made.lock().unwrap_or_else(|err| err.into_inner()) = Some(shader);
+        Ok(entry)
     }
 }
 
@@ -148,22 +152,29 @@ fn cached(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
     let input = [&build[..], container].concat();
-    let converter = Translate {
+    let mut converter = Translate {
         translate,
-        ran: AtomicBool::new(false),
+        made: Mutex::new(None),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let entry = cache.get_or_convert(&converter, &input);
+        if let Some(shader) = converter.made.get_mut().unwrap_or_else(|err| err.into_inner()).take() {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            match entry {
+                Ok(path) => tracing::debug!(path = %path.display(), "shader translated and cached"),
+                Err(error) => {
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(error = format!("{error:#}"), "shader cache write failed; using the translation in memory");
+                    }
+                }
+            }
+            return Ok(shader);
+        }
+        let path = entry.map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader from the cache");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
@@ -270,6 +281,20 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(slot));
         word(&mut out, dword);
     }
+    // The places it uses buffers with atomics through, those it writes, and the tables it
+    // picks such buffers from at run time (`HostShader::atomic_views` and its kin).
+    for places in [&s.atomic_views, &s.written_views] {
+        word(&mut out, places.len() as u32);
+        for &(slot, dword) in places {
+            word(&mut out, u32::from(slot));
+            word(&mut out, dword);
+        }
+    }
+    word(&mut out, s.picked_views.len() as u32);
+    for &(slot, bits) in &s.picked_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, u32::from(bits));
+    }
     out
 }
 
@@ -343,6 +368,21 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     for _ in 0..n {
         half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
+    let mut places = || -> Option<Vec<(u8, u32)>> {
+        let n = r.word()? as usize;
+        let mut all = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            all.push((u8::try_from(r.word()?).ok()?, r.word()?));
+        }
+        Some(all)
+    };
+    let atomic_views = places()?;
+    let written_views = places()?;
+    let n = r.word()? as usize;
+    let mut picked_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        picked_views.push((u8::try_from(r.word()?).ok()?, u8::try_from(r.word()?).ok()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -354,6 +394,9 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         half_views,
+        atomic_views,
+        written_views,
+        picked_views,
     })
 }
 
@@ -389,6 +432,9 @@ mod tests {
                 shift: 5,
             }],
             half_views: vec![(0, 8), (4, 0)],
+            atomic_views: vec![(1, 4)],
+            written_views: vec![(1, 4), (1, 12), (5, 0)],
+            picked_views: vec![(2, 3)],
         }
     }
 
@@ -423,6 +469,30 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn a_failed_cache_write_keeps_the_translation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"container whose entry cannot be written";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        let entries = walk(dir.path());
+        assert_eq!(entries.len(), 1);
+        std::fs::remove_file(&entries[0]).unwrap();
+        std::fs::create_dir(&entries[0]).unwrap();
+
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert!(entries[0].is_dir());
+        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        assert!(cached(&cache, &build, container, fail).unwrap_err().contains("unsupported"));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

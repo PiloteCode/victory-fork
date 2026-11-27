@@ -8,6 +8,8 @@
 //! On a terminal the lines name their module without the crates' common
 //! `victory_` (`gpu::host` for `victory_gpu::host`); redirected, and in the
 //! log file [`init_with_file`] writes, they keep the full path.
+//! `VICTORY_LOG_FILE` appends the same lines to a plain-text file when no
+//! command asked for a log file of its own.
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -42,10 +44,24 @@ pub fn init_with_file(default_level: &str, file: Option<&Path>) {
         .and_then(|v| EnvFilter::try_new(v).ok())
         .unwrap_or_else(|| EnvFilter::new(default_level));
     let short = std::io::stderr().is_terminal();
-    let file = file.and_then(|path| {
-        path.parent().map(std::fs::create_dir_all);
-        std::fs::File::create(path).ok()
-    });
+    let file = file
+        .and_then(|path| {
+            path.parent().map(std::fs::create_dir_all);
+            std::fs::File::create(path).ok()
+        })
+        .or_else(|| {
+            // VICTORY_LOG_FILE (alex's, from TaynanGT's tree): appended to,
+            // when no log file was asked for by the command.
+            let path = std::env::var_os("VICTORY_LOG_FILE").filter(|p| !p.is_empty())?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .inspect_err(|error| {
+                    eprintln!("Could not open VICTORY_LOG_FILE {}: {error}", Path::new(&path).display());
+                })
+                .ok()
+        });
     let _ = tracing_subscriber::registry()
         .with(CAP)
         .with(filter)

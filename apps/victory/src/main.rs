@@ -9,6 +9,8 @@
 //! upstream has them. A bare `pilotebox` says where things stand.
 
 mod bench;
+#[cfg(agility_sdk)]
+mod agility;
 mod census;
 mod check;
 mod clean;
@@ -58,6 +60,7 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// The first run in one command: finds the title, writes pilotebox.toml,
@@ -119,8 +122,9 @@ enum Command {
     /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found (and per pack pipeline).
-        #[arg(long)]
+        /// Print one line per container found (and per pack pipeline), and
+        /// show why paths were skipped.
+        #[arg(short, long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
@@ -132,6 +136,9 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
+    ///
+    /// VICTORY_HOST_WAVE (or VICTORY_HOST_MAX_WAVE) translates as for a host
+    /// of waves that wide, including with --warm.
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -150,7 +157,7 @@ enum Command {
         #[arg(long)]
         hashes: bool,
         /// Worker threads, at least 1 (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_nonzero_jobs)]
         jobs: Option<NonZeroUsize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line),
@@ -173,13 +180,19 @@ enum Command {
         keys: bool,
     },
     /// Translate every shader found (as `translate` finds them) into the
-    /// shader cache, so that no run has to: a few minutes, once per change
-    /// of the translator.
+    /// shader cache, so that no run has to: a few minutes, once per version
+    /// of the translator. Translations an earlier build of the same version
+    /// cached are made again, and those that came out different counted.
+    /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
+        /// Also write every shader that does not translate to this file,
+        /// one line each: hash, where it was found, why.
+        #[arg(long)]
+        list: Option<PathBuf>,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -188,7 +201,7 @@ enum Command {
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// At most this many pipelines.
         #[arg(long)]
@@ -243,6 +256,17 @@ enum Console {
     SeriesS,
 }
 
+fn parse_jobs(value: &str) -> Result<usize, &'static str> {
+    value
+        .parse::<NonZeroUsize>()
+        .map(NonZeroUsize::get)
+        .map_err(|_| "expected a worker count of 1 or more")
+}
+
+fn parse_nonzero_jobs(value: &str) -> Result<NonZeroUsize, &'static str> {
+    parse_jobs(value).map(|n| NonZeroUsize::new(n).expect("at least 1"))
+}
+
 fn main() -> Result<()> {
     // `PILOTEBOX_X` stands for `VICTORY_X`, before anything reads either.
     // SAFETY: no other thread is running yet.
@@ -268,6 +292,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    #[cfg(agility_sdk)]
+    agility::check_runtime()?;
     let Some(command) = cli.command else {
         status::run(&Cli::command());
         return Ok(());
@@ -319,6 +345,7 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            // (`translate` itself also reads `VICTORY_HOST_MAX_WAVE`)
             if let Some(n) = host_wave {
                 victory_shader::emit::set_host_max_wave(n);
             }
@@ -329,7 +356,7 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, hashes, jobs)
         }
         Command::TranslateDiff { old, new, keys } => translate_diff::run(&old, &new, keys),
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {

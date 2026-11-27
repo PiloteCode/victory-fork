@@ -124,6 +124,30 @@ none is needed. The switches are described in
 [docs/findings.md](docs/findings.md), [docs/README-fxceless.md](docs/README-fxceless.md)
 and each module's notes.
 
+### Switches that bear on the card's time and on the settle
+
+The play settings are the defaults; these are the ones that matter most for
+the goal, with what they are by default:
+
+| Switch | Default | What it does |
+|---|---|---|
+| `VICTORY_PORT_RT=1` | off | When a fill of upload memory reads bytes that a copy at its place declared written, the card brings them, or the fill takes them from the copy's source, instead of the submission waiting for every flight (the one settle a frame). Its frame line counts the cases even when off. |
+| `VICTORY_PORT_CONSTANTS=1` | off | The title's 174 MB constants heap is read by the card where the title writes it: no uploads and no fills of it. With it, indirect executions whose arguments sit there are prepared alone right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on; 2-5 ms). |
+| `VICTORY_FILL_TITLE=2` | off | Small fills of upload memory go on without waiting for flights where no shader wrote the page lately. |
+| `VICTORY_RT_STAMPS=1` | off | Diagnostics builds: the card's time of every compute dispatch, by kind and by pipeline. |
+| `VICTORY_PORT_DESCRIPTORS=1`, `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1` | off | The layer's renderer ports 2, 6 and 7: less work on the processor (descriptor stores reported by the title's own code, a shared guard lock, the heaps' records split). |
+| `VICTORY_TEXTURE_MAX` | 0 | Streamed textures at their full size (the layer underneath caps them at 1,024 texels a side for 16 GB cards). |
+| `VICTORY_RESIDENCY`, `VICTORY_FALLBACK_HEAPS`, `VICTORY_SWEEP_PER_HEAP`, `VICTORY_XMA_REFILL` | 1 | codec-d/cool_fox's memory budgets, heaps of one slot, the heap buffer pass per heap and XMA refill, as on an RTX 5090 before. |
+| `VICTORY_DSTORAGE_STAGING_MB` | 256 | A DirectStorage staging floor (cool_fox). |
+| `VICTORY_CARD_BUFFERS_MIN_KB`, `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB`, `VICTORY_CARD_RESERVE_BUDGETS=1` | unset | Title buffers from that size up, and the windows shaders read, kept on the card within those budgets; with the last one, textures leave the room (TaynanGT's tree's RTX 4070 preset: 64, 1536, 1024, 1). |
+| `VICTORY_STRUCTURED_RAW=1` | 0 | Structured views off 16 bytes get a copy of their own bytes. Off: on cards whose heaps have no raw twins (NVIDIA) the rule made 400 copies a frame under one lock and doubled the frame's time. |
+
+Renderer port 5 (`VICTORY_PORT_CBV`) needs the layer underneath's own
+translator and does nothing with ours. `VICTORY_FSR_4K=quality` (Series X
+profile only, with AMD's signed `amd_fidelityfx_upscaler_dx12.dll` in
+`VICTORY_FIDELITYFX_DIR`) renders at 2560x1440 and upscales to 3840x2160 with
+FSR 4.1.2; it is not measured on NVIDIA yet.
+
 ## What is different here
 
 - **A shader translator for 32-lane GPUs.** Every one of the 25,953 programs
@@ -189,8 +213,9 @@ side has to stay under 33.
    levers.
 3. **One settle a frame.** The preparing thread waits about 36 ms a frame for
    the card at one point, for a fill of upload memory that reads title memory.
-4. **The newest layer underneath** (renderer ports that read constant buffers
-   in place) is being merged.
+   Renderer port RT (`VICTORY_PORT_RT=1`) is the first thing to measure there.
+4. **The newest layer underneath** is merged: its renderer ports are
+   switches, off until measured on NVIDIA (see the switches above).
 5. **The Series S profile** as the fast mode meanwhile.
 6. **The ray-traced light** once the rest fits in a frame.
 

@@ -189,6 +189,9 @@ fn build(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: Vec::new(),
+        atomic_views: Vec::new(),
+        written_views: Vec::new(),
+        picked_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

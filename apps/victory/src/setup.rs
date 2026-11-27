@@ -97,7 +97,7 @@ pub(crate) fn run(s: Setup) -> Result<()> {
     } else {
         println!();
         line("shaders", "the title's shaders go into the cache now: a few minutes, once per translator");
-        crate::translate::precompile(vec![dir], s.jobs)?;
+        crate::translate::precompile(vec![dir], s.jobs, None)?;
     }
     println!();
     line("next", "pilotebox play, or a double click on PiloteBox.cmd");

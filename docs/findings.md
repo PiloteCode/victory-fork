@@ -72,7 +72,7 @@ in that order of size:
 - Mapping pages on sixteen threads: no more pages mapped, frames longer.
 - Scalar buffer loads four dwords a call (`VICTORY_SHADER_OPT=127`): no gain on this card.
 - Wave sizes, fused multiply-adds, fast reciprocals, raw picked buffers, leaving out
-  barriers: nothing to 0.1 ms each. Exact RDNA float rules (`VICTORY_RDNA_FLOAT`): 0.8 ms.
+  barriers: nothing to 0.1 ms each. Exact RDNA float rules (in that fork's translator, not this branch's): 0.8 ms.
 - Running the console's shader code natively on the card: the Windows driver takes no raw
   code, the two generations differ, and a Vulkan host layer ends at the same compiler. What
   is left to gain from shader code was guessed at under 1 ms.
@@ -85,7 +85,8 @@ in that order of size:
    for the next submission while this one is sent; view the card's own buffers where fills
    copy them now.
 2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
-   after fxceless c36971b2; not measured here yet), and the passes that run for nothing
+   after fxceless c36971b2, wins over `VICTORY_CARD_BUFFERS_MIN_MB`; not measured here
+   yet), and the passes that run for nothing
    without rays.
 3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
    pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.

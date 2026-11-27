@@ -95,6 +95,10 @@ pub(super) fn stage() -> u32 {
 /// place in a list. The whole submission was refused for it, and stood 40 to
 /// 60 ms until the flights had landed (run n19).
 fn placed_order() -> bool {
+    // Renderer port RT: this order is its part 1.
+    if crate::port_rt::on() {
+        return true;
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
         return on;
@@ -102,6 +106,8 @@ fn placed_order() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
+
+mod forward;
 
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
@@ -148,16 +154,12 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         copy: false,
                     }));
                 }
-                for &i in &flight.order {
-                    for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
-                        out.push(Writer {
-                            shadow: None,
-                            from: at,
-                            to: at + rows.saturating_sub(1) * pitch + row,
-                            copy: false,
-                        });
-                    }
-                }
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
@@ -186,6 +188,13 @@ pub(super) fn copies(line: &Line) -> Vec<Writer> {
         ..*w
     });
     flying.flat_map(Taken::copied).chain(landing).collect()
+}
+
+/// The title memory [`copies`] write, in order and joined.
+pub(super) fn copied_ranges(line: &Line) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    join_ranges(&mut ranges, copies(line).iter().map(|w| (w.from, w.to)));
+    ranges
 }
 
 /// Whether `runs` refresh another host copy of a destination in `copies`,
@@ -452,7 +461,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     from: *at,
                     to: *at + *len,
                 },
-                Step::Run(_) => Does::Run,
+                Step::RawCopy { .. } => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
@@ -477,7 +486,11 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (mut does, steps) = does_of(&written, runs);
+    if forward::on() {
+        let (places, shader_writes) = forward::places_of(runs, &steps);
+        forward::forward(&mut does, &places, &shader_writes);
+    }
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -485,7 +498,9 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let (placed, reader) = behind?;
     let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
     let cut = place(placed)? + 1;
-    (place(reader)? >= cut).then_some(cut)
+    let apart = place(reader)? >= cut;
+    crate::port_rt::count(if apart { crate::port_rt::CUT } else { crate::port_rt::SAME_LIST });
+    apart.then_some(cut)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -668,8 +683,11 @@ impl Host {
             }
             (line.written.clone(), copies(&line))
         };
+        let looked = crate::timeline::span("steps on the card: whether in the way");
         blocked_by(&written, runs, false)?;
-        let taken = if copied_read(&copies, runs) {
+        let read = copied_read(&copies, runs);
+        looked.end();
+        let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
             self.take_steps(&written, runs)
@@ -688,8 +706,38 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let (mut does, steps) = does_of(written, runs);
+        // (Only where a copy at its place is there at all: some 1,200 steps
+        // a submission are looked at for it.)
+        let placed = does.iter().any(|d| matches!(d, Does::Placed { .. }));
+        let mut forwarded = 0;
+        if forward::on() && placed {
+            let (places, shader_writes) = forward::places_of(runs, &steps);
+            forwarded = forward::forward(&mut does, &places, &shader_writes);
+        }
+        let by_order = placed_order();
+        let mut behind = None;
+        let chosen = plan(&does, stage(), by_order, &mut behind);
+        if placed {
+            match (&chosen, by_order) {
+                (Err(BEHIND_PLACED), false) => crate::port_rt::count(crate::port_rt::REFUSED_OFF),
+                (Ok(_), true) if plan(&does, stage(), false, &mut None) == Err(BEHIND_PLACED) => {
+                    crate::port_rt::count(crate::port_rt::BY_ORDER)
+                }
+                _ => {}
+            }
+        }
+        let chosen = match chosen {
+            Ok(chosen) => chosen,
+            Err(why) => {
+                #[cfg(feature = "diagnostics")]
+                if why == BEHIND_PLACED {
+                    note_placed(&does, &steps, runs, behind);
+                }
+                let _ = behind;
+                return Err(why);
+            }
+        };
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -850,6 +898,7 @@ impl Host {
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
+        forward::FORWARDED.fetch_add(forwarded as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -884,6 +933,81 @@ type Noted = std::collections::HashMap<(usize, (u64, u64), (u64, u64)), (u64, us
 #[cfg(feature = "diagnostics")]
 static NOTED: Mutex<Option<Noted>> = Mutex::new(None);
 
+/// Diagnostics: since the last frame line, the submissions whose steps a
+/// copy at its place in a list kept off the card ([`BEHIND_PLACED`]), and
+/// what the last one was.
+#[cfg(feature = "diagnostics")]
+static PLACED: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+
+/// Diagnostics: [`plan`] refused `does` for a copy at its place in a list;
+/// `behind` is what it found in the way behind that copy. Names the copy,
+/// where it stands, and the steps that read or write its bytes ahead of it
+/// and behind it, and whether a cut between lists ([`cut_for`]) could part
+/// them.
+#[cfg(feature = "diagnostics")]
+fn note_placed(does: &[Does], steps: &[(usize, usize)], runs: &[&HostList], behind: Option<(usize, usize)>) {
+    use std::fmt::Write;
+    let list = |i: usize| {
+        runs.iter()
+            .position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0)
+            .map_or_else(|| "?".to_owned(), |l| l.to_string())
+    };
+    let what = |i: usize| match does[i] {
+        Does::Copy { dst, src, len, asked } => {
+            format!("a copy of {len:#x} bytes to {dst:#x} from {src:#x}{}", if asked { " (flights stop it)" } else { "" })
+        }
+        Does::Fill { src, len, asked, to } => format!(
+            "a fill of {len:#x} bytes from {src:#x}{}{}",
+            if asked { " (flights stop it)" } else { "" },
+            if to { "" } else { " (the card cannot be given its bytes)" }
+        ),
+        _ => "another step".to_owned(),
+    };
+    let mut text = String::new();
+    for (p, d) in does.iter().enumerate() {
+        let Does::Placed { dst, src, len } = *d else {
+            continue;
+        };
+        let (to, from) = ((dst, dst + len), (src, src + len));
+        let meets = |i: usize| {
+            i != p && reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
+        };
+        let ahead: Vec<usize> = (0..p).filter(|&i| meets(i)).collect();
+        let after: Vec<usize> = (p + 1..does.len()).filter(|&i| meets(i)).collect();
+        if ahead.is_empty() && after.is_empty() {
+            continue;
+        }
+        let _ = write!(
+            text,
+            "the copy at its place of {len:#x} bytes to {dst:#x} from {src:#x}, step {p} of {} in list {} of {}; {} steps ahead of \
+             it and {} behind it read or write its bytes",
+            does.len(),
+            list(p),
+            runs.len(),
+            ahead.len(),
+            after.len()
+        );
+        if let Some(&i) = ahead.last() {
+            let _ = write!(text, "; the last ahead: {} in list {}", what(i), list(i));
+        }
+        if let Some(&i) = after.first() {
+            let _ = write!(text, "; the first behind: {} in list {}", what(i), list(i));
+        }
+        break;
+    }
+    if let Some((p, i)) = behind {
+        let same = list(i) == list(p);
+        let _ = write!(
+            text,
+            "; in the way on the card: step {i} behind it{}",
+            if same { ", in the same list (no cut between lists parts them)" } else { ", in a later list" }
+        );
+    }
+    let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    placed.0 += 1;
+    placed.1 = text;
+}
+
 #[cfg(feature = "diagnostics")]
 fn noted(ops: &[Op]) {
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -906,15 +1030,34 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} fills read a copy's source, the copy at its place being \
+         just ahead of them (VICTORY_FILL_FORWARD={}); left as they were: {:.2} as a step writes the source ahead of the \
+         copy, {:.2} as a shader does, {:.2} as a shader writes what the fill reads in between",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        forward::FORWARDED.swap(0, Ordering::Relaxed) as f64 / frames,
+        u8::from(forward::on()),
+        forward::LEFT[0].swap(0, Ordering::Relaxed) as f64 / frames,
+        forward::LEFT[1].swap(0, Ordering::Relaxed) as f64 / frames,
+        forward::LEFT[2].swap(0, Ordering::Relaxed) as f64 / frames,
     );
     #[cfg(feature = "diagnostics")]
     {
+        let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if r.iter().any(|&n| n > 0.0) {
+            tracing::info!(
+                "what a copy at its place writes, found read on the CPU behind it, per frame (looks, all threads): {:.2} by \
+                 another such copy, {:.2} by a buffer copy, {:.2} by a fill, {:.2} by a texture, {:.2} by a step of ours",
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4]
+            );
+        }
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let mut noted: Vec<_> = noted.into_iter().collect();
         noted.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e.0));
@@ -932,6 +1075,20 @@ pub(super) fn log(frames: f64) {
                     to.1
                 );
             }
+        }
+        let (n, last) = std::mem::take(&mut *PLACED.lock().unwrap_or_else(|e| e.into_inner()));
+        if n > 0 {
+            tracing::info!(
+                "kept off the card by a copy at its place in a list, per frame: {:.2} submissions (VICTORY_PLACED_ORDER={}: {}); \
+                 the last: {last}",
+                n as f64 / frames,
+                u8::from(placed_order()),
+                if placed_order() {
+                    "only what stands behind the copy is in its way, and a submission is cut behind the copy's list"
+                } else {
+                    "whatever reads or writes its bytes is in its way, wherever it stands"
+                },
+            );
         }
     }
 }
@@ -1020,6 +1177,21 @@ mod tests {
 
     /// A copy at its place in a list is in the way of what reads or writes its
     /// bytes behind it, not of what did ahead of it.
+    /// Renderer port RT is the order's switch too: with it a fill ahead of
+    /// a copy at its place is let through, one behind it still refused.
+    #[test]
+    fn the_port_takes_the_order() {
+        crate::port_rt::PORT_RT_IN_TEST.set(true);
+        assert!(placed_order());
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let by_order = placed_order();
+        assert!(plan(&[fill(2032, 64, true), placed], 2, by_order, &mut None).is_ok());
+        assert_eq!(plan(&[placed, fill(2032, 64, true)], 2, by_order, &mut None), Err(BEHIND_PLACED));
+        crate::port_rt::PORT_RT_IN_TEST.set(false);
+        // Without it (and without VICTORY_PLACED_ORDER) both were refused.
+        assert_eq!(plan(&[fill(2032, 64, true), placed], 2, false, &mut None), Err(BEHIND_PLACED));
+    }
+
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
         let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
@@ -1296,7 +1468,7 @@ mod tests {
             let c = host.new_list().unwrap();
             c.defer_copy((start + 1_200_000) as *mut u8, (start + HALF + 100) as *const u8, 1500);
             c.close();
-            let number = host.execute_own(&c);
+            let (number, _) = host.execute_own(&c);
             settle_now(WHY_SYNC);
             assert!(FINISHED.load(Ordering::Acquire) >= number);
             let wanted: Vec<u8> = (0..2000)

@@ -25,6 +25,7 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # `pilotebox doctor` asks the graphics card what a run asks it; `bench`
@@ -56,6 +57,7 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true
