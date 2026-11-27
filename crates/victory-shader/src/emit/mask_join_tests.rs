@@ -96,6 +96,9 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
         half_views: Vec::new(),
+        atomic_views: Vec::new(),
+        written_views: Vec::new(),
+        picked_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
