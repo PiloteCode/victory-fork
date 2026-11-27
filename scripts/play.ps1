@@ -29,9 +29,11 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
-$victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
-if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
-if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
+# The program is pilotebox.exe in this fork (victory.exe in builds before the rename).
+$victory = Join-Path $PSScriptRoot "..\target\$Build\pilotebox.exe"
+if (-not (Test-Path $victory)) { $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe" }
+if (-not (Test-Path $victory)) { Write-Host "No pilotebox.exe in target\$Build. Build it first (README.md)."; return }
+if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })

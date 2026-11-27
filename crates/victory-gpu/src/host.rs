@@ -9363,8 +9363,6 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
-    /// The caption the window had, once read.
-    caption: Option<Vec<u16>>,
 }
 
 impl Meter {
@@ -9378,7 +9376,6 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
-            caption: None,
         }
     }
 
@@ -9679,17 +9676,11 @@ impl Meter {
                     }
                 }
         });
-        if self.caption.is_none() {
-            // The window's own text, read without a message.
-            let mut buffer = vec![0u16; 512];
-            // SAFETY: a window handle and a buffer of that length.
-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
-            buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
-        }
-        let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        // This fork's caption: its own name, then the frame's figures (the
+        // window's own text is not kept in front of them).
+        let name = victory_core::product::NAME;
+        let text = format!("{name} | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -10615,6 +10606,24 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // What the system tells every window about displays and devices, in
+    // the log: on a test machine Windows reset the card four times in one
+    // day, each 2.5 to 4.6 s after a remote-desktop host ended its session
+    // and removed its virtual input device, and nothing in our log showed
+    // it. In the trail too, which the report of a removal prints with how
+    // long before it each came.
+    match message {
+        WM_DISPLAYCHANGE => {
+            let (width, height) = (lparam.0 & 0xffff, (lparam.0 >> 16) & 0xffff);
+            tracing::info!(width, height, bits = wparam.0, "the display's mode changed");
+            trail(|| format!("the display's mode changed to {width}x{height}"));
+        }
+        WM_DEVICECHANGE if wparam.0 == DBT_DEVNODES_CHANGED as usize => {
+            tracing::info!("a device was added to or removed from the system");
+            trail(|| "a device was added to or removed from the system".to_owned());
+        }
+        _ => {}
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }

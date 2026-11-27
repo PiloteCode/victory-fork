@@ -66,6 +66,16 @@ fn wanted(choice: Option<&str>) -> Vec<(&'static str, &'static str)> {
 /// first thing in `main` for `victory run`, before any thread reads the
 /// environment.
 pub(crate) fn apply() {
+    let set = set();
+    if !set.is_empty() {
+        println!("defaults       {} (VICTORY_PLAY_DEFAULTS=0: none)", set.join(" "));
+    }
+}
+
+/// Sets each default the environment does not set, and returns them as
+/// `NAME=value` (`pilotebox play` says it shorter). Before any thread
+/// reads the environment.
+pub(crate) fn set() -> Vec<String> {
     let choice = std::env::var("VICTORY_PLAY_DEFAULTS").ok();
     let mut set = Vec::new();
     for (name, value) in wanted(choice.as_deref()) {
@@ -76,9 +86,7 @@ pub(crate) fn apply() {
             set.push(format!("{name}={value}"));
         }
     }
-    if !set.is_empty() {
-        println!("defaults       {} (VICTORY_PLAY_DEFAULTS=0: none)", set.join(" "));
-    }
+    set
 }
 
 #[cfg(test)]

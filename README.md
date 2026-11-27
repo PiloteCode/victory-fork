@@ -1,280 +1,247 @@
-# VIctory on an RX 7900 XTX
+# PiloteBox
 
-## Run the codec_d Windows build
+**An Xbox Series (Scarlett) compatibility layer for Windows, tuned for NVIDIA cards.**
 
-Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
+[![CI](https://github.com/PiloteCode/PiloteBox/actions/workflows/ci.yml/badge.svg)](https://github.com/PiloteCode/PiloteBox/actions/workflows/ci.yml)
+
+PiloteBox runs an Xbox Series title's own x64 code natively on a Windows PC. It
+is not an emulator of the processor: the title's code runs as it is. What
+PiloteBox supplies is everything around it: a loader for the title's image, the
+console's GDK runtime (`XGameRuntime`, memory, files, DirectStorage, input,
+audio) on Win32, the console's Direct3D 12 (`d3d12_xs`) on the PC's Direct3D 12,
+and a recompiler that turns the console's RDNA2 (GFX10) shaders into DXIL.
+
+Its own subject is the cards the console's shaders were not written for: GPUs
+with 32-lane waves (NVIDIA, Intel) and a view heap capped at 1,000,000
+descriptors. The goal is plain: **the Series X profile, at full quality, at a
+steady 30 frames a second.** It is not there yet; the numbers below say where
+it is.
+
+> **This repository contains no game files, code, keys or assets.** You need
+> your own lawful copy of the title you run. PiloteBox is not affiliated with
+> or endorsed by any console maker, developer or publisher. We do not help
+> anyone obtain a game: requests for game files, keys, dumps or links are
+> closed without an answer.
+
+## Where it stands (2026-11-27, version 0.12.2)
+
+Measured on one machine: Windows 11, GeForce RTX 5090 on a PCIe 5.0 x16 link,
+Core i9-14900KF, 128 GB of RAM, a 2560x1440 display, a diagnostics build, one
+Xbox Series title, automated runs of four to five minutes that start a new game
+or load a save.
+
+| Step | State |
+|---|---|
+| Loads and boots | yes |
+| Menus, videos, loading screens | yes, 30 fps |
+| In the world | yes |
+| Playable | yes: a new game's opening and the prologue |
+| Series X profile (full quality) | 79-95 ms a frame (10.5-12.5 fps) in the prologue's first playable scenes, about 4,800 draws a frame; the picture is right |
+| Series S profile (lighter, upscaled) | shows a picture since 0.12.2; its frame time is being measured again (44 ms a frame before the upscaler's passes ran) |
+| Ray-traced indirect light (`--rt`) | runs, far too slow to play with today |
+| Stability | no crash and no device loss in eleven automated runs of this version; long sessions are not measured yet |
+| Memory | about 37 GB of private memory and 11-19 GB of video memory: 64 GB of RAM recommended |
+| Shaders | 25,953 of the 25,953 programs of the title's shader archive translate and validate for 32-lane GPUs |
+
+The same scenes took 130-168 ms a frame with the layer this tree replaced two
+days earlier.
+
+**What bounds the frame today is the card.** A timing run of the Series X
+profile counts 57.5 ms of card work a frame: 31.7 ms in 3,812 compute
+dispatches and 20.8 ms in 4,471 indirect executions. Preparing a frame on the
+processor takes 22-26 ms. The [roadmap](#roadmap) says what we do about it.
+
+Known to be wrong:
+
+- Textures of what just came into view appear late: skin and clothes can stay
+  grey for seconds.
+- Mouths in cutscenes: the fix (16-bit typed buffers moved as integers) is in
+  0.12.1 and passes its tests on the card; it is not yet confirmed in a
+  cutscene.
+- Rooms with little direct light are too dark without `--rt`.
+- The first run after a build or a driver update stutters while the driver
+  makes its pipelines.
+
+## Quick start
+
+You need Windows 10 or 11 (x64), a processor with AVX2, a Direct3D 12 card with
+shader model 6.6 and mesh shaders, [Rust](https://rustup.rs) (the toolchain is
+pinned in `rust-toolchain.toml`), the MSVC build tools with a Windows SDK, and
+your own copy of the title, in a folder outside this repository.
 
 ```powershell
-$env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
-.\Play-VIctory.cmd pareto-residency
+git clone https://github.com/PiloteCode/PiloteBox
+cd PiloteBox
+cargo build --release -p victory               # makes target\release\pilotebox.exe
+target\release\pilotebox.exe doctor            # checks the PC, the cache and the title's files
+target\release\pilotebox.exe play --game D:\titles\mine
 ```
 
-The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
+Or double-click `PiloteBox.cmd`: it builds when the sources changed, then
+plays. Without `--game`, the title is looked for in `VICTORY_GAME_DIR`, then in
+`victory.toml` (copy `victory.example.toml`), then beside the program and in
+the folder above the repository.
 
-To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
+## Commands
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+| Command | What it does |
+|---|---|
+| `pilotebox play` | Plays the title. `--mode x` is the Series X profile (the default), `--mode s` the Series S profile, `--rt` turns the ray-tracing structure builder on, `--safe` leaves the newest speed-ups out (the first thing to try when something is wrong). |
+| `pilotebox bench` | A timed run that ends by itself (`--seconds 300` by default) on a **copy** of your saves, then its figures: time to the world, mean and worst frame, preparing, card, copy-back, draws, dropped draws. Written as Markdown, JSON and a log beside the cache folder. |
+| `pilotebox doctor` | Checks this PC: card and driver, wave size, view heap, PCIe link, AVX2, memory, disk, the cache's parts, the title's files, other runs. |
+| `pilotebox check` | `doctor`, then a short `bench`, ending with PASS or FAIL. |
+| `pilotebox clean` | Lists what in the cache folder is old and removes it with `--yes`. It never touches saves. |
 
-## The goal
+The developer commands of the layer are all still there: `run`, `shaders`,
+`warm`, `translate`, `translate-diff`, `shader-info`, `replay`, `inspect`,
+`census`, `config`. `pilotebox <command> --help` describes each.
 
-**The Series X version at 4K output (drawn at 1440p) with ray tracing on,
-looking the way it does on the Xbox**, on an AMD RX 7900 XTX first.
+```powershell
+pilotebox bench --name first                    # five minutes, Series X profile
+pilotebox bench --mode s --seconds 180          # three minutes, Series S profile
+pilotebox check                                 # is this build and this PC all right?
+```
 
-In this order:
+## Modes
 
-1. **A correct picture.** Textures and models reach full detail and stay there
-   (no pop-in or pop-out, no flickering trees), and ray-traced lighting is right:
-   not too dark, not too bright, no flicker.
-2. **Then the frame rate:** 30 fps or more with ray tracing on, then as high a
-   frame rate and as low frame times as the PC allows.
-3. **Then smaller PCs:** 32 GB (later 16 GB) of RAM and smaller cards.
-
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. The Series S profile and
-ray tracing off stay available.
-
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
-
-### This branch: their layer with our translator, and the defaults it runs with
-
-This tree is the RX 7900 XTX fork's layer (everything below) with the shader
-translator of our tree (PiloteCode's waves, `crates/victory-shader` as of
-wave 11): every one of the title's 25,953 programs translates and validates for
-a card of 32-lane waves too (NVIDIA), with paired forms of wave64 programs,
-geometry programs, linked mesh programs, dispatches past 65,535 groups split,
-thread-limited forms for dispatches by thread counts.
-
-`victory run` now plays with the switches `scripts\play.ps1` set, as its
-defaults (`apps/victory/src/defaults.rs`); a switch set in the environment
-keeps its value:
-
-| Switch | Default here | What it does |
+| Mode | What you get | What it costs |
 |---|---|---|
-| `VICTORY_THIN` | 1 | list calls written down, translated by eight threads of ours |
-| `VICTORY_JOIN_PARTS` | 8 | parts of submissions prepared as one |
-| `VICTORY_UPLOAD_AHEAD` | 1 | first texture uploads on a copy queue of their own |
-| `VICTORY_RELAY` | 2 | what shaders wrote comes back beside the guards, on a thread of its own |
-| `VICTORY_RELAY_COPY` | 1 | that fetch on a copy queue |
-| `VICTORY_WIDE_BACK` | 1 | (the layer's default too) |
-| `VICTORY_CARD_REHASH_RUNS` | 1 | card copies' hashes by runs |
-| `VICTORY_JOIN_COPIES` | 1 | copies of a submission joined |
-| `VICTORY_CARD_STEPS` | 2 | fills that need bytes on the card done on the card |
-| `VICTORY_INDIRECT_WINDOW` | 1 | indirect draws clamped a window at a time |
-| `VICTORY_INDIRECT_BATCH` | 2 | single-record executions clamped in batches, dispatches included |
-| `VICTORY_TEXTURE_NO_WAIT` | 1 | texture uploads wait for no mapping |
-| `VICTORY_SHOW_AFTER` | 1 | a slot shows a texture after its upload has run |
-| `VICTORY_MAP_THREADS` | 1 | pages mapped by the caller alone |
-| `VICTORY_TITLE_PRIORITIES` | 0 | the title's thread priorities as it sets them |
-| `VICTORY_CARD_AWAKE` | 1 | the card's clocks kept up between submissions |
-| `VICTORY_D3D12_DRED` | light | crash tracing that can stay on (diagnostics builds) |
-| `VICTORY_RESIDENCY` | 1 | codec-d/cool_fox's memory budgets (as its archive ran them on an RTX 5090) |
-| `VICTORY_FALLBACK_HEAPS` | 1 | heaps of one slot where a list sets none (cool_fox) |
-| `VICTORY_SWEEP_PER_HEAP` | 1 | the heap buffer pass per view heap (cool_fox) |
-| `VICTORY_XMA_REFILL` | 1 | XMA voices go on after their end (cool_fox) |
-| `VICTORY_DSTORAGE_STAGING_MB` | 256 | a DirectStorage staging floor (cool_fox) |
-| `VICTORY_TEXTURE_MAX` | 0 | streamed textures at their full size (the base caps them at 1024 texels a side for 16 GB cards) |
+| `--mode x` (default) | The Series X profile: the title's full quality. | 79-95 ms a frame on an RTX 5090 today. |
+| `--mode s` | The Series S profile: a 960x540 scene upscaled by the title's own upscaler. Softer, and much lighter on the card. | Being measured; the fast mode while the Series X profile is brought to 30 fps. |
+| `--rt` | The title's ray-traced indirect light: the structure builder and the walks. | With the walks really running, a tester measured 333-425 ms a frame on an RTX 4070 SUPER. For looking, not for playing. |
+| `--safe` | The layer's older, slower ways. | Slower; use it to tell a bug of the speed-ups from a bug of the layer. |
 
-The renderer ports of the RX 7900 XTX fork are switches, off by default as
-there: `VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_DESCRIPTORS=1`,
-`VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1` (its runs had 1, 2, 5, 6 and 7
-on). Port 5, `VICTORY_PORT_CBV`, needs that fork's translator (constant buffers
-read as raw bytes) and does nothing with ours.
-Renderer port RT, `VICTORY_PORT_RT=1` (off by default as there), lets the card
-bring the bytes of a fill of upload memory that a copy at its place declared
-written, instead of the submission waiting for every flight;
-`VICTORY_RT_STAMPS=1` (diagnostics builds) times each compute dispatch on the
-card. `VICTORY_PORT_CONSTANTS_ORDER` (on) matters with port 1 only.
+Every switch of the layer (`VICTORY_*`) still works as it is; the play settings
+are the defaults, so none is needed. The switches are described in
+[docs/findings.md](docs/findings.md), [docs/README-fxceless.md](docs/README-fxceless.md)
+and each module's notes.
 
-`VICTORY_PLAY_DEFAULTS=0` leaves every one at the layer's own default;
-`VICTORY_PLAY_DEFAULTS=safe` is the script's `-Safe` (no `THIN`, `JOIN_PARTS`,
-`UPLOAD_AHEAD`; `VICTORY_UNDER_WIDE=0`, `VICTORY_LAND_ECHO=0`). Not among them,
-and off unless set:
+### Switches that bear on the card's time and on the settle
 
-- `VICTORY_AMBIENT=0.8`, the script's stand-in for the traced indirect light;
-- `VICTORY_BVH_BUILDER=1`, the ray-tracing structure builder (the script's
-  `-RayTracing`): its cost kept it off in our measurements; while it does not
-  run, the programs that walk its structures see an empty scene.
+The play settings are the defaults; these are the ones that matter most for
+the goal, with what they are by default:
 
-On by the layer's own default, as in our tree: texture read-back into title
-memory (`VICTORY_TEXTURE_BACK=0` turns it off), linked mesh programs
-(`VICTORY_MESH_LINK=0`). Off unless asked for: textures made due again after
-DirectStorage writes (`VICTORY_PAGE_WRITES=1`) and such a write naming the
-textures behind views the title wrote before (`VICTORY_OWN_BYTES=newer`); the
-levels a texture holds always end at the next texture placed inside it.
-Builds are made for x86-64-v3 (AVX2, which the title needs anyway;
-`.cargo/config.toml`), release and diag with thin LTO and one codegen unit
-(`Cargo.toml`).
+| Switch | Default | What it does |
+|---|---|---|
+| `VICTORY_PORT_RT=1` | off | When a fill of upload memory reads bytes that a copy at its place declared written, the card brings them, or the fill takes them from the copy's source, instead of the submission waiting for every flight (the one settle a frame). Its frame line counts the cases even when off. |
+| `VICTORY_PORT_CONSTANTS=1` | off | The title's 174 MB constants heap is read by the card where the title writes it: no uploads and no fills of it. With it, indirect executions whose arguments sit there are prepared alone right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on; 2-5 ms). |
+| `VICTORY_FILL_TITLE=2` | off | Small fills of upload memory go on without waiting for flights where no shader wrote the page lately. |
+| `VICTORY_RT_STAMPS=1` | off | Diagnostics builds: the card's time of every compute dispatch, by kind and by pipeline. |
+| `VICTORY_PORT_DESCRIPTORS=1`, `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1` | off | The layer's renderer ports 2, 6 and 7: less work on the processor (descriptor stores reported by the title's own code, a shared guard lock, the heaps' records split). |
+| `VICTORY_TEXTURE_MAX` | 0 | Streamed textures at their full size (the layer underneath caps them at 1,024 texels a side for 16 GB cards). |
+| `VICTORY_RESIDENCY`, `VICTORY_FALLBACK_HEAPS`, `VICTORY_SWEEP_PER_HEAP`, `VICTORY_XMA_REFILL` | 1 | codec-d/cool_fox's memory budgets, heaps of one slot, the heap buffer pass per heap and XMA refill, as on an RTX 5090 before. |
+| `VICTORY_DSTORAGE_STAGING_MB` | 256 | A DirectStorage staging floor (cool_fox). |
 
-## Where it stands (2026-11-26)
-
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, renderer patches 1, 2, 5, 6 and 7 on. Runs of 270 s in a city
-street: standing still, then walking and turning the camera.
-
-| Version | Standing | Walking | RAM |
-|---|---|---|---|
-| **Series X, 4K drawn at 1440p, ray tracing on (the goal)** | 99 ms (10 fps) | ~110 ms (9 fps) | 45 GB |
-| Series X, 4K drawn at 1440p, ray tracing off | 49 ms (20 fps) | ~62 ms (16 fps) | 45 GB |
-| Series X, 1080p output, ray tracing off | 40 ms (25 fps) | ~43 ms (23 fps) | 42 GB |
-| Series S, ray tracing off | 43 ms (23 fps) | ~64 ms (16 fps) | 37 GB |
-
-Fixed 2026-11-26: trees and palms dropping out for a few frames, and most of the
-lighting swinging between too dark and too bright in lamp-lit rooms. Both came from
-indirect draws whose arguments sit in renderer patch 1's in-place memory being
-prepared before the title's culling had written them; they are now prepared one at
-a time right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on by default, about
-2-5 ms). Rooms lit only by bounced light are no longer black with ray tracing
-(`VICTORY_AMBIENT_RT=0.7,1.5`, which `Play-Watched.ps1 -RayTracing` sets).
-
-Still open: models and textures stay at their lowest detail for a long time while
-the title streams (worst in the intro): the title paces its streaming by its own
-frames, so it loads about three times slower at 10 fps than at 30; ray-traced
-structures of moving objects are partly corrupt (the rays follow some 450 stray
-pointers a frame).
-
-Earlier measurements with ray tracing off:
-
-| | |
-|---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
-
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
-
-### Renderer patches (off by default while they are tested)
-
-| Switch | What it does |
-|---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
-
-### Other switches
-
-| Switch | What it does |
-|---|---|
-| `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
-
-What is known to be wrong:
-
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
-
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
-
-```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
-```
-
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-In this branch `target\diag\victory.exe run <exe> --execute` alone plays with the
-script's switches too (above), all but the stand-in light (`VICTORY_AMBIENT`).
-
-For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
-`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
-`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
-`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
-
-`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
-the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
-and `performance` selects 1920×1080. All three output 3840×2160. With
-`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
-The log reports the provider at context creation and the actual input and
-output sizes at the first successful temporal dispatch. The title profile
-and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
-
-On a hybrid-graphics PC the RX 7900 XTX fork prefers a high-performance
-adapter, with a switch to name one; that choice lives in its translator
-(`victory_shader::emit::host`), which this branch does not have: here the
-runtime opens the default adapter, as VIctory does.
-
-Before the first run, ahead of time (both can be stopped and go on later):
-
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
-
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+Renderer port 5 (`VICTORY_PORT_CBV`) needs the layer underneath's own
+translator and does nothing with ours. `VICTORY_FSR_4K=quality` (Series X
+profile only, with AMD's signed `amd_fidelityfx_upscaler_dx12.dll` in
+`VICTORY_FIDELITYFX_DIR`) renders at 2560x1440 and upscales to 3840x2160 with
+FSR 4.1.2; it is not measured on NVIDIA yet.
 
 ## What is different here
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
+- **A shader translator for 32-lane GPUs.** Every one of the 25,953 programs
+  of the title's shader archive translates and validates for a host whose
+  widest wave is 32 lanes: paired, split, halves and local forms of the
+  console's 64-lane programs, geometry programs as geometry shaders, mesh
+  programs linked with their pixel programs, dispatches by thread counts.
+- **The upscaler's own shader containers** (an `ACCC` part holding an `FSPX`
+  blob) translate too, so the Series S profile shows a picture (0.12.2).
+- **16-bit typed buffers moved as integers** where a program moves halves
+  through unsigned views: on NVIDIA the float path read zeros (0.12.1).
+- **Dynamic descriptor slots that do not run out** on a 1,000,000-view heap:
+  a submission gives its tables' slots back when the card has run it (from
+  codec-d/cool_fox, see [CREDITS.md](CREDITS.md)).
+- **The play settings are the defaults**: no script and no environment
+  variable to remember.
+- **Builds for x86-64-v3** with thin LTO: the title needs AVX2 anyway.
+- **The PiloteBox commands**: `play`, `bench`, `doctor`, `check`, `clean`, and
+  a benchmark anyone can repeat and paste.
+- **A frame recorder and replay** (from the layer underneath) that we use to
+  time shader forms against each other without the title.
 
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+## How it works, in one paragraph
+
+The loader maps the title's PE image at an address of its own and patches the
+few instructions a PC processor lacks. The runtime answers the console's GDK
+calls (`XGameRuntime`, `XMemAllocate`, `XTaskQueue`, `GameInput`, DirectStorage,
+XMA audio) with Win32 services. The graphics layer takes the console's
+`d3d12_xs` command lists, written down on the title's threads and translated by
+threads of ours, keeps host copies of the title's buffers and textures coherent
+with what shaders write (guard pages, a write watch, copies in the card's
+memory, a relay that brings shader writes back), and sends host lists to
+Direct3D 12 without waiting for the card. The shader recompiler lowers GFX10
+(RDNA2) machine code to DXIL: wave operations, LDS memory, typed and raw
+buffers, images, mesh and geometry stages, ray-tracing structure walks. See
+[docs/architecture.md](docs/architecture.md).
+
+## Benchmarks: measuring and reporting
+
+`pilotebox bench` is the measure we use and ask for. It reads the layer's own
+frame lines, leaves out the seconds in which pipelines are still being made,
+and reports means over the world (1,000 draws a frame or more).
+
+When you report a number, give the card, the profile, the scene and the
+build, and say what was not tested. One run on a quiet machine: a build running
+beside the title doubles the preparing time. A report template is in the issue
+tracker.
+
+## Roadmap
+
+The goal is the Series X profile at a steady 30 fps on NVIDIA cards: the card's
+work has to come down from 57.5 ms a frame to under 30, and the processor's
+side has to stay under 33.
+
+1. **Small buffers where shaders write them.** About 11 ms of the card's
+   time go to nine small programs whose atomics and stores land on title
+   buffers kept in the PC's memory, across the bus. A narrow rule (buffers
+   used with atomics, and small written buffers, live in the card's memory)
+   is being built; moving every small buffer costs the processor as much as
+   it saves the card.
+2. **The console's 64-lane programs on 32 lanes.** Their forms cost about
+   15 ms a frame together; the entry barrier and the per-lane guards are the
+   levers.
+3. **One settle a frame.** The preparing thread waits about 36 ms a frame for
+   the card at one point, for a fill of upload memory that reads title memory.
+   Renderer port RT (`VICTORY_PORT_RT=1`) is the first thing to measure there.
+4. **The newest layer underneath** is merged: its renderer ports are
+   switches, off until measured on NVIDIA (see the switches above).
+5. **The Series S profile** as the fast mode meanwhile.
+6. **The ray-traced light** once the rest fits in a frame.
+
+## Troubleshooting
+
+- **Stutter in the first minutes:** the driver is making pipelines. A second
+  run is smooth; `pilotebox shaders` and `pilotebox warm` make them ahead.
+- **Everything is several times slower than it was:** look at the PCIe line of
+  `pilotebox doctor`. After a driver reset a card can fall back to
+  generation 1 until the PC is restarted.
+- **A build fails with "no space left":** build folders are large (10 GB a
+  tree). `pilotebox clean` only looks at the cache; `cargo clean` frees the
+  build folder.
+- **Something is wrong in the picture:** try `pilotebox play --safe`, then
+  open an issue with the output of `pilotebox doctor` and the log lines.
+- **Your saves:** `bench` and `check` run on a copy. `play` uses the data
+  folder (`%LOCALAPPDATA%\victory\data` by default); copy it before trying a
+  new version.
+
+## Contributing
+
+Pull requests are welcome and are checked on every push: the asset policy, the
+build, the lints and the tests on the software adapter. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) first; it is short. We aim to answer within
+a day.
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+PiloteBox stands on other people's work, named exactly in
+[CREDITS.md](CREDITS.md): VIctory by Marvisak and its contributors,
+fxceless/victory-fork, avatarmanz/VIctory-7900XTX (the layer this tree is built
+on), codec-d/cool_fox, and the people whose pull requests those trees carry.
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+Internal names (crates, modules, the `VICTORY_*` switches, the data folder)
+stay upstream's on purpose: those trees are merged here regularly, and renaming
+their insides would turn every merge into conflicts.
 
 ## License
 

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Read first
+    url: https://github.com/PiloteCode/PiloteBox/blob/main/CONTRIBUTING.md
+    about: "Three rules without exceptions: nothing from a game in this repository, no game named, no help obtaining a game."

@@ -592,6 +592,7 @@ impl Player {
         let folder = find(folder)?;
         let began = Instant::now();
         let frame = Frame::read(&folder.join("frame.bin"))?;
+        gpu::NAMED.store(options.breadcrumbs, std::sync::atomic::Ordering::Relaxed);
         let (device, info) = make_device(&frame, options.debug, options.breadcrumbs)?;
         // SAFETY: plain creation and queries.
         let (queue, frequency) = unsafe {
@@ -869,6 +870,7 @@ impl Player {
             };
             match (result, made) {
                 (Ok(()), Some(res)) => {
+                    Worker::name(&res, || format!("resource {}", r.id));
                     // SAFETY: a live resource.
                     let va = if is_buffer {
                         unsafe { res.GetGPUVirtualAddress() }
@@ -2266,11 +2268,14 @@ impl Player {
         )?;
         let mut next = 0u32;
         let mut steps = Vec::new();
+        // (the frame's lists by their place, as `--only` counts them)
+        let mut listed = 0;
         for (i, lists) in submits.iter().enumerate() {
             let parts = self.delta_parts.get(i).filter(|p| !p.is_empty());
             let delta = match (parts, &self.deltas) {
                 (Some(parts), Some(from)) => {
                     let open = self.open(&heap, &mut next)?;
+                    Worker::name(&open.1, || format!("the CPU's changes before submission {i}"));
                     // SAFETY: an open list; live buffers.
                     unsafe {
                         let mut seen = HashSet::new();
@@ -2305,6 +2310,8 @@ impl Player {
             let mut built = Vec::new();
             for cmds in lists {
                 let open = self.open(&heap, &mut next)?;
+                Worker::name(&open.1, || format!("frame list {listed} (submission {i})"));
+                listed += 1;
                 let stamps = self.translate(
                     &open.1,
                     cmds,
