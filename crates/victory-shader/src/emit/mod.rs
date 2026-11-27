@@ -910,14 +910,15 @@ fn paired(
             what: "paired lanes outside compute",
         });
     };
-    // `VICTORY_WAVE_PAIRS_SPILLED=1`: try it anyway (the structure builder's
-    // three wave64 programs are spilled ones; offline checks first).
+    // Spilled DispatchX programs (the structure builder's three wave64 programs): each lane
+    // leaves out the threads past a count on its own (`Lower::dispatch_threads_prologue`).
+    // `VICTORY_WAVE_PAIRS_SPILLED=0` keeps them out of this form.
     if crate::spill::is_spilled(native)
-        && std::env::var_os("VICTORY_WAVE_PAIRS_SPILLED").is_none_or(|v| v != "1")
+        && std::env::var_os("VICTORY_WAVE_PAIRS_SPILLED").is_some_and(|v| v == "0")
     {
         return Err(ShaderError::Unsupported {
             offset: 0,
-            what: "paired Wave64 for spilled DispatchX programs is not validated",
+            what: "paired Wave64 for spilled DispatchX programs turned off (VICTORY_WAVE_PAIRS_SPILLED=0)",
         });
     }
     let threads = cs.threads.iter().product::<u32>();

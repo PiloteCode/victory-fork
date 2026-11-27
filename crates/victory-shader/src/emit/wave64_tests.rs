@@ -609,8 +609,10 @@ mod after_loop;
 /// must store nothing and count in neither; 0 is no count (all 64). On a host of 64-lane
 /// waves they leave at entry; on one of 32 (both halves exchange) they stay, left out of the
 /// ballot, the reduction and the store, and no barrier hangs with an empty upper half.
-#[test]
-fn threads_past_a_dispatch_x_count_do_nothing() {
+/// The program of [`threads_past_a_dispatch_x_count_do_nothing`]: a spilled 64-thread wave64
+/// compute program that stores `(bit count of EXEC on entry, wave OR of 1 << (lane >> 1))` at
+/// `uav[lane * 2..]` from every lane.
+fn counted_threads_program() -> NativeProgram {
     let mut words = vec![
         // The spilled table's descriptor-table offset (user data 16) from s[0:1] + 0.
         0x8703_FF01,
@@ -635,7 +637,7 @@ fn threads_past_a_dispatch_x_count_do_nothing() {
         0x80 << 24 | 2 << 16 | 2 << 8 | 1, // buffer_store_dwordx2 v[2:3], v1, s[8:11], 0 offen
         S_ENDPGM,
     ]);
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
         vgprs: 16,
@@ -662,7 +664,12 @@ fn threads_past_a_dispatch_x_count_do_nothing() {
             threads: [64, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
+    }
+}
+
+#[test]
+fn threads_past_a_dispatch_x_count_do_nothing() {
+    let native = counted_threads_program();
     assert!(crate::spill::is_spilled(&native));
     let p = crate::spill::build(&native).expect("spill::build");
     let st = structure::structure(&p).expect("structure");
@@ -737,6 +744,71 @@ fn threads_past_a_dispatch_x_count_do_nothing() {
         }
         eprintln!("ran on the hardware device (waves of {host_wave}): counts 45, 1 and none exact");
     }
+}
+
+/// [`counted_threads_program`] in the paired form (a host of 32-lane waves, each thread two
+/// console lanes, n and n + 32), dispatched by a `DispatchX` that counts threads
+/// (`USER_DISPATCH_THREADS`). A thread cannot leave for one of its lanes, so each lane is
+/// guarded by its own place against the count: with 45 threads asked, lanes 0 to 31 run, and
+/// of the upper lanes 32 to 44 do and 45 to 63 store nothing and count in neither the ballot
+/// of EXEC on entry nor the wave OR. The structure builder's stages are spilled programs, and
+/// three of its wave64 programs take the paired form on 32-lane hosts.
+#[test]
+fn the_paired_form_leaves_each_lane_past_a_dispatch_x_count_out() {
+    let native = counted_threads_program();
+    let p = crate::spill::build(&native).expect("spill::build");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let paired = super::paired(&c, &native, &p);
+    lower::TEST_HOST_WAVE.set(was);
+    let (shader, wave) = paired.expect("the paired form");
+    assert_eq!(wave, Some(32));
+    let counts = RootType::Other(super::USER_DISPATCH_THREADS);
+    assert!(
+        shader.user_data.iter().any(|u| u.root == counts && u.dword == 0),
+        "the paired form does not take the thread count of x"
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((host, lanes)) = card() else {
+        return;
+    };
+    if lanes < 32 {
+        eprintln!("the hardware device's waves hold {lanes} lanes, not the paired form's 32; not run");
+        return;
+    }
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("the hardware device refused the paired form: {e}"));
+    // (count, threads that run, their wave OR: bits 0..ceil(n / 2))
+    for (count, active, or) in [(45u32, 45usize, 0x007F_FFFFu32), (33, 33, 0x0001_FFFF), (1, 1, 1), (0, 64, u32::MAX)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in shader.user_data.iter().filter(|u| u.root == counts && u.dword == 0) {
+            ud[u.index as usize] = count;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed (count {count}): {e}"));
+        for lane in 0..64 {
+            let got = (out[0][lane * 2], out[0][lane * 2 + 1]);
+            let expected = if lane < active { (active as u32, or) } else { (0, 0) };
+            assert_eq!(got, expected, "count {count}, lane {lane}");
+        }
+    }
+    eprintln!("ran on the hardware device (paired form): counts 45, 33, 1 and none exact");
 }
 
 /// A wave64 program of 128 threads (two console waves) that leaves early when no lane of its

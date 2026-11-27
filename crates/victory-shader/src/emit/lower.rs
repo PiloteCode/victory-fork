@@ -369,6 +369,8 @@ struct LaneState {
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     strides: HashMap<(usize, Site, u8), V>,
     clane: Option<V>,
+    /// The lane's own guard against a `DispatchX` thread count ([`Lower::partial_active`]).
+    partial_active: Option<V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -2997,19 +2999,24 @@ impl<'a> Lower<'a> {
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
-                // (the paired form: the upper lanes' bits too, lanes 32-63)
+                // (the paired form: the upper lanes' bits too, lanes 32-63; EXEC on entry leaves
+                // out the threads past a DispatchX count, in the paired form each lane by its own)
+                let entry = self.x.st.active.contains(&lo);
+                let own = |l: &mut Self, bit: V| match l.partial_active {
+                    Some(active) if entry => l.s.m.bin(at, Bin::And, bit, active),
+                    _ => bit,
+                };
                 let bits = if self.twin.is_some() {
-                    self.both(|l| l.boolean(m, at)).map(|[a, b]| (a, Some(b)))
+                    self.both(|l| {
+                        let bit = l.boolean(m, at)?;
+                        Ok(own(l, bit))
+                    })
+                    .map(|[a, b]| (a, Some(b)))
                 } else {
-                    self.boolean(m, at).map(|a| (a, None))
+                    self.boolean(m, at).map(|a| (own(self, a), None))
                 };
                 self.balloting.remove(&lo);
-                let (mut bit, upper) = bits?;
-                if let Some(active) = self.partial_active
-                    && self.x.st.active.contains(&lo)
-                {
-                    bit = self.s.m.bin(at, Bin::And, bit, active);
-                }
+                let (bit, upper) = bits?;
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -3736,7 +3743,14 @@ impl<'a> Lower<'a> {
         };
         if self.twin.is_some() {
             let at = at(self)?;
-            let [lo, hi] = self.both(|l| l.boolean(m, at))?;
+            // (each lane without the threads past its DispatchX count)
+            let [lo, hi] = self.both(|l| {
+                let bit = l.boolean(m, at)?;
+                Ok(match l.partial_active {
+                    Some(active) => l.s.m.bin(at, Bin::And, bit, active),
+                    None => bit,
+                })
+            })?;
             let either = self.s.m.bin(at, Bin::Or, lo, hi);
             self.s.flags |= flags::WAVE_OPS;
             return Ok(self.s.op(at, "waveAnyTrue", Attr::NoUnwind, self.s.t.i1, 113, &[either]));
@@ -3776,7 +3790,19 @@ impl<'a> Lower<'a> {
             // says what it says on the console (no set bit for "some lane", no objection to
             // "every lane").
             let c = self.cur;
-            let [lo, hi] = self.both(|l| l.boolean(when, c))?;
+            let [lo, hi] = self.both(|l| {
+                let mine = l.boolean(when, c)?;
+                // (threads past a DispatchX count speak neither for nor against)
+                Ok(match l.partial_active {
+                    Some(active) if any => l.s.m.bin(c, Bin::And, mine, active),
+                    Some(active) => {
+                        let t = l.s.m.bool(true);
+                        let off = l.s.m.bin(c, Bin::Xor, active, t);
+                        l.s.m.bin(c, Bin::Or, mine, off)
+                    }
+                    None => mine,
+                })
+            })?;
             let pair = self.s.m.bin(c, if any { Bin::Or } else { Bin::And }, lo, hi);
             self.s.flags |= flags::WAVE_OPS;
             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
