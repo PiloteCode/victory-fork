@@ -1497,8 +1497,10 @@ fn a_wave_value_used_past_a_lane_branch_takes_the_paired_form_not_an_approximate
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let pairs = super::paired(&c, &native, &p);
     let chosen = super::with_wave_pairs(true, || super::emit(&c, &native, &p, &st, &io, &res));
-    // (without the paired form asked for: an approximate form)
+    // (without the paired form: an approximate form)
+    let off = super::TEST_PAIRS.replace(Some(false));
     let approximate = super::with_wave_pairs(false, || super::emit(&c, &native, &p, &st, &io, &res));
+    super::TEST_PAIRS.set(off);
     lower::TEST_HOST_WAVE.set(was);
     let (pairs, wave) = pairs.expect("the paired form");
     assert_eq!(wave, Some(32));

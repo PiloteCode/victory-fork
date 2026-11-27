@@ -894,8 +894,41 @@ fn widen(
     }
 }
 
-fn wave_pairs_on() -> bool {
-    std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1")
+/// Whether console wave64 compute programs may take the paired form ([`paired`]):
+/// `VICTORY_WAVE_PAIRS=1` on, `=0` off; unset, on where the host's widest wave is under 64
+/// lanes. There a program that needs the console's 64 lanes is otherwise refused by the card
+/// (it asks for `WaveSize(64)`) or runs in an approximate per-half form; a host of 64-lane
+/// waves runs it as it is and never takes this form.
+pub(crate) fn wave_pairs_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PAIRS.get() {
+        return on;
+    }
+    match std::env::var("VICTORY_WAVE_PAIRS").as_deref().map(str::trim) {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => lower::host_max_wave() < 64,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wave_pairs_on`], for its thread only.
+    pub(crate) static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[test]
+fn the_paired_form_is_on_by_default_only_below_64_lanes() {
+    if std::env::var_os("VICTORY_WAVE_PAIRS").is_some() {
+        return;
+    }
+    for (wave, on) in [(32, true), (64, false)] {
+        let was = lower::TEST_HOST_WAVE.replace(Some(wave));
+        let got = wave_pairs_on();
+        lower::TEST_HOST_WAVE.set(was);
+        assert_eq!(got, on, "host waves of {wave}");
+    }
 }
 
 // Paired lanes from PR #854 (PiloteCode), including the per-wave CFG used by 840243e2.
