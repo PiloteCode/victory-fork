@@ -1,8 +1,29 @@
-# PiloteBox
+<h1 align="center">PiloteBox</h1>
 
-**An Xbox Series (Scarlett) compatibility layer for Windows, tuned for NVIDIA cards.**
+<p align="center">
+  <b>An Xbox Series (Scarlett) compatibility layer for Windows, tuned for NVIDIA cards.</b><br>
+  The title's own x64 code runs natively. Its Direct3D 12 and its RDNA2 shaders are translated for your card.
+</p>
 
-[![CI](https://github.com/PiloteCode/PiloteBox/actions/workflows/ci.yml/badge.svg)](https://github.com/PiloteCode/PiloteBox/actions/workflows/ci.yml)
+<p align="center">
+  <a href="https://github.com/PiloteCode/PiloteBox/actions/workflows/ci.yml"><img src="https://github.com/PiloteCode/PiloteBox/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/PiloteCode/PiloteBox/releases/latest"><img src="https://img.shields.io/github/v/release/PiloteCode/PiloteBox?label=release&color=2ea44f" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/Series%20X%20profile-21.5%20fps%20on%20an%20RTX%205090-2ea44f" alt="21.5 frames a second on an RTX 5090">
+  <img src="https://img.shields.io/badge/goal-30%20fps-1f6feb" alt="Goal: 30 frames a second">
+  <img src="https://img.shields.io/badge/shaders-25%2C953%20of%2025%2C953-2ea44f" alt="25,953 of 25,953 shader programs translate">
+  <img src="https://img.shields.io/badge/tests-1%2C100%2B-2ea44f" alt="More than 1,100 tests">
+  <img src="https://img.shields.io/badge/licence-GPL--3.0--or--later-8b949e" alt="GPL-3.0-or-later">
+</p>
+
+<p align="center">
+  <a href="#the-road-to-30-frames-a-second">Progress</a> ·
+  <a href="#where-it-stands-2026-11-27-version-0131">Status</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#benchmarks-measuring-and-reporting">Benchmarks</a> ·
+  <a href="ROADMAP.md">Roadmap</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="CREDITS.md">Credits</a>
+</p>
 
 PiloteBox runs an Xbox Series title's own x64 code natively on a Windows PC. It
 is not an emulator of the processor: the title's code runs as it is. What
@@ -23,6 +44,50 @@ it is.
 > anyone obtain a game: requests for game files, keys, dumps or links are
 > closed without an answer.
 
+## The road to 30 frames a second
+
+One reference scene (a prologue's first playable scene, about 4,850 draws a
+frame), the Series X profile at full quality, one machine: a GeForce RTX 5090
+and a Core i9-14900KF. Each block is one frame a second.
+
+| Version | Date | What moved it | A frame | Frames a second |
+|---|---|---|---|---|
+| 0.8 | 25 Nov | the first layer on an NVIDIA card | 132 ms ¹ | `████████░░░░░░░░░░░░░░░░░░░░░░` 7.6 |
+| 0.12 | 27 Nov | a new layer: list calls written down and translated by threads; our translator for 32-lane cards | 79 to 95 ms ¹ | `████████████░░░░░░░░░░░░░░░░░░` 11.5 |
+| 0.12.2 | 27 Nov | the same, measured as the rows below | 77.9 and 79.6 ms | `█████████████░░░░░░░░░░░░░░░░░` 12.7 |
+| 0.13.0 | 27 Nov | host copies of title buffers and windows of title memory in the card's memory | 53.7 and 53.8 ms | `███████████████████░░░░░░░░░░░` 18.6 |
+| **0.13.1** | 27 Nov | first cuts on the one thread that sets the frame | **46.6 and 48.8 ms** | `█████████████████████░░░░░░░░░` 21.0 |
+| the goal |  | two submissions prepared at once, then the card's indirect executions | 33.3 ms | `██████████████████████████████` 30.0 |
+
+¹ Measured with a capture of one frame in eight for pictures, which costs
+about 9 ms a frame on the thread that sets the frame. The rows without the
+mark are without captures: two runs of four minutes, alternated with the
+version before, the median frame of each run's last minute.
+
+```mermaid
+xychart-beta
+    title "Frames a second, Series X profile, RTX 5090"
+    x-axis ["0.8", "0.12", "0.12.2", "0.13.0", "0.13.1", "goal"]
+    y-axis "frames a second" 0 --> 32
+    bar [7.6, 11.5, 12.7, 18.6, 21.0, 30.0]
+```
+
+**What each step taught us:**
+
+- **0.12 to 0.13.0: it was the bus, not the shaders.** Half of the card's
+  time went to shaders reading the PC's memory across PCIe. With the host
+  copies of title buffers and the windows of title memory in the card's own
+  memory, the card's work by command fell from 53.8 to 26.6 ms a frame.
+- **0.13.0 to 0.13.1: one thread sets the frame.** The card now waits for us.
+  The thread that prepares the title's submissions works 44 ms of a 47 ms
+  frame; its planning went from 10 ms to 3.8 ms.
+- **Next: under 29 ms on that thread**, by preparing two submissions at once.
+  The [roadmap](ROADMAP.md) has the plan and what is measured so far.
+
+Every figure here is measured on our machine and says how. Yours will differ:
+run `pilotebox bench` and add your line to the
+[benchmarks issue](https://github.com/PiloteCode/PiloteBox/issues/12).
+
 ## Where it stands (2026-11-27, version 0.13.1)
 
 Measured on one machine: Windows 11, GeForce RTX 5090 on a PCIe 5.0 x16 link,
@@ -36,7 +101,7 @@ or load a save.
 | Menus, videos, loading screens | yes, 30 fps |
 | In the world | yes |
 | Playable | yes: a new game's opening and the prologue |
-| Series X profile (full quality) | 46.6 and 48.8 ms a frame (21.5 and 20.5 fps) in the prologue's first playable scene, about 4,850 draws a frame; 0.13.0 took 53.7 and 53.8 ms in the same session, and the placement of before 0.13.0 about 85 ms. Not 30 fps yet. Measured as two runs of four minutes each, alternated, the median frame of each run's last minute, the process at high priority, no captures, another program drawing on the card |
+| Series X profile (full quality) | **21.5 and 20.5 frames a second** (46.6 and 48.8 ms a frame) in the reference scene. Not 30 yet. Two runs of four minutes, alternated with 0.13.0 (53.7 and 53.8 ms), the median frame of each run's last minute, the process at high priority, no captures, another program drawing on the card |
 | The card's work (Series X) | 53.8 ms a frame by command with the placement of before, 26.6 ms with every title buffer and the windows on the card's side |
 | Series S profile (lighter, upscaled) | shows a picture since 0.12.2; 60.6 ms a frame (16.5 fps) in 0.13.0, one run in the same scene with captures on (about 9 ms a frame of that run): the same thread of the processor's side bounds it |
 | Ray-traced indirect light (`--rt`) | runs, far too slow to play with today |
@@ -44,10 +109,6 @@ or load a save.
 | Memory | about 37 GB of private memory and 11-19 GB of video memory: 64 GB of RAM recommended |
 | Shaders | 25,953 of the 25,953 programs of the title's shader archive translate and validate for 32-lane GPUs |
 | Tests | more than 1,100 run on every push, the layer's and the translator's on the software adapter; the translator's whole suite also passes on the card (390 tests on an RTX 5090) |
-
-For comparison, 0.12.2 took 86.9 ms a frame in that scene on a quiet machine
-(with a capture of one frame in eight, which costs about 9 ms a frame: runs
-before 0.13.1 all had them).
 
 **What bounds the frame now is the processor's side.** The card's work was
 halved by where title buffers live: with every title buffer's copy and the
