@@ -1533,7 +1533,8 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
+                        // (within its half on the console: `lds::bpermute_halves`)
+                        || n.starts_with("ds_bpermute") && !lds::bpermute_halves()
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1603,7 +1604,9 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+                        } else if n.starts_with("ds_permute")
+                            || n.starts_with("ds_bpermute") && !lds::bpermute_halves()
+                        {
                             "ds_(b)permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
@@ -5632,7 +5635,15 @@ impl<'a> Lower<'a> {
                     };
                     Ok((from, x, guard))
                 })?;
-                let read = [pick(self, x_lo, x_hi, from_lo), pick(self, x_lo, x_hi, from_hi)];
+                // Within each half (`lds::bpermute_halves`): the lower lane reads the lower
+                // values, the upper lane the upper ones, of the host lane its address names.
+                let read = if lds::bpermute_halves() {
+                    let lo = self.s.m.bin(c, Bin::And, from_lo, k31);
+                    let hi = self.s.m.bin(c, Bin::And, from_hi, k31);
+                    [self.read_lane(x_lo, lo), self.read_lane(x_hi, hi)]
+                } else {
+                    [pick(self, x_lo, x_hi, from_lo), pick(self, x_lo, x_hi, from_hi)]
+                };
                 let guards = [g_lo, g_hi];
                 let reg = *reg;
                 self.both(|l| {

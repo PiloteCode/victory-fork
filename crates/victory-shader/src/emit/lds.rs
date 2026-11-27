@@ -4,6 +4,27 @@
 
 use super::{Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, pred, quad};
 
+/// Whether a wave64 `ds_bpermute_b32` permutes within each 32-lane half, as the console's
+/// generation runs it (RDNA 2 ISA, section 10.4.4: lanes 0..31 and 32..63 are permuted apart; an
+/// address names a lane of the reader's own half, and a lane of that half outside EXEC gives 0).
+/// On (`VICTORY_BPERMUTE_HALVES=0`: across the 64 lanes, as before). Part of the translation the
+/// shader cache keys on. With it, a permute is no code across halves: a wave64 program whose
+/// only such code it is runs in host waves of 32 rather than in the paired form.
+pub(super) fn bpermute_halves() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BPERMUTE_HALVES.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BPERMUTE_HALVES").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`bpermute_halves`], for its thread only.
+    pub(crate) static TEST_BPERMUTE_HALVES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 impl Lower<'_> {
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     pub(super) fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -78,16 +99,19 @@ impl Lower<'_> {
         }
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
+            // register of the lane its address names, (address + offset) / 4,
+            // within its own 32-lane half of a wave64 ([`bpermute_halves`]); a
+            // source lane outside EXEC gives 0. (The title's checkerboard
+            // shadow-mask generators read their neighbours' samples with it;
+            // without them every shadowed light was multiplied by an empty
+            // mask.) In host waves of 32 each host wave is one half of the
+            // console wave, so the lane named is always in this host wave.
             // shortcut: a source lane that is not at this instruction on the
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
+            let halves = bpermute_halves();
+            if !halves && self.exchange.as_ref().is_some_and(|e| !e.1) {
                 // a console wave of 64 run as two host waves: the lane named
                 // may be in the other one
                 return Err("a lane permute across two host waves");
@@ -98,8 +122,22 @@ impl Lower<'_> {
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let src = if halves {
+                let k31 = self.s.m.i32(31);
+                let src = self.s.m.bin(c, Bin::And, src, k31);
+                if self.x.native.wave64 {
+                    // this lane's half (0 in a host wave of 32, which holds one half)
+                    let me = self.lane_index();
+                    let half = self.s.m.i32(!31);
+                    let base = self.s.m.bin(c, Bin::And, me, half);
+                    self.s.m.bin(c, Bin::Or, base, src)
+                } else {
+                    src
+                }
+            } else {
+                let last = self.s.m.i32(self.wave() - 1);
+                self.s.m.bin(c, Bin::And, src, last)
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
