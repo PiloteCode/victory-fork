@@ -12,6 +12,54 @@ Every figure says what it was measured on. Unless it says otherwise:
 - the profile is the Series X one;
 - the scene is the prologue's first playable scene, about 4,800 draws a frame.
 
+## Wave 14 (in test, 2026-11-27)
+
+Wave 13 (avatarmanz's layer at `014d52de`) and TaynanGT's tree (the same
+layer at `126acb35`, tuned on an RTX 4090, with its pull requests). Not yet
+measured on our card; the figures below are that tree's, on its machines.
+
+- **Small title buffers on the card** (switches, off): that tree's RTX 4070
+  preset, `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_CARD_BUFFERS_MB=1536`,
+  `VICTORY_CARD_WINDOWS_MB=1024`, with `VICTORY_CARD_RESERVE_BUDGETS=1`
+  (new) so textures leave that room. On an RTX 3080, Series S, its matched
+  pair went from 135 to 68 ms a frame, the card's time from 63 to 2 ms.
+  `VICTORY_TITLE_PREWARM_COUNT=<n>` (new) makes up to 3,584 such buffers
+  before the world.
+- **Structured views off 16 bytes** keep their own copy by default, because
+  our translator reads them as raw bytes. `VICTORY_STRUCTURED_RAW=0` leaves
+  them on their buffer's copy as that tree does: there, the copies' lock held
+  the list threads about 40 % of the time. To be tried for the picture first.
+- **Bookkeeping of host copies**: a bitmask of uncopied pages, lock-free
+  mirrors and an AVX2 `Shadow::take` (Vladimir); refreshes keep the page lock
+  through the copy, so a refresh no longer lays older bytes over newer ones.
+- **Textures**: an AVX2 detiler with a pool for big textures (Vladimir);
+  small pooled textures at 4 KiB outside AMD cards (`VICTORY_POOL_SMALL`),
+  3.2 GB less memory and 3.4 GB less on the card there.
+- **Long sessions**: placed views keyed without the words the title leaves
+  unwritten; that tree's game grew to 52 GB in 70 minutes before, and stayed
+  at 27 GB for 30 minutes after. `VICTORY_OWNERLESS_VIEWS` caps the views no
+  resource releases at a million.
+- **Upscaling and frame generation for the Series S profile** (off; the
+  libraries are the user's): `VICTORY_FSR=quality|balanced|performance` (AMD
+  FSR 3.1.6, `PILOTEBOX_FIDELITYFX_DIR`), `VICTORY_DLSS=...` (NVIDIA DLSS,
+  `nvngx_dlss.dll` in `PILOTEBOX_DLSS_DIR` or the driver's),
+  `VICTORY_FRAMEGEN=1` (AMD frame generation, `PILOTEBOX_FFX_FG_DIR`), and
+  `VICTORY_DLSS_4K=...` for the Series X profile. On that tree's RTX 4090:
+  22.4 frames rendered and 44.9 shown a second with DLSS Quality and frame
+  generation.
+- **Input and window**: DualSense pads (`VICTORY_DUALSENSE`), relative mouse
+  (`VICTORY_GAMEPAD_MOUSE=1`), `VICTORY_MONITOR`, `VICTORY_FULLSCREEN=1` and
+  F11; `VICTORY_KEYS_FILE` for scripted keys.
+- **Fixes**: slots given back only to the heap that took them, a slot flip
+  keeping its record, a failed shader cache write that keeps the
+  translation, pipeline workers that survive a panic, a save version with a
+  blob gone that is still read when it is the only one, only the title's
+  window ending the title on `WM_CLOSE`, pipelines with static samplers made
+  by the driver on NVIDIA (`VICTORY_LIBRARY_STATIC_SAMPLERS=1` takes them
+  from the library again).
+- **Tools**: `VICTORY_LOG_FILE`, `scripts\faultbook.ps1`, the HUD panel with
+  the card's load as Windows counts it.
+
 ## 0.12.2 (2026-11-27)
 
 The upscaler's containers, and the commands for playing.

@@ -59,6 +59,40 @@ in the repositories linked below, at the commits named.
   two presented planes of the Series S profile composed into one image,
   host-memory admission for texture staging, bake uploads done at once. Its
   own journal is kept as `docs/bug-journal.md`.
+- **TaynanGT's tree** ([github.com/TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay)),
+  merged at its commit `4ee1a47b` (wave 14): avatarmanz's layer at `126acb35`
+  tuned on an RTX 4090, with the pull requests it took in. Its translator
+  changes are not in this tree (ours is kept whole); its own documents are in
+  `docs/taynangt`. Taken, by author:
+  - TaynanGT: dynamic slots given back when a flight lands and only to the
+    heap that took them, the slot flip that keeps its record, placed views
+    keyed without the words the title leaves unwritten (and the cap on views
+    no resource releases), small pooled textures at 4 KiB outside AMD cards,
+    the switch for structured views off 16 bytes, synchronized shadow
+    refreshes, readback and write-watch work without allocations, PC FSR
+    3.1.6 and DLSS for the Series S profile and DLSS to 4K, AMD frame
+    generation, full screen and the keys file, saves with a blob gone, XAsync
+    and close fixes, the card reservation for buffer budgets.
+  - Vladimir: the AVX2/SSE2 micro-tile detiler and its pool; the bitmask of
+    uncopied pages, lock-free mirrors and an AVX2 `Shadow::take`.
+  - KGAT1W: title buffers of 64 KiB made before the world.
+  - beloooo (Belobug): the HUD panel's later form with the card's load.
+  - pawcijo: DualSense over USB and Bluetooth. superboynick: relative mouse
+    input. Geckomacabre: the monitor to play on.
+  - meshahid973: warm workers that survive failures, PE relocation bounds.
+  - alex (nullexxx): `VICTORY_LOG_FILE`, vkd3d's empty pipeline library,
+    `VICTORY_SKIP_PIPELINES` in release builds.
+  - Filip Michalski: pipeline workers that survive a panic. loyodea: no
+    worker count of zero. edsuuu and fxceless: pending texture changes kept
+    when queues fill, GPU-written texture views after a CPU upload.
+    Pototoooo: pipeline cache saves retried. Ariel Nathan: shaders
+    translated before a cold launch. welisonzika14-jpg, efsebayern,
+    kripotker, gomeaw, rafaconvaitis, spk, anes66, cwWwWwW and the others
+    named in its history: fixes and tests.
+  - Through it, from trustno1-coder/VIctory-NVIDIA: pipelines with static
+    samplers made by the driver on NVIDIA (readmet3xt-lab), helpers woken
+    by need (readmet3xt-lab), the fault-capture reader, descriptor counts by
+    kind (LucaruluDev), the optional mimalloc build (Dastano).
 
 ## Through those trees
 
