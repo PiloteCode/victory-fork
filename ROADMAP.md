@@ -3,82 +3,74 @@
 **The goal:** the Series X profile, at full quality, at a steady 30 frames a
 second (33.3 ms a frame) on NVIDIA cards.
 
-**Today:** 79-95 ms a frame (10.5-12.5 fps), with the picture right. That is
-an RTX 5090 on a PCIe 5 link with an i9-14900KF, a diagnostics build, in the
-prologue's first playable scene at about 4,800 draws a frame. The card is
-what bounds the frame: it is 75-84 % busy, while preparing a frame takes
-22-26 ms. So the first track is the card's time.
+**Today:**
+- 0.12.2 took 79-95 ms a frame (10.5-12.5 fps), with the picture right.
+- In 0.13.0 the card's work is halved by where title buffers live, the one
+  settle a frame has its cause and its answer, and loops are ruled out.
+- What bounds the frame now is the processor's side. In the first run with
+  the placement on, the thread that prepares submissions worked 64 ms of a
+  67 ms frame.
+- All of this is on an RTX 5090 on a PCIe 5 link with an i9-14900KF, a
+  diagnostics build, in the prologue's first playable scene at about 4,800
+  draws a frame.
+- 0.13.0's frame figures follow its runs.
 
-Each track below says what is measured today and on what. A figure without
-its card and scene is not one. To add yours, run `pilotebox bench` and paste
-its last line.
+Each track below says what is measured and on what. A figure without its card
+and scene is not one. To add yours, run `pilotebox bench` and paste its last
+line.
 
-## 1. The card's time: 57.5 ms a frame
+## 1. The processor's side: the thread that prepares submissions
 
-**Measured today** (timing run, RTX 5090, the scene above):
+**Measured:** in the first run with the placement on, the thread that
+prepares submissions worked 64 ms of a 67 ms frame. That run was on an RTX
+5090, Series X profile, `VICTORY_CARD_SIDE=1`, a diagnostics build.
 
-| Where it goes | Time a frame | How many |
+**The levers.** None of these is measured on our card yet:
+- **The other trees' processor-side work.** It is in this tree since 0.13.0,
+  as defaults or as switches.
+  - TaynanGT's tree: Vladimir's bitmask of uncopied pages, lock-free mirrors
+    and AVX2 `Shadow::take`, and the AVX2 detiler, both on.
+  - avatarmanz's renderer ports 2, 6 and 7 (`VICTORY_PORT_DESCRIPTORS`,
+    `VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL`), off.
+- **The thread counts.** TaynanGT's tree runs an RTX 4090 with
+  `VICTORY_THIN_THREADS=12`, `VICTORY_UNDER_THREADS=8`,
+  `VICTORY_LAND_THREADS=6` and `VICTORY_MAP_THREADS=auto`. Our defaults are
+  tuned on an AMD card (`VICTORY_MAP_THREADS=1`, `VICTORY_CARD_AWAKE=1`).
+- **Where the 64 ms go.** The timeline (`VICTORY_TIMELINE`) and a profile of
+  that thread, step by step.
+
+## 2. The card's time: halved by placement
+
+**Measured** (the card's work by command, RTX 5090, the scene above):
+- 53.8 ms a frame with the default placement;
+- 26.6 ms with every title buffer and the windows of title memory on the
+  card's side (`VICTORY_CARD_SIDE=1`).
+
+| Where it went | Default placement | On the card's side |
 |---|---|---|
-| Compute dispatches | 31.7 ms | 3,812 |
-| Indirect executions | 20.8 ms | 4,471 |
-| The rest | about 5 ms | |
+| Dispatches | 29.9 ms | 7.5 ms |
+| The two shadow-mask programs | 5.6 and 2.1 ms | 0.2 and 0.3 ms |
 
-**The levers:**
-- Find the passes that cost the most, frame by frame:
-  `pilotebox replay --timing detailed` on a recorded frame, which needs a
-  diagnostics build (docs/replay.md).
-- Measure the compute programs' translated forms against each other, turn by
-  turn, with replay's `--shaders` and `--shaders-b`. This applies to wave64
-  programs on 32-lane hosts (paired, split, local) and to legacy multiplies.
-- Find the indirect executions that run for nothing: empty records, and
-  passes whose inputs are missing while the ray-traced light is off.
-- Find the barriers between our own passes that the order does not need. Our
-  older layer had a pass for this; it is in the history and is not ported
-  yet.
+Loops are answered: of 746 programs drawn with counted loops, one pixel
+program reaches its iteration limit, and no compute program does.
 
-## 2. Small buffers in the card's memory, and their sync cost
+**Next:**
+- Make the placement the default once the runs say yes.
+- Measure the translator's forms of wave64 programs against each other with
+  replay's `--shaders` and `--shaders-b`. A wave64 `ds_bpermute` permutes
+  within each 32-lane half on the console, which would let more programs run
+  as halves (TaynanGT's tree found it).
 
-The console's CPU and GPU share memory; here they do not. So everything one
-writes and the other reads must be noticed and moved.
+## 3. The one settle a frame: its cause found
 
-**Measured today:** in the first intervals of the world, the frame lines show:
-- 25-30 ms a frame of title memory copies;
-- 23-26 ms a frame of copy-back (RTX 5090, diagnostics build, the scene
-  above).
+The cause: a 240-byte buffer copy at its place in a list, which a draw of the
+same list reads as constants. The fill of upload memory for those constants
+waited for every flight. `VICTORY_FILL_FORWARD` (on) makes such a fill read
+the copy's source instead, on the card with the other steps. The frame line
+says why a fill was left to wait.
 
-About 11 ms of the card's 57.5 ms go to nine small programs whose atomics
-and stores land on title buffers kept in the PC's memory, across the bus
-(traced through a recorded frame).
-
-**The levers:**
-- Moving every small copy to the card (`VICTORY_CARD_BUFFERS_MIN_KB=64`) is
-  measured: the wait for the card at the settle fell from 36 to 22 ms a
-  frame, but 49,000 ranges a frame went up instead of 385 and the frame did
-  not get shorter.
-- A narrow rule instead: the translator now lists the views a program uses
-  with atomics and the views it writes; only those buffers go to the card's
-  memory. A first, coarser form of the rule did not move the frame; the
-  form that uses the lists is being measured.
-- Bring back only the dwords that changed.
-
-## 3. The one settle a frame
-
-Once a frame, the layer waits until what the card wrote is back in title
-memory before the title reads it.
-
-**Measured today:** the thread that prepares submissions works 83 ms a
-frame, and 38 ms of that is waiting for the card at this one settle, whose
-reason is a fill of upload memory that reads title memory (RTX 5090, a quiet
-machine, diagnostics build). The layer's own switch for it
-(`VICTORY_PLACED_ORDER=1`) did not remove it in our run.
-
-**The levers.** Our older layer tried three, behind switches; they are in the
-history (0.8 to 0.10) and not yet ported to this layer:
-- wait only for the producers of the pages the title reads;
-- settle a page window at its first touch;
-- cut long submissions while waits happen.
-
-None of them was measured as a default on NVIDIA.
+**Next:** confirm on the runs that the settle is gone in the world, not only
+in the prologue's first scene.
 
 ## 4. The Series S profile
 

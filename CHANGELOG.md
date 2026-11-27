@@ -12,55 +12,132 @@ Every figure says what it was measured on. Unless it says otherwise:
 - the profile is the Series X one;
 - the scene is the prologue's first playable scene, about 4,800 draws a frame.
 
-## Wave 14 (in test, 2026-11-27)
+## 0.13.0 (2026-11-27)
 
-Wave 13 (avatarmanz's layer at `014d52de`) and TaynanGT's tree (the same
-layer at `126acb35`, tuned on an RTX 4090, with its pull requests). Not yet
-measured on our card; the figures below are that tree's, on its machines.
+Waves 13, 14 and 15: avatarmanz's newer layer, TaynanGT's tree, title
+buffers on the card's side, and the cause of the one settle a frame. The
+version also takes 13 and 14, which were working waves. Our translator is
+unchanged apart from its new lists of written and atomic views: all 25,953
+programs still translate and validate.
 
-- **Small title buffers on the card** (switches, off): that tree's RTX 4070
-  preset, `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_CARD_BUFFERS_MB=1536`,
-  `VICTORY_CARD_WINDOWS_MB=1024`, with `VICTORY_CARD_RESERVE_BUDGETS=1`
-  (new) so textures leave that room. On an RTX 3080, Series S, its matched
-  pair went from 135 to 68 ms a frame, the card's time from 63 to 2 ms.
-  `VICTORY_TITLE_PREWARM_COUNT=<n>` (new) makes up to 3,584 such buffers
-  before the world.
-- **Structured views off 16 bytes** stay on their buffer's copy, as in every
-  wave up to 12 (`VICTORY_STRUCTURED_RAW=1` gives them a copy of their own).
-  The rule came with wave 13's layer; on our card it sent 2,270 views a frame
-  to copies of their own and made 400 new ones a frame under one lock: the
-  frame took 171 ms where wave 12 took 87 ms. That tree measured the same on
-  an RTX 4090 (21 to 6 fps) and has the same default.
-- **Bookkeeping of host copies**: a bitmask of uncopied pages, lock-free
-  mirrors and an AVX2 `Shadow::take` (Vladimir); refreshes keep the page lock
-  through the copy, so a refresh no longer lays older bytes over newer ones.
-- **Textures**: an AVX2 detiler with a pool for big textures (Vladimir);
-  small pooled textures at 4 KiB outside AMD cards (`VICTORY_POOL_SMALL`),
-  3.2 GB less memory and 3.4 GB less on the card there.
-- **Long sessions**: placed views keyed without the words the title leaves
-  unwritten; that tree's game grew to 52 GB in 70 minutes before, and stayed
-  at 27 GB for 30 minutes after. `VICTORY_OWNERLESS_VIEWS` caps the views no
+### On our card
+
+- **The card's work, halved by placement.** These are the commands' times on
+  the card, measured with `VICTORY_CARD_SIDE=1` (sync12, off by default):
+  every title buffer's copy and the windows of title memory sit on the
+  card's side, as far as the card's budget allows.
+  - The card's work went from 53.8 ms a frame with the default placement to
+    26.6 ms.
+  - Dispatches went from 29.9 to 7.5 ms.
+  - The two shadow-mask programs went from 5.6 and 2.1 ms to 0.2 and 0.3 ms.
+  - The frame's own figures with it come after the runs.
+- **Loops are not the card's time.** Of the 746 programs drawn with counted
+  loops, one pixel program reaches its iteration limit. No compute program
+  does.
+- **The one settle a frame, found** (sync12). A 240-byte buffer copy sits at
+  its place in a list, and a draw of the same list reads it as constants.
+  The fill of upload memory for those constants then waited for every
+  flight.
+  - `VICTORY_FILL_FORWARD` (on) makes such a fill read the copy's source
+    instead. It does so on the card, with the other steps, when nothing of
+    the submission writes those bytes in between.
+  - The frame line says why a fill was left to wait.
+- **Structured views off 16 bytes stay on their buffer's copy**, as in every
+  wave up to 12. `VICTORY_STRUCTURED_RAW=1` brings back the rule that came
+  with wave 13's layer (gomeaw's, for hosts without descriptor twins).
+  - With the rule, 2,270 views a frame went through one lock in
+    `shadow::exact`, which made 400 new copies a frame.
+  - List translation took 1,249 ms a frame instead of 156, and the frame
+    171 ms where wave 12 took 87 ms.
+  - Without it: about 200 ms of translation, 1.7 views a frame asked, and
+    the picture is right.
+  - TaynanGT's tree found the same on an RTX 4090, and has the same default.
+
+### Wave 15: the placement and the settle (sync12, ours)
+
+- `VICTORY_CARD_SIDE=1`, off: placement on the card's side, as described
+  above. Its room is kept by the texture queue, and each buffer's own switch
+  still wins.
+- The finer switches it is made of, all off:
+  - `VICTORY_CARD_WRITTEN_KB` and `VICTORY_CARD_ATOMIC`: buffers that shaders
+    store to or do atomics on;
+  - `VICTORY_CARD_UNORDERED_KB`: buffers the title made for unordered
+    access;
+  - `VICTORY_CARD_JOIN_GAP`: a copy's ranges joined over gaps the card
+    already holds.
+- The translator names the table places and root views a program writes or
+  does atomics through (`atomic_views`, `written_views`, `picked_views`;
+  gpu-shaders3, ours). A bind then asks for that buffer's copy as such.
+- The frame line says what goes up to copies in the card's memory, and which
+  steps a copy at its place keeps off the card.
+
+### Wave 14: TaynanGT's tree
+
+- **Bookkeeping of host copies** (Vladimir): a bitmask of uncopied pages,
+  lock-free mirrors and an AVX2 `Shadow::take`. Refreshes now keep the page
+  lock through the copy (TaynanGT), so a refresh no longer lays older bytes
+  over newer ones.
+- **Textures:**
+  - an AVX2 detiler with a pool for big textures (Vladimir);
+  - small pooled textures at 4 KiB outside AMD cards (`VICTORY_POOL_SMALL`);
+  - allocation retries, and pending texture changes kept when queues fill
+    (edsuuu);
+  - GPU-written texture views after a CPU upload (fxceless).
+- **Long sessions** (TaynanGT): placed views are keyed without the words the
+  title leaves unwritten. `VICTORY_OWNERLESS_VIEWS` caps the views that no
   resource releases at a million.
-- **Upscaling and frame generation for the Series S profile** (off; the
-  libraries are the user's): `VICTORY_FSR=quality|balanced|performance` (AMD
-  FSR 3.1.6, `PILOTEBOX_FIDELITYFX_DIR`), `VICTORY_DLSS=...` (NVIDIA DLSS,
-  `nvngx_dlss.dll` in `PILOTEBOX_DLSS_DIR` or the driver's),
-  `VICTORY_FRAMEGEN=1` (AMD frame generation, `PILOTEBOX_FFX_FG_DIR`), and
-  `VICTORY_DLSS_4K=...` for the Series X profile. On that tree's RTX 4090:
-  22.4 frames rendered and 44.9 shown a second with DLSS Quality and frame
-  generation.
-- **Input and window**: DualSense pads (`VICTORY_DUALSENSE`), relative mouse
-  (`VICTORY_GAMEPAD_MOUSE=1`), `VICTORY_MONITOR`, `VICTORY_FULLSCREEN=1` and
-  F11; `VICTORY_KEYS_FILE` for scripted keys.
-- **Fixes**: slots given back only to the heap that took them, a slot flip
-  keeping its record, a failed shader cache write that keeps the
-  translation, pipeline workers that survive a panic, a save version with a
-  blob gone that is still read when it is the only one, only the title's
-  window ending the title on `WM_CLOSE`, pipelines with static samplers made
-  by the driver on NVIDIA (`VICTORY_LIBRARY_STATIC_SAMPLERS=1` takes them
-  from the library again).
-- **Tools**: `VICTORY_LOG_FILE`, `scripts\faultbook.ps1`, the HUD panel with
-  the card's load as Windows counts it.
+- **Card budgets for small title buffers**, switches that are off:
+  - `VICTORY_CARD_BUFFERS_MIN_KB`, `VICTORY_CARD_BUFFERS_MB` and
+    `VICTORY_CARD_WINDOWS_MB`, with `VICTORY_CARD_RESERVE_BUDGETS=1` (zzzz,
+    TaynanGT) so that textures leave that room;
+  - `VICTORY_TITLE_PREWARM_COUNT` (KGAT1W).
+- **Upscaling and frame generation for the Series S profile** (TaynanGT; off,
+  and the libraries are the user's):
+  - `VICTORY_FSR=quality|balanced|performance`: AMD FSR 3.1.6, with
+    `PILOTEBOX_FIDELITYFX_DIR`;
+  - `VICTORY_DLSS=...`: NVIDIA DLSS, with `nvngx_dlss.dll` in
+    `PILOTEBOX_DLSS_DIR` or the driver's own copy;
+  - `VICTORY_FRAMEGEN=1`: AMD frame generation, with `PILOTEBOX_FFX_FG_DIR`;
+  - `VICTORY_DLSS_4K=...` for the Series X profile.
+- **Input and window:**
+  - DualSense pads (pawcijo, `VICTORY_DUALSENSE`);
+  - relative mouse (superboynick, `VICTORY_GAMEPAD_MOUSE=1`);
+  - the monitor to play on (Geckomacabre, `VICTORY_MONITOR`);
+  - `VICTORY_FULLSCREEN=1` and F11, and `VICTORY_KEYS_FILE` (TaynanGT).
+- **Fixes:**
+  - slots given back only to the heap that took them (cwWwWwW, TaynanGT);
+  - a slot flip keeps its record;
+  - a failed shader cache write keeps the translation;
+  - pipeline workers survive a panic (Filip Michalski);
+  - a save version with a blob gone is still read when it is the only one;
+  - only the title's window ends the title on `WM_CLOSE`;
+  - pipelines with static samplers are made by the driver on NVIDIA
+    (readmet3xt-lab). `VICTORY_LIBRARY_STATIC_SAMPLERS=1` takes them from
+    the library again.
+- **Tools:** `VICTORY_LOG_FILE` (alex), `scripts\faultbook.ps1`, and the HUD
+  panel with the card's load as Windows counts it (beloooo, TaynanGT).
+- Their documents are kept in `docs/taynangt`.
+
+### Wave 13: avatarmanz's layer at `014d52de`
+
+- **Title textures uploaded in a submission's prelude** (beloooo), decided at
+  submission after the refresh. This puts textures in frame order and stops
+  the flicker.
+- **The renderer ports** (avatarmanz), all off:
+  - 1 (`VICTORY_PORT_CONSTANTS`), 2 (`VICTORY_PORT_DESCRIPTORS`), 6
+    (`VICTORY_PORT_GUARD`), 7 (`VICTORY_PORT_JOURNAL`) and RT
+    (`VICTORY_PORT_RT`);
+  - port 5 (`VICTORY_PORT_CBV`) needs its own translator and does nothing
+    with ours.
+- **PC FidelityFX FSR 4.1.2 to 4K** (`VICTORY_FSR_4K`, beloooo after DexNom),
+  and the RX 9070 XT work (beloooo).
+- **33 community pull requests** that layer carried (see CREDITS.md).
+- **Ours:**
+  - textures at their full size by default (`VICTORY_TEXTURE_MAX=0`);
+  - the texel noise of the own-bytes rule fixed;
+  - the parallel compare's first cut (after kelvaroq's patch 0009; merged
+    upstream as fxceless `81d54b06`);
+  - tests of the indirect budget.
 
 ## 0.12.2 (2026-11-27)
 

@@ -23,7 +23,7 @@ it is.
 > anyone obtain a game: requests for game files, keys, dumps or links are
 > closed without an answer.
 
-## Where it stands (2026-11-27, version 0.12.2)
+## Where it stands (2026-11-27, version 0.13.0)
 
 Measured on one machine: Windows 11, GeForce RTX 5090 on a PCIe 5.0 x16 link,
 Core i9-14900KF, 128 GB of RAM, a 2560x1440 display, a diagnostics build, one
@@ -36,7 +36,8 @@ or load a save.
 | Menus, videos, loading screens | yes, 30 fps |
 | In the world | yes |
 | Playable | yes: a new game's opening and the prologue |
-| Series X profile (full quality) | 79-95 ms a frame (10.5-12.5 fps) in the prologue's first playable scenes, about 4,800 draws a frame; the picture is right |
+| Series X profile (full quality) | 79-95 ms a frame (10.5-12.5 fps) with 0.12.2 in the prologue's first playable scenes, about 4,800 draws a frame; the picture is right. 0.13.0's figures follow its runs |
+| The card's work (Series X) | 53.8 ms a frame by command with the default placement, 26.6 ms with every title buffer and the windows on the card's side (`VICTORY_CARD_SIDE=1`) |
 | Series S profile (lighter, upscaled) | shows a picture since 0.12.2; its frame time is being measured again (44 ms a frame before the upscaler's passes ran) |
 | Ray-traced indirect light (`--rt`) | runs, far too slow to play with today |
 | Stability | no crash and no device loss in eleven automated runs of this version; long sessions are not measured yet |
@@ -46,10 +47,16 @@ or load a save.
 The same scenes took 130-168 ms a frame with the layer this tree replaced two
 days earlier.
 
-**What bounds the frame today is the card.** A timing run of the Series X
-profile counts 57.5 ms of card work a frame: 31.7 ms in 3,812 compute
-dispatches and 20.8 ms in 4,471 indirect executions. Preparing a frame on the
-processor takes 22-26 ms. The [roadmap](#roadmap) says what we do about it.
+**What bounds the frame now is the processor's side.** The card's work was
+halved by where title buffers live: with every title buffer's copy and the
+windows of title memory on the card's side, the card's work by command fell
+from 53.8 to 26.6 ms a frame (dispatches 29.9 to 7.5 ms). The one settle a
+frame has its cause (a 240-byte copy at its place in a list, read as constants
+by a draw of the same list) and its answer (`VICTORY_FILL_FORWARD`, on).
+Loops are not the card's time: of 746 programs drawn with counted loops, one
+pixel program reaches its limit. In the first run with the placement on, the
+thread that prepares submissions worked 64 ms of a 67 ms frame. The
+[roadmap](#roadmap) says what we do about it.
 
 Known to be wrong:
 
@@ -131,6 +138,9 @@ the goal, with what they are by default:
 
 | Switch | Default | What it does |
 |---|---|---|
+| `VICTORY_CARD_SIDE=1` | off | Every title buffer's copy and the windows of title memory on the card's side, up to totals by the card's budget, their room kept by the texture queue; each buffer's own switch still wins. The card's work by command: 53.8 ms a frame without it, 26.6 ms with it. |
+| `VICTORY_FILL_FORWARD` | on | A fill of upload memory that reads only what a copy at its place in the same list just wrote reads the copy's source instead, on the card (the cause of the one settle a frame). `=0`: it waits for the flights, as before. |
+| `VICTORY_CARD_WRITTEN_KB`, `VICTORY_CARD_ATOMIC=1`, `VICTORY_CARD_UNORDERED_KB` | off | Narrower placements: buffers that shaders store to or do atomics on (from the translator's lists of written and atomic views), buffers the title made for unordered access. |
 | `VICTORY_PORT_RT=1` | off | When a fill of upload memory reads bytes that a copy at its place declared written, the card brings them, or the fill takes them from the copy's source, instead of the submission waiting for every flight (the one settle a frame). Its frame line counts the cases even when off. |
 | `VICTORY_PORT_CONSTANTS=1` | off | The title's 174 MB constants heap is read by the card where the title writes it: no uploads and no fills of it. With it, indirect executions whose arguments sit there are prepared alone right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on; 2-5 ms). |
 | `VICTORY_FILL_TITLE=2` | off | Small fills of upload memory go on without waiting for flights where no shader wrote the page lately. |
@@ -198,26 +208,31 @@ tracker.
 
 ## Roadmap
 
-The goal is the Series X profile at a steady 30 fps on NVIDIA cards: the card's
-work has to come down from 57.5 ms a frame to under 30, and the processor's
-side has to stay under 33.
+The goal is the Series X profile at a steady 30 fps on NVIDIA cards: the
+card's work and the processor's side each under 33 ms a frame.
 
-1. **Small buffers where shaders write them.** About 11 ms of the card's
-   time go to nine small programs whose atomics and stores land on title
-   buffers kept in the PC's memory, across the bus. A narrow rule (buffers
-   used with atomics, and small written buffers, live in the card's memory)
-   is being built; moving every small buffer costs the processor as much as
-   it saves the card.
-2. **The console's 64-lane programs on 32 lanes.** Their forms cost about
-   15 ms a frame together; the entry barrier and the per-lane guards are the
-   levers.
-3. **One settle a frame.** The preparing thread waits about 36 ms a frame for
-   the card at one point, for a fill of upload memory that reads title memory.
-   Renderer port RT (`VICTORY_PORT_RT=1`) is the first thing to measure there.
-4. **The newest layer underneath** is merged: its renderer ports are
-   switches, off until measured on NVIDIA (see the switches above).
-5. **The Series S profile** as the fast mode meanwhile.
-6. **The ray-traced light** once the rest fits in a frame.
+Done in 0.13.0:
+- **The card's work, halved by placement.** It went from 53.8 to 26.6 ms a
+  frame with every title buffer and the windows of title memory on the
+  card's side (`VICTORY_CARD_SIDE=1`).
+- **The one settle a frame: its cause found.** A 240-byte copy at its place
+  in a list is read as constants by a draw of the same list.
+  `VICTORY_FILL_FORWARD` (on) answers it.
+- **Loops answered.** Of the 746 programs drawn with counted loops, one pixel
+  program reaches its limit.
+
+Next:
+1. **The processor's side**, now the bound. In the first run with the
+   placement on, the thread that prepares submissions worked 64 ms of a 67 ms
+   frame.
+2. **The placement as the default**, once the runs say yes.
+3. **The console's 64-lane programs on 32 lanes**: their forms measured
+   against each other, and a wave64 `ds_bpermute` within each half.
+4. **The Series S profile** as the fast mode meanwhile, with PC upscaling and
+   frame generation from TaynanGT's tree (the libraries are the user's).
+5. **The ray-traced light** once the rest fits in a frame.
+
+[ROADMAP.md](ROADMAP.md) has each track with its figures.
 
 ## Troubleshooting
 
