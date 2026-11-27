@@ -924,10 +924,12 @@ fn card_room_for(size: u64, any_size: bool) -> Option<ID3D12Resource> {
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    // (With `placement`: where the card's memory cannot be written through
-    // the bus.)
+    // (With `placement`: its total, unless the bus way was asked for by its
+    // own switch.)
     *MOST.get_or_init(|| {
-        placement::mb_or("VICTORY_CARD_WINDOWS_MB", |set| if windows_through_bus() { 0 } else { set.windows_most })
+        placement::mb_or("VICTORY_CARD_WINDOWS_MB", |set| {
+            if window_mapped_most() > 0 && windows_through_bus() { 0 } else { set.windows_most }
+        })
             .unwrap_or(0)
     })
 }
@@ -979,11 +981,13 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// [`window_room_for`], which this comes before.
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    // (With `placement`: where the card's memory can be written through the
-    // bus.)
+    // (`placement` does not choose this way: measured dearer for the card
+    // than two sides by more than it spares the processor.)
     *MOST.get_or_init(|| {
-        placement::mb_or("VICTORY_WINDOWS_BAR_MB", |set| if windows_through_bus() { set.windows_most } else { 0 })
-            .unwrap_or(0)
+        std::env::var("VICTORY_WINDOWS_BAR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |mb| mb << 20)
     })
 }
 

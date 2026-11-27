@@ -1,5 +1,6 @@
-//! What shaders touch lives on the card's side (`VICTORY_CARD_SIDE=1`; off,
-//! the default: the placement of before).
+//! What shaders touch lives on the card's side: the default on NVIDIA cards
+//! (`VICTORY_CARD_SIDE=0`: the placement of before), and `VICTORY_CARD_SIDE=1`
+//! elsewhere, where it is not measured yet.
 //!
 //! A host copy in the PC's memory is read and written by shaders across the
 //! bus. In a timing pair on an RTX 5090 (runs integ-t3-base and
@@ -17,25 +18,29 @@
 //! - every title buffer's copy on the card (a copy is 64 KiB at least, so a
 //!   least of 64 KiB takes them all), up to a total by budget;
 //! - windows of title memory outside buffers on the card, up to a total by
-//!   budget: written by the CPU through the bus into card memory it maps
-//!   (`VICTORY_WINDOWS_BAR_MB`'s way) where the card and the system allow it
-//!   (`D3D12_FEATURE_DATA_D3D12_OPTIONS16::GPUUploadHeapSupported`, which
-//!   needs resizable BAR), else with two sides (`VICTORY_CARD_WINDOWS_MB`'s
-//!   way);
+//!   budget, with two sides (`VICTORY_CARD_WINDOWS_MB`'s way). The other way,
+//!   written by the CPU through the bus into card memory it maps
+//!   (`VICTORY_WINDOWS_BAR_MB`, which needs resizable BAR), is taken only by
+//!   its own switch: see "Measured" below;
 //! - the texture queue keeps the room of both totals, less what they hold
 //!   already (`card_room_kept`), so that the copies made after the textures
 //!   came still find it.
 //!
-//! Why the bus for windows where it can: the CPU writes the window once,
+//! The two ways for windows. Through the bus the CPU writes the window once,
 //! where the card reads it, and nothing more (no CPU side, no list of what
 //! changed, no copy before each submission, no hash). Two sides cost a second
 //! copy of every byte the title changes (into the submission's own memory)
 //! and a copy command on the card, and give in return what the bus does not:
 //! a submission in the air keeps the bytes it was prepared with, and a shader
-//! write to a window is compared and brought back on the card. Neither is
-//! asked for by windows today (the title does not write what the card still
-//! reads, and no shader is declared to write a window), and the bus way is
-//! what windows in the PC's memory already were: one side, written in place.
+//! write to a window is compared and brought back on the card.
+//!
+//! Measured (RTX 5090, the same build and scene, the process at high
+//! priority; runs integ-w15-def, -side, -side2): 89.2 ms a frame with the
+//! placement of before; 75.5 ms with the windows through the bus (the thread
+//! that prepares submissions worked 54.4 ms, the card had work queued for 51
+//! ms); 68.0 ms with two-sided windows (that thread 63.9 ms, the card 34 ms).
+//! The bus is cheaper for the processor and dearer for the card by more, so
+//! two sides are the placement's choice.
 //!
 //! Every switch of its own still wins: `VICTORY_CARD_BUFFERS_MIN_KB`,
 //! `_MIN_MB`, `VICTORY_CARD_BUFFERS_MB`, `VICTORY_WINDOWS_BAR_MB`,
@@ -43,10 +48,17 @@
 
 use std::sync::OnceLock;
 
-/// Whether the placement is by [`set_for`] (`VICTORY_CARD_SIDE=1`).
+/// Whether the placement is by [`set_for`]: `VICTORY_CARD_SIDE=1` or `=0`
+/// says so; unsaid, it is on NVIDIA cards, where it is measured (asked once
+/// the host is there: [`set`]).
 pub(crate) fn on() -> bool {
+    const NVIDIA: u32 = 0x10DE;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SIDE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_CARD_SIDE").ok().as_deref().map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => crate::host::host().is_some_and(|h| h.adapter_vendor_id() == Some(NVIDIA)),
+    })
 }
 
 /// The sizes of the placement, in bytes.
@@ -112,10 +124,10 @@ pub(crate) fn set() -> Option<Set> {
                 buffers_least_kb = set.buffers_least >> 10,
                 buffers_most_mb = set.buffers_most >> 20,
                 windows_most_mb = set.windows_most >> 20,
-                windows_through_the_bus = host.mapped_card_memory(),
-                "what shaders touch lives on the card's side (VICTORY_CARD_SIDE=1); a switch of its own overrides each size"
+                the_bus_could_carry_windows = host.mapped_card_memory(),
+                "what shaders touch lives on the card's side (VICTORY_CARD_SIDE=0: the placement of before); a switch of its own overrides each size"
             ),
-            None => tracing::info!("VICTORY_CARD_SIDE=1, but the card's budget is not known: the placement stays as it was"),
+            None => tracing::info!("the card's budget is not known: the placement stays as it was (VICTORY_CARD_SIDE)"),
         }
         set
     })
