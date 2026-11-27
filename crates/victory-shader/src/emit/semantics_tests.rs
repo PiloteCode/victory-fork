@@ -2491,7 +2491,7 @@ fn sixteen_bit_probes() -> Vec<Probe> {
 }
 
 #[test]
-#[ignore = "ours: 16-bit results round as the host's conversion does (toward zero on NVIDIA and WARP) unless VICTORY_F16_NEAREST=1; v_pk_fmac_f16 is not lowered (the title runs none)"]
+#[ignore = "ours: 16-bit results round as the host's conversion does (toward zero on NVIDIA and WARP) unless VICTORY_F16_NEAREST=1 (with it, this passes)"]
 fn sixteen_bit_floats_match_the_hardware() {
     assert_clean(check(&passing(sixteen_bit_probes())));
 }
@@ -2625,7 +2625,6 @@ fn mixed_precision_matches_the_hardware() {
 /// accumulator (RDNA2 ISA), with `op_sel_hi` as assemblers write it (all
 /// set) and clear.
 #[test]
-#[ignore = "ours: v_dot4_i32_i8 and v_dot4c_i32_i8 are not lowered (only the FidelityFX upscaler DLL's programs would run them, whose ACCC containers ours does not read)"]
 fn byte_dot_products_match_the_hardware() {
     let bytes = [
         0u32,
@@ -2972,7 +2971,6 @@ fn scalar_probes() -> Vec<Probe> {
 }
 
 #[test]
-#[ignore = "ours: src_scc as a vector operand is not lowered (the title has none)"]
 fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
@@ -3074,7 +3072,7 @@ fn min_max_and_selects_take_denormals_on_the_bits() {
 /// 16-bit interpolation). Was a defect: DXIL `legacyF32ToF16` rounds toward
 /// zero on both adapters here (65504 where the hardware gives infinity).
 #[test]
-#[ignore = "ours: 16-bit results round as the host's conversion does (toward zero on NVIDIA and WARP) unless VICTORY_F16_NEAREST=1; v_pk_fmac_f16 is not lowered (the title runs none)"]
+#[ignore = "ours: 16-bit results round as the host's conversion does (toward zero on NVIDIA and WARP) unless VICTORY_F16_NEAREST=1 (with it, this passes)"]
 fn f16_results_round_to_nearest_even() {
     let mut p = conversion_probes();
     p.extend(sixteen_bit_probes());
@@ -3088,7 +3086,7 @@ fn f16_results_round_to_nearest_even() {
 /// extra precision on one adapter and not the other (`1.0 * 1.5 + 0x8001`
 /// in `v_pk_fma_f16` gave 0x3e00 on WARP, 0x3dff on the RX 6700 XT).
 #[test]
-#[ignore = "ours: 16-bit results round as the host's conversion does (toward zero on NVIDIA and WARP) unless VICTORY_F16_NEAREST=1; v_pk_fmac_f16 is not lowered (the title runs none)"]
+#[ignore = "ours: 16-bit results round as the host's conversion does (toward zero on NVIDIA and WARP) unless VICTORY_F16_NEAREST=1 (with it, this passes)"]
 fn f16_arithmetic_rounds_once() {
     let mut p = sixteen_bit_probes();
     p.extend(mix_probes());

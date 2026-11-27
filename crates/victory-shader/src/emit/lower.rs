@@ -94,6 +94,12 @@ mod descriptors;
 #[path = "image.rs"]
 mod image;
 
+/// Forms only the FidelityFX upscaler's compiler makes (byte dot products, `src_scc`, counter
+/// textures, one lane of what a whole-wave section leaves), a child module so it shares the
+/// emitter's state.
+#[path = "upscaler.rs"]
+mod upscaler;
+
 /// Buffer instructions (loads, stores, atomics, typed loads), a child module so it shares the
 /// emitter's state.
 #[path = "buffer.rs"]
@@ -3870,6 +3876,7 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.source(v)
             }
+            Operand::Const(upscaler::SRC_SCC) => self.src_scc(inst),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -5491,6 +5498,13 @@ impl<'a> Lower<'a> {
         if once {
             self.inst(b, i)?;
             self.mirror(inst);
+            return Ok(());
+        }
+        // One lane of what a whole-wave section left (`upscaler`).
+        if let Some((w, shape)) = self.section_read(inst, b, i) {
+            if let Err(why) = self.section_read_value(w, shape) {
+                self.put_lanes(w, Val::Missing(why), Val::Missing(why));
+            }
             return Ok(());
         }
         let cross = match name {
