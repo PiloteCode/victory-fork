@@ -22,42 +22,67 @@ programs still translate and validate.
 
 ### On our card
 
-- **The card's work, halved by placement.** These are the commands' times on
-  the card, measured with `VICTORY_CARD_SIDE=1` (sync12, off by default):
-  every title buffer's copy and the windows of title memory sit on the
-  card's side, as far as the card's budget allows.
-  - The card's work went from 53.8 ms a frame with the default placement to
-    26.6 ms.
+**14.7 frames a second in that scene, not 30.** One run of four minutes per
+row, measured while other builds ran, with the process at high priority.
+Diagnostics build of wave 15, about 4,850 draws a frame:
+
+| Placement | A frame | The thread that prepares submissions | The card |
+|---|---|---|---|
+| As before | 89.2 ms (11.2 fps) | worked 80.6 ms | work queued about 89 % of the frame |
+| Title buffers on the card, windows through the bus | 75.5 ms (13.2 fps) | worked 54.4 ms | work queued 51 ms |
+| Title buffers on the card, two-sided windows (the new default on NVIDIA) | 68.0 ms (14.7 fps) | worked 63.9 ms | work queued 34 ms |
+
+For reference:
+- 0.12.2 (wave 12) took 86.9 ms a frame on a quiet machine.
+- Wave 13's layer took 171 ms before its structured-view rule went behind a
+  switch.
+
+**The card is no longer the bound: it waits for us 23 ms a frame. The
+processor is.**
+- The title's own submitting thread spends 56 ms of the 68 inside its
+  submissions.
+- The thread that prepares them works 64 ms.
+
+- **The card's work, halved by placement** (sync12).
+  - The commands' times on the card went from 53.8 ms a frame with the
+    placement of before to 26.6 ms with every title buffer and the windows of
+    title memory on the card's side.
   - Dispatches went from 29.9 to 7.5 ms.
   - The two shadow-mask programs went from 5.6 and 2.1 ms to 0.2 and 0.3 ms.
-  - The frame's own figures with it come after the runs.
+  - `VICTORY_CARD_SIDE` is now on by default on NVIDIA cards (`=0`: the
+    placement of before). Elsewhere it is off unless `=1`: it is not measured
+    there.
+  - Its sizes follow the card's budget (crates/victory-gpu/src/shadow/
+    placement.rs). The 8 GB and 12 GB rows are guesses still to be measured.
+  - The windows are two-sided copies. `VICTORY_WINDOWS_BAR_MB` (windows
+    through the bus) stays a switch of its own.
 - **Loops are not the card's time.** Of the 746 programs drawn with counted
   loops, one pixel program reaches its iteration limit. No compute program
   does.
 - **The one settle a frame, found** (sync12). A 240-byte buffer copy sits at
-  its place in a list, and a draw of the same list reads it as constants.
-  The fill of upload memory for those constants then waited for every
-  flight.
+  its place in a list, and a draw of the same list reads it as constants. The
+  fill of upload memory for those constants waited for every flight.
   - `VICTORY_FILL_FORWARD` (on) makes such a fill read the copy's source
-    instead. It does so on the card, with the other steps, when nothing of
-    the submission writes those bytes in between.
-  - The frame line says why a fill was left to wait.
+    instead, on the card with the other steps, when nothing of the submission
+    writes those bytes in between.
+  - It forwarded 19 fills a frame, and 0.14 submissions a frame were still
+    refused and waited.
+  - With the placement on, the settle's wait is 1.2 to 1.5 ms a frame. It was
+    38.7 ms in 0.12.2.
 - **Structured views off 16 bytes stay on their buffer's copy**, as in every
   wave up to 12. `VICTORY_STRUCTURED_RAW=1` brings back the rule that came
   with wave 13's layer (gomeaw's, for hosts without descriptor twins).
   - With the rule, 2,270 views a frame went through one lock in
     `shadow::exact`, which made 400 new copies a frame.
-  - List translation took 1,249 ms a frame instead of 156, and the frame
-    171 ms where wave 12 took 87 ms.
+  - List translation took 1,249 ms a frame instead of 156.
   - Without it: about 200 ms of translation, 1.7 views a frame asked, and
     the picture is right.
   - TaynanGT's tree found the same on an RTX 4090, and has the same default.
 
 ### Wave 15: the placement and the settle (sync12, ours)
 
-- `VICTORY_CARD_SIDE=1`, off: placement on the card's side, as described
-  above. Its room is kept by the texture queue, and each buffer's own switch
-  still wins.
+- `VICTORY_CARD_SIDE`, on by default on NVIDIA cards, as described above. The
+  texture queue keeps its room, and each buffer's own switch still wins.
 - The finer switches it is made of, all off:
   - `VICTORY_CARD_WRITTEN_KB` and `VICTORY_CARD_ATOMIC`: buffers that shaders
     store to or do atomics on;

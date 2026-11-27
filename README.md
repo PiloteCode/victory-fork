@@ -36,27 +36,30 @@ or load a save.
 | Menus, videos, loading screens | yes, 30 fps |
 | In the world | yes |
 | Playable | yes: a new game's opening and the prologue |
-| Series X profile (full quality) | 79-95 ms a frame (10.5-12.5 fps) with 0.12.2 in the prologue's first playable scenes, about 4,800 draws a frame; the picture is right. 0.13.0's figures follow its runs |
-| The card's work (Series X) | 53.8 ms a frame by command with the default placement, 26.6 ms with every title buffer and the windows on the card's side (`VICTORY_CARD_SIDE=1`) |
+| Series X profile (full quality) | 68.0 ms a frame (14.7 fps) in the prologue's first playable scene, about 4,850 draws a frame, with title buffers on the card (the default on NVIDIA); 89.2 ms (11.2 fps) with the placement of before. Not 30 fps yet. One four-minute run each, while other builds ran |
+| The card's work (Series X) | 53.8 ms a frame by command with the placement of before, 26.6 ms with every title buffer and the windows on the card's side |
 | Series S profile (lighter, upscaled) | shows a picture since 0.12.2; its frame time is being measured again (44 ms a frame before the upscaler's passes ran) |
 | Ray-traced indirect light (`--rt`) | runs, far too slow to play with today |
 | Stability | no crash and no device loss in eleven automated runs of this version; long sessions are not measured yet |
 | Memory | about 37 GB of private memory and 11-19 GB of video memory: 64 GB of RAM recommended |
 | Shaders | 25,953 of the 25,953 programs of the title's shader archive translate and validate for 32-lane GPUs |
 
-The same scenes took 130-168 ms a frame with the layer this tree replaced two
-days earlier.
+For comparison, 0.12.2 took 86.9 ms a frame in that scene on a quiet machine.
 
 **What bounds the frame now is the processor's side.** The card's work was
 halved by where title buffers live: with every title buffer's copy and the
 windows of title memory on the card's side, the card's work by command fell
-from 53.8 to 26.6 ms a frame (dispatches 29.9 to 7.5 ms). The one settle a
-frame has its cause (a 240-byte copy at its place in a list, read as constants
-by a draw of the same list) and its answer (`VICTORY_FILL_FORWARD`, on).
-Loops are not the card's time: of 746 programs drawn with counted loops, one
-pixel program reaches its limit. In the first run with the placement on, the
-thread that prepares submissions worked 64 ms of a 67 ms frame. The
-[roadmap](#roadmap) says what we do about it.
+from 53.8 to 26.6 ms a frame (dispatches 29.9 to 7.5 ms). The card now waits
+for us 23 ms a frame. The title's own submitting thread spends 56 ms of the 68
+inside its submissions, and the thread that prepares them works 64 ms.
+
+The one settle a frame has its cause and its answer. A 240-byte copy at its
+place in a list is read as constants by a draw of the same list;
+`VICTORY_FILL_FORWARD` (on) answers it. Its wait is now 1.2 to 1.5 ms a frame,
+where it was 38.7 ms in 0.12.2. Loops are not the card's time either: of 746
+programs drawn with counted loops, one pixel program reaches its limit.
+
+The [roadmap](#roadmap) says what we do next.
 
 Known to be wrong:
 
@@ -120,7 +123,7 @@ pilotebox check                                 # is this build and this PC all 
 
 | Mode | What you get | What it costs |
 |---|---|---|
-| `--mode x` (default) | The Series X profile: the title's full quality. | 79-95 ms a frame on an RTX 5090 today. |
+| `--mode x` (default) | The Series X profile: the title's full quality. | 68.0 ms a frame (14.7 fps) on an RTX 5090 in the prologue's first playable scene. |
 | `--mode s` | The Series S profile: a 960x540 scene upscaled by the title's own upscaler. Softer, and much lighter on the card. | Being measured; the fast mode while the Series X profile is brought to 30 fps. |
 | `--rt` | The title's ray-traced indirect light: the structure builder and the walks. | With the walks really running, a tester measured 333-425 ms a frame on an RTX 4070 SUPER. For looking, not for playing. |
 | `--safe` | The layer's older, slower ways. | Slower; use it to tell a bug of the speed-ups from a bug of the layer. |
@@ -138,7 +141,7 @@ the goal, with what they are by default:
 
 | Switch | Default | What it does |
 |---|---|---|
-| `VICTORY_CARD_SIDE=1` | off | Every title buffer's copy and the windows of title memory on the card's side, up to totals by the card's budget, their room kept by the texture queue; each buffer's own switch still wins. The card's work by command: 53.8 ms a frame without it, 26.6 ms with it. |
+| `VICTORY_CARD_SIDE` | on with NVIDIA cards, else off | Every title buffer's copy and the windows of title memory on the card's side (the windows as two-sided copies), up to totals by the card's budget (the 8 and 12 GB sizes are guesses still to be measured), their room kept by the texture queue; each buffer's own switch still wins. `=0`: the placement of before; `=1` on other cards (not measured there). The card's work by command: 53.8 ms a frame without it, 26.6 ms with it; the frame 89.2 ms without it, 68.0 ms with it. |
 | `VICTORY_FILL_FORWARD` | on | A fill of upload memory that reads only what a copy at its place in the same list just wrote reads the copy's source instead, on the card (the cause of the one settle a frame). `=0`: it waits for the flights, as before. |
 | `VICTORY_CARD_WRITTEN_KB`, `VICTORY_CARD_ATOMIC=1`, `VICTORY_CARD_UNORDERED_KB` | off | Narrower placements: buffers that shaders store to or do atomics on (from the translator's lists of written and atomic views), buffers the title made for unordered access. |
 | `VICTORY_PORT_RT=1` | off | When a fill of upload memory reads bytes that a copy at its place declared written, the card brings them, or the fill takes them from the copy's source, instead of the submission waiting for every flight (the one settle a frame). Its frame line counts the cases even when off. |
@@ -214,7 +217,8 @@ card's work and the processor's side each under 33 ms a frame.
 Done in 0.13.0:
 - **The card's work, halved by placement.** It went from 53.8 to 26.6 ms a
   frame with every title buffer and the windows of title memory on the
-  card's side (`VICTORY_CARD_SIDE=1`).
+  card's side (`VICTORY_CARD_SIDE`, now the default on NVIDIA cards); the
+  frame from 89.2 to 68.0 ms (14.7 fps).
 - **The one settle a frame: its cause found.** A 240-byte copy at its place
   in a list is read as constants by a draw of the same list.
   `VICTORY_FILL_FORWARD` (on) answers it.
@@ -222,10 +226,11 @@ Done in 0.13.0:
   program reaches its limit.
 
 Next:
-1. **The processor's side**, now the bound. In the first run with the
-   placement on, the thread that prepares submissions worked 64 ms of a 67 ms
-   frame.
-2. **The placement as the default**, once the runs say yes.
+1. **The processor's side**, now the bound: the card waits for us 23 ms a
+   frame, the title's own submitting thread spends 56 ms of the 68 inside its
+   submissions, and the thread that prepares them works 64 ms.
+2. **The placement on other cards**: the 8 and 12 GB sizes measured, and the
+   placement tried on AMD and Intel cards.
 3. **The console's 64-lane programs on 32 lanes**: their forms measured
    against each other, and a wave64 `ds_bpermute` within each half.
 4. **The Series S profile** as the fast mode meanwhile, with PC upscaling and

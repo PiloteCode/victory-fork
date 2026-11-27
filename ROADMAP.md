@@ -3,27 +3,32 @@
 **The goal:** the Series X profile, at full quality, at a steady 30 frames a
 second (33.3 ms a frame) on NVIDIA cards.
 
-**Today:**
-- 0.12.2 took 79-95 ms a frame (10.5-12.5 fps), with the picture right.
-- In 0.13.0 the card's work is halved by where title buffers live, the one
-  settle a frame has its cause and its answer, and loops are ruled out.
-- What bounds the frame now is the processor's side. In the first run with
-  the placement on, the thread that prepares submissions worked 64 ms of a
-  67 ms frame.
-- All of this is on an RTX 5090 on a PCIe 5 link with an i9-14900KF, a
-  diagnostics build, in the prologue's first playable scene at about 4,800
-  draws a frame.
-- 0.13.0's frame figures follow its runs.
+**Today (0.13.0):** 68.0 ms a frame, 14.7 fps, not 30. These figures are from
+one four-minute run while other builds ran, on an RTX 5090 with an
+i9-14900KF, the Series X profile, a diagnostics build, in the prologue's first
+playable scene at about 4,850 draws a frame.
+
+| Placement | A frame | The thread that prepares submissions | The card |
+|---|---|---|---|
+| As before | 89.2 ms (11.2 fps) | worked 80.6 ms | work queued about 89 % of the frame |
+| Title buffers on the card, windows through the bus | 75.5 ms (13.2 fps) | worked 54.4 ms | work queued 51 ms |
+| Title buffers on the card, two-sided windows (the default on NVIDIA) | 68.0 ms (14.7 fps) | worked 63.9 ms | work queued 34 ms |
+
+For comparison, 0.12.2 took 86.9 ms a frame on a quiet machine.
+
+The card is no longer the bound: it waits for us 23 ms a frame. The processor
+is.
 
 Each track below says what is measured and on what. A figure without its card
 and scene is not one. To add yours, run `pilotebox bench` and paste its last
 line.
 
-## 1. The processor's side: the thread that prepares submissions
+## 1. The processor's side: the title's submissions and the thread that prepares them
 
-**Measured:** in the first run with the placement on, the thread that
-prepares submissions worked 64 ms of a 67 ms frame. That run was on an RTX
-5090, Series X profile, `VICTORY_CARD_SIDE=1`, a diagnostics build.
+**Measured** (the default placement, the run above):
+- The title's own submitting thread spends 56 ms of the 68 inside its
+  submissions.
+- The thread that prepares them works 64 ms.
 
 **The levers.** None of these is measured on our card yet:
 - **The other trees' processor-side work.** It is in this tree since 0.13.0,
@@ -36,41 +41,55 @@ prepares submissions worked 64 ms of a 67 ms frame. That run was on an RTX
   `VICTORY_THIN_THREADS=12`, `VICTORY_UNDER_THREADS=8`,
   `VICTORY_LAND_THREADS=6` and `VICTORY_MAP_THREADS=auto`. Our defaults are
   tuned on an AMD card (`VICTORY_MAP_THREADS=1`, `VICTORY_CARD_AWAKE=1`).
-- **Where the 64 ms go.** The timeline (`VICTORY_TIMELINE`) and a profile of
-  that thread, step by step.
+- **Where the time goes**, step by step: the timeline (`VICTORY_TIMELINE`)
+  and a profile of both threads.
+- **Windows through the bus.** The preparing thread worked 54.4 ms with them,
+  against 63.9 ms with two-sided windows, while the card had more work queued
+  (51 ms against 34). `VICTORY_WINDOWS_BAR_MB` is the switch.
 
 ## 2. The card's time: halved by placement
 
 **Measured** (the card's work by command, RTX 5090, the scene above):
-- 53.8 ms a frame with the default placement;
+- 53.8 ms a frame with the placement of before;
 - 26.6 ms with every title buffer and the windows of title memory on the
-  card's side (`VICTORY_CARD_SIDE=1`).
+  card's side.
 
-| Where it went | Default placement | On the card's side |
+| Where it went | Placement of before | On the card's side |
 |---|---|---|
 | Dispatches | 29.9 ms | 7.5 ms |
 | The two shadow-mask programs | 5.6 and 2.1 ms | 0.2 and 0.3 ms |
 
-Loops are answered: of 746 programs drawn with counted loops, one pixel
-program reaches its iteration limit, and no compute program does.
+Loops are answered: of the 746 programs drawn with counted loops, one pixel
+program reaches its iteration limit. No compute program does.
+
+`VICTORY_CARD_SIDE` is the default on NVIDIA cards since 0.13.0. Its sizes
+follow the card's budget.
 
 **Next:**
-- Make the placement the default once the runs say yes.
-- Measure the translator's forms of wave64 programs against each other with
-  replay's `--shaders` and `--shaders-b`. A wave64 `ds_bpermute` permutes
-  within each 32-lane half on the console, which would let more programs run
-  as halves (TaynanGT's tree found it).
+- Measure the 8 GB and 12 GB sizes, which are guesses.
+- Try the placement on AMD and Intel cards. It is off there unless
+  `VICTORY_CARD_SIDE=1`.
+- Measure the translator's forms of wave64 programs against each other, with
+  replay's `--shaders` and `--shaders-b`. On the console, a wave64
+  `ds_bpermute` permutes within each 32-lane half; using that would let more
+  programs run as halves (TaynanGT's tree found it).
 
 ## 3. The one settle a frame: its cause found
 
-The cause: a 240-byte buffer copy at its place in a list, which a draw of the
-same list reads as constants. The fill of upload memory for those constants
-waited for every flight. `VICTORY_FILL_FORWARD` (on) makes such a fill read
-the copy's source instead, on the card with the other steps. The frame line
-says why a fill was left to wait.
+The cause was a 240-byte buffer copy at its place in a list, read as
+constants by a draw of the same list. The fill of upload memory for those
+constants waited for every flight.
 
-**Next:** confirm on the runs that the settle is gone in the world, not only
-in the prologue's first scene.
+`VICTORY_FILL_FORWARD` (on) makes such a fill read the copy's source instead,
+on the card with the other steps.
+
+**Measured** (the run above, the placement on):
+- 19 fills a frame forwarded;
+- 0.14 submissions a frame still refused and waited;
+- the settle's wait is 1.2 to 1.5 ms a frame, where it was 38.7 ms in 0.12.2.
+
+**Next:** the submissions that are still refused, and their reasons, which
+the frame line names.
 
 ## 4. The Series S profile
 
