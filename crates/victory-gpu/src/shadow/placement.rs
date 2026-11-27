@@ -18,10 +18,12 @@
 //! - every title buffer's copy on the card (a copy is 64 KiB at least, so a
 //!   least of 64 KiB takes them all), up to a total by budget;
 //! - windows of title memory outside buffers on the card, up to a total by
-//!   budget, with two sides (`VICTORY_CARD_WINDOWS_MB`'s way). The other way,
-//!   written by the CPU through the bus into card memory it maps
-//!   (`VICTORY_WINDOWS_BAR_MB`, which needs resizable BAR), is taken only by
-//!   its own switch: see "Measured" below;
+//!   budget: written by the CPU through the bus into card memory it maps
+//!   (`VICTORY_WINDOWS_BAR_MB`'s way) where the card and the system allow it
+//!   (`D3D12_FEATURE_DATA_D3D12_OPTIONS16::GPUUploadHeapSupported`, which
+//!   needs resizable BAR), else with two sides (`VICTORY_CARD_WINDOWS_MB`'s
+//!   way). `VICTORY_WINDOWS_BAR_MB=0` asks for two sides: see "Measured"
+//!   below;
 //! - the texture queue keeps the room of both totals, less what they hold
 //!   already (`card_room_kept`), so that the copies made after the textures
 //!   came still find it.
@@ -34,13 +36,20 @@
 //! a submission in the air keeps the bytes it was prepared with, and a shader
 //! write to a window is compared and brought back on the card.
 //!
-//! Measured (RTX 5090, the same build and scene, the process at high
-//! priority; runs integ-w15-def, -side, -side2): 89.2 ms a frame with the
-//! placement of before; 75.5 ms with the windows through the bus (the thread
-//! that prepares submissions worked 54.4 ms, the card had work queued for 51
-//! ms); 68.0 ms with two-sided windows (that thread 63.9 ms, the card 34 ms).
-//! The bus is cheaper for the processor and dearer for the card by more, so
-//! two sides are the placement's choice.
+//! Measured (RTX 5090, the same scene, the process at high priority; the
+//! median frame of each run's last minute, and what the thread that prepares
+//! submissions worked a frame). The placement of before: 85.5 ms (79.8). The
+//! windows through the bus, three runs: 62.1 (56.3), 71.8 (67.8), 74.0 (68.8).
+//! Two-sided windows, four runs: 66.7 (65.3), 69.6 (63.0), 83.7 (84.7), 74.5
+//! (73.7). The later runs of both had other programs on the card and the
+//! processor. Run for run the bus is the faster or the equal one, it spares
+//! that thread about 7 ms, and it keeps no second copy of the windows in the
+//! PC's memory (up to the windows' total again), so it is the placement's
+//! choice where it exists.
+//!
+//! (0.13.0 chose two sides, from figures that did not hold: the runs' means,
+//! which a slow first minute weighed on unequally, and one line of the card's
+//! clock each.)
 //!
 //! Every switch of its own still wins: `VICTORY_CARD_BUFFERS_MIN_KB`,
 //! `_MIN_MB`, `VICTORY_CARD_BUFFERS_MB`, `VICTORY_WINDOWS_BAR_MB`,
@@ -125,7 +134,7 @@ pub(crate) fn set() -> Option<Set> {
                 buffers_least_kb = set.buffers_least >> 10,
                 buffers_most_mb = set.buffers_most >> 20,
                 windows_most_mb = set.windows_most >> 20,
-                the_bus_could_carry_windows = host.mapped_card_memory(),
+                windows_through_the_bus = host.mapped_card_memory(),
                 "what shaders touch lives on the card's side (VICTORY_CARD_SIDE=0: the placement of before); a switch of its own overrides each size"
             ),
             None => tracing::info!("the card's budget is not known: the placement stays as it was (VICTORY_CARD_SIDE)"),
