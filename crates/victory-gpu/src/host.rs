@@ -4432,6 +4432,8 @@ pub(crate) mod awake;
 mod title_stock;
 mod card_steps;
 mod cardsync;
+#[cfg(feature = "diagnostics")]
+mod refreshstat;
 pub(crate) mod indirects;
 mod panel;
 mod place;
@@ -8645,6 +8647,17 @@ enum TitleWrite {
 static TITLE_WRITE_FLUSHES: [[std::sync::atomic::AtomicU64; 2]; 3] =
     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 3];
 
+/// [`crate::shadow::Shadow::nothing_new`], timed for the frame line with
+/// diagnostics (`refreshstat`).
+fn nothing_new(shadow: &crate::shadow::Shadow, from: usize, len: usize) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let checking = std::time::Instant::now();
+    let nothing = shadow.nothing_new(from, len);
+    #[cfg(feature = "diagnostics")]
+    refreshstat::checked(nothing, checking);
+    nothing
+}
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -8707,6 +8720,7 @@ fn split_line(frames: f64) {
         e[0],
         e[1] / 1e3,
     );
+    refreshstat::line(frames);
     let writes = TITLE_WRITE_FLUSHES.each_ref().map(|[count, nanos]| {
         (count.swap(0, Ordering::Relaxed) as f64 / frames, nanos.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames)
     });
@@ -9273,6 +9287,8 @@ impl Batch {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
+        #[cfg(feature = "diagnostics")]
+        refreshstat::done(copied, started);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
@@ -9297,6 +9313,8 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         let mut planning = crate::timeline::span("refreshes in front: the steps gathered");
         let mut due = Vec::new();
         // Renderer port #6: each list's part made on the threads beside, and
@@ -9335,6 +9353,8 @@ impl Batch {
                 }
             }
             let spans = join_fronts(&fronts, parts);
+            #[cfg(feature = "diagnostics")]
+            refreshstat::planned(began);
             self.refresh_spans(spans, due, planning);
             return;
         }
@@ -9370,6 +9390,8 @@ impl Batch {
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
+        #[cfg(feature = "diagnostics")]
+        refreshstat::planned(began);
         self.refresh_spans(spans, due, planning);
     }
 
@@ -9404,7 +9426,7 @@ impl Batch {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            spans.retain(|(shadow, from, to)| !nothing_new(shadow, *from, *to - *from));
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
@@ -9422,7 +9444,7 @@ impl Batch {
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
+            if many && nothing_new(shadow, *from, *to - *from) {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
@@ -9440,6 +9462,8 @@ impl Batch {
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        refreshstat::flushed(started);
     }
 
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
