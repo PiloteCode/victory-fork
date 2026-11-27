@@ -103,6 +103,8 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
+mod forward;
+
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
 
@@ -484,7 +486,11 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (mut does, steps) = does_of(&written, runs);
+    if forward::on() {
+        let (places, shader_writes) = forward::places_of(runs, &steps);
+        forward::forward(&mut does, &places, &shader_writes);
+    }
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -695,7 +701,14 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
+        let (mut does, steps) = does_of(written, runs);
+        // (Only where a copy at its place is there at all: some 1,200 steps
+        // a submission are looked at for it.)
+        let mut forwarded = 0;
+        if forward::on() && does.iter().any(|d| matches!(d, Does::Placed { .. })) {
+            let (places, shader_writes) = forward::places_of(runs, &steps);
+            forwarded = forward::forward(&mut does, &places, &shader_writes);
+        }
         let mut behind = None;
         let chosen = match plan(&does, stage(), placed_order(), &mut behind) {
             Ok(chosen) => chosen,
@@ -868,6 +881,7 @@ impl Host {
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
+        forward::FORWARDED.fetch_add(forwarded as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -999,12 +1013,15 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} fills read a copy's source, the copy at its place being \
+         just ahead of them (VICTORY_FILL_FORWARD={})",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        forward::FORWARDED.swap(0, Ordering::Relaxed) as f64 / frames,
+        u8::from(forward::on()),
     );
     #[cfg(feature = "diagnostics")]
     {
