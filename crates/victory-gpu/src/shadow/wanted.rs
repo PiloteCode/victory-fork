@@ -101,11 +101,6 @@ fn set(wanted: Use) -> Asking {
     Asking(Some(USE.replace(wanted)))
 }
 
-/// What a shader does with the buffer of a view it uses as `kind`, as far
-/// as that tells: a view of unordered access may be stored through.
-pub(crate) fn by_kind(kind: Option<victory_shader::native::ResourceType>) -> Use {
-    if kind == Some(victory_shader::native::ResourceType::Uav) { Use::Written } else { Use::Read }
-}
 
 /// Whether a copy of a buffer of `len` bytes made now goes to the card's
 /// memory for what the asking bind does with it.
@@ -214,8 +209,5 @@ mod tests {
             assert_eq!(USE.get(), Use::Written);
         }
         assert_eq!(USE.get(), Use::Read);
-        assert_eq!(by_kind(Some(victory_shader::native::ResourceType::Uav)), Use::Written);
-        assert_eq!(by_kind(Some(victory_shader::native::ResourceType::Srv)), Use::Read);
-        assert_eq!(by_kind(None), Use::Read);
     }
 }

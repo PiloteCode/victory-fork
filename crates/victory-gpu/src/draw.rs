@@ -45,6 +45,14 @@ struct TableGroup {
     /// unsigned integers (`HostShader::half_views`, #927); counted in
     /// `max_dword`, so a fresh table reaches them.
     half: Vec<u32>,
+    /// The dwords of the buffer descriptors the shader does atomics on and
+    /// stores to (`HostShader::atomic_views`, `written_views`), and what
+    /// it does through descriptors of the table it picks at an index it
+    /// computes (`picked_views`' bits): where the buffers' copies go
+    /// (`crate::shadow::wanted`).
+    atomic: Vec<u32>,
+    written: Vec<u32>,
+    picked: u8,
 }
 
 impl TablePlan {
@@ -73,6 +81,9 @@ impl TablePlan {
                 by_descriptor: Vec::new(),
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
                 half: half.iter().filter(|h| h.0 == slot).map(|h| h.1).collect(),
+                atomic: Vec::new(),
+                written: Vec::new(),
+                picked: 0,
             })
             .collect();
         let mut direct = Vec::new();
@@ -100,9 +111,37 @@ impl TablePlan {
         }
         Self { groups, direct }
     }
+
+    /// The plan with what the shader does to the buffers of its tables:
+    /// `HostShader::atomic_views`, `written_views` and `picked_views`.
+    pub(crate) fn with_uses(mut self, atomic: &[(u8, u32)], written: &[(u8, u32)], picked: &[(u8, u8)]) -> Self {
+        for group in &mut self.groups {
+            group.atomic = atomic.iter().filter(|p| p.0 == group.slot).map(|p| p.1).collect();
+            group.written = written.iter().filter(|p| p.0 == group.slot).map(|p| p.1).collect();
+            group.picked = picked.iter().filter(|p| p.0 == group.slot).fold(0, |bits, p| bits | p.1);
+        }
+        self
+    }
 }
 
 impl TableGroup {
+    /// What the shader does with the buffer of the descriptor at `dword`
+    /// of the table, used as `kind` there: atomics or stores where the
+    /// translator names the place, or where it picks the table's
+    /// descriptors at a computed index and this one may be reached that way
+    /// (an unordered access view).
+    fn use_of(&self, dword: u32, kind: Option<ResourceType>) -> crate::shadow::wanted::Use {
+        use crate::shadow::wanted::Use;
+        let picked = kind == Some(ResourceType::Uav);
+        if self.atomic.contains(&dword) || picked && self.picked & victory_shader::emit::PICKED_ATOMIC != 0 {
+            Use::Atomic
+        } else if self.written.contains(&dword) || picked && self.picked & victory_shader::emit::PICKED_WRITTEN != 0 {
+            Use::Written
+        } else {
+            Use::Read
+        }
+    }
+
     fn entry(&self, descriptor: u32) -> Option<&UsedResource> {
         let i = self
             .by_descriptor
@@ -3668,7 +3707,6 @@ impl State {
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let _asking = crate::shadow::wanted::asking(crate::shadow::wanted::by_kind(Some(u.kind)));
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -3741,7 +3779,9 @@ impl State {
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+                let u = &group.entries[e];
+                let _asking = crate::shadow::wanted::asking(group.use_of(u.table_offset_dwords, Some(u.kind)));
+                self.table_entry(list, u, compute);
             }
         }
         let mut made = Few::default();
@@ -3960,7 +4000,7 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        let _asking = crate::shadow::wanted::asking(crate::shadow::wanted::by_kind(used.map(|u| u.kind)));
+                        let _asking = crate::shadow::wanted::asking(group.use_of(k * 8, used.map(|u| u.kind)));
                         let twin = if twin_here {
                             crate::descriptor::half_views::half_view(&view)
                         } else {
