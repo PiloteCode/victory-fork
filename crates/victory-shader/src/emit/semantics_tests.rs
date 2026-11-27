@@ -314,6 +314,9 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: Vec::new(),
+        atomic_views: Vec::new(),
+        written_views: Vec::new(),
+        picked_views: Vec::new(),
     })
 }
 

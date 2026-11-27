@@ -128,6 +128,10 @@ mod official;
 /// shares the emitter's state.
 #[path = "half_bits.rs"]
 mod half_bits;
+/// The table places through which a program uses buffers with atomics or writes them, a child
+/// module so it shares the emitter's state.
+#[path = "views.rs"]
+pub(super) mod views;
 #[cfg(test)]
 pub(super) use half_bits::with_half_bits_off;
 
@@ -163,6 +167,12 @@ pub(crate) struct Lowered {
     pub root_uavs: Vec<u8>,
     /// See [`super::HostShader::half_views`].
     pub half_views: Vec<(u8, u32)>,
+    /// See [`super::HostShader::atomic_views`].
+    pub atomic_views: Vec<(u8, u32)>,
+    /// See [`super::HostShader::written_views`].
+    pub written_views: Vec<(u8, u32)>,
+    /// See [`super::HostShader::picked_views`].
+    pub picked_views: Vec<(u8, u8)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -2787,6 +2797,7 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
+        let uses = self.view_uses();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         let form = match () {
@@ -2806,6 +2817,9 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             half_views,
+            atomic_views: uses.atomic,
+            written_views: uses.written,
+            picked_views: uses.picked,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]

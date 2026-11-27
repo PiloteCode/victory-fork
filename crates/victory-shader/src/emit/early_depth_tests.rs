@@ -103,6 +103,9 @@ fn pixel_programs_tested_before_they_run_keep_that_order() {
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
         half_views: Vec::new(),
+        atomic_views: Vec::new(),
+        written_views: Vec::new(),
+        picked_views: Vec::new(),
     };
     let vs = super::host::stub_vs(&ps).expect("vertex stub");
     for (label, warp) in [("hardware", false), ("warp", true)] {

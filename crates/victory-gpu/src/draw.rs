@@ -43,6 +43,10 @@ pub(crate) struct TablePlan {
     // Direct entries can interleave slots. Preserve their declaration order
     // when recording resource reads, writes, and transitions.
     direct: Vec<(usize, usize)>,
+    /// The root views (by root parameter) the shader does atomics on and
+    /// stores to ([`TablePlan::with_uses`]).
+    root_atomic: Vec<u8>,
+    root_written: Vec<u8>,
 }
 
 struct TableGroup {
@@ -58,6 +62,14 @@ struct TableGroup {
     /// unsigned integers (`HostShader::half_views`, #927); counted in
     /// `max_dword`, so a fresh table reaches them.
     half: Vec<u32>,
+    /// The dwords of the buffer descriptors the shader does atomics on and
+    /// stores to (`HostShader::atomic_views`, `written_views`), and what
+    /// it does through descriptors of the table it picks at an index it
+    /// computes (`picked_views`' bits): where the buffers' copies go
+    /// (`crate::shadow::wanted`).
+    atomic: Vec<u32>,
+    written: Vec<u32>,
+    picked: u8,
 }
 
 impl TablePlan {
@@ -86,6 +98,9 @@ impl TablePlan {
                 by_descriptor: Vec::new(),
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
                 half: half.iter().filter(|h| h.0 == slot).map(|h| h.1).collect(),
+                atomic: Vec::new(),
+                written: Vec::new(),
+                picked: 0,
             })
             .collect();
         let mut direct = Vec::new();
@@ -111,11 +126,59 @@ impl TablePlan {
             // first; review on #927): the table reaches them.
             group.max_dword = group.half.iter().fold(group.max_dword, |m, &at| m.max(at));
         }
-        Self { groups, direct }
+        Self { groups, direct, root_atomic: Vec::new(), root_written: Vec::new() }
+    }
+
+    /// The plan with what the shader does to the buffers of its tables and
+    /// root views: `HostShader::atomic_views`, `written_views` (a root view
+    /// as dword `emit::ROOT_VIEW`) and `picked_views`.
+    pub(crate) fn with_uses(mut self, atomic: &[(u8, u32)], written: &[(u8, u32)], picked: &[(u8, u8)]) -> Self {
+        use victory_shader::emit::ROOT_VIEW;
+        let in_table = |places: &[(u8, u32)], slot: u8| -> Vec<u32> {
+            places.iter().filter(|p| p.0 == slot && p.1 != ROOT_VIEW).map(|p| p.1).collect()
+        };
+        for group in &mut self.groups {
+            group.atomic = in_table(atomic, group.slot);
+            group.written = in_table(written, group.slot);
+            group.picked = picked.iter().filter(|p| p.0 == group.slot).fold(0, |bits, p| bits | p.1);
+        }
+        let roots = |places: &[(u8, u32)]| -> Vec<u8> { places.iter().filter(|p| p.1 == ROOT_VIEW).map(|p| p.0).collect() };
+        self.root_atomic = roots(atomic);
+        self.root_written = roots(written);
+        self
+    }
+
+    /// What the shader does with the buffer of its root view at `slot`.
+    pub(crate) fn root_use(&self, slot: u8) -> crate::shadow::wanted::Use {
+        use crate::shadow::wanted::Use;
+        if self.root_atomic.contains(&slot) {
+            Use::Atomic
+        } else if self.root_written.contains(&slot) {
+            Use::Written
+        } else {
+            Use::Read
+        }
     }
 }
 
 impl TableGroup {
+    /// What the shader does with the buffer of the descriptor at `dword`
+    /// of the table, used as `kind` there: atomics or stores where the
+    /// translator names the place, or where it picks the table's
+    /// descriptors at a computed index and this one may be reached that way
+    /// (an unordered access view).
+    fn use_of(&self, dword: u32, kind: Option<ResourceType>) -> crate::shadow::wanted::Use {
+        use crate::shadow::wanted::Use;
+        let picked = kind == Some(ResourceType::Uav);
+        if self.atomic.contains(&dword) || picked && self.picked & victory_shader::emit::PICKED_ATOMIC != 0 {
+            Use::Atomic
+        } else if self.written.contains(&dword) || picked && self.picked & victory_shader::emit::PICKED_WRITTEN != 0 {
+            Use::Written
+        } else {
+            Use::Read
+        }
+    }
+
     fn entry(&self, descriptor: u32) -> Option<&UsedResource> {
         let i = self
             .by_descriptor
@@ -2058,6 +2121,7 @@ impl State {
                         None
                     }
                 };
+                let _asking = crate::shadow::wanted::asking(t.tables.root_use(slot));
                 if !self.root_uav(list, address, param, compute, writes) {
                     return false;
                 }
@@ -4082,7 +4146,9 @@ impl State {
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+                let u = &group.entries[e];
+                let _asking = crate::shadow::wanted::asking(group.use_of(u.table_offset_dwords, Some(u.kind)));
+                self.table_entry(list, u, compute);
             }
         }
         let mut made = Few::default();
@@ -4316,6 +4382,7 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
+                        let _asking = crate::shadow::wanted::asking(group.use_of(k * 8, used.map(|u| u.kind)));
                         let twin = if twin_here {
                             crate::descriptor::half_views::half_view(&view)
                         } else {
@@ -5668,5 +5735,49 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod use_tests {
+    use super::*;
+    use crate::shadow::wanted::Use;
+
+    fn entry(slot: u8, dword: u32, kind: ResourceType) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: dword,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 4,
+            user_data: 4,
+            slot,
+        }
+    }
+
+    /// The places the translator names say what a bind asks a buffer's
+    /// copy for; a view of unordered access in a table the shader picks
+    /// from at a computed index may be reached that way too.
+    #[test]
+    fn the_translators_places_say_what_a_buffer_is_asked_for() {
+        let used = [entry(5, 0, ResourceType::Uav), entry(5, 8, ResourceType::Uav), entry(5, 16, ResourceType::Uav), entry(4, 0, ResourceType::Uav)];
+        let plan = TablePlan::new(&used, &[], &[]).with_uses(&[(5, 16)], &[(5, 0), (5, 8), (5, 16)], &[(4, victory_shader::emit::PICKED_WRITTEN)]);
+        let group = |slot: u8| plan.groups.iter().find(|g| g.slot == slot).unwrap();
+        assert_eq!(group(5).use_of(16, Some(ResourceType::Uav)), Use::Atomic);
+        assert_eq!(group(5).use_of(8, Some(ResourceType::Uav)), Use::Written);
+        // A view the shader only reads, in a table nothing is picked from.
+        assert_eq!(group(5).use_of(24, Some(ResourceType::Srv)), Use::Read);
+        assert_eq!(group(5).use_of(24, Some(ResourceType::Uav)), Use::Read);
+        // Picked for writes: its unordered access views, not its others.
+        assert_eq!(group(4).use_of(0, Some(ResourceType::Uav)), Use::Written);
+        assert_eq!(group(4).use_of(8, Some(ResourceType::Srv)), Use::Read);
+        assert_eq!(group(4).use_of(8, None), Use::Read);
+        // Root views, named by their parameter alone.
+        let root = victory_shader::emit::ROOT_VIEW;
+        let plan = TablePlan::new(&used, &[], &[]).with_uses(&[(2, root)], &[(2, root), (3, root), (5, 0)], &[]);
+        assert_eq!((plan.root_use(2), plan.root_use(3), plan.root_use(7)), (Use::Atomic, Use::Written, Use::Read));
+        // (A root view's place is no table's.)
+        assert_eq!(plan.groups.iter().find(|g| g.slot == 5).unwrap().written, [0]);
     }
 }

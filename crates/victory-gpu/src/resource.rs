@@ -2856,7 +2856,9 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        // (Made to allow unordered access: shaders may store to it.)
+        let unordered = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
+        crate::shadow::register_with(at, resource.data() as u64, desc.width, desc.flags & unordered != 0);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }

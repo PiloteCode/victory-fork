@@ -281,6 +281,20 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(slot));
         word(&mut out, dword);
     }
+    // The places it uses buffers with atomics through, those it writes, and the tables it
+    // picks such buffers from at run time (`HostShader::atomic_views` and its kin).
+    for places in [&s.atomic_views, &s.written_views] {
+        word(&mut out, places.len() as u32);
+        for &(slot, dword) in places {
+            word(&mut out, u32::from(slot));
+            word(&mut out, dword);
+        }
+    }
+    word(&mut out, s.picked_views.len() as u32);
+    for &(slot, bits) in &s.picked_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, u32::from(bits));
+    }
     out
 }
 
@@ -354,6 +368,21 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     for _ in 0..n {
         half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
+    let mut places = || -> Option<Vec<(u8, u32)>> {
+        let n = r.word()? as usize;
+        let mut all = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            all.push((u8::try_from(r.word()?).ok()?, r.word()?));
+        }
+        Some(all)
+    };
+    let atomic_views = places()?;
+    let written_views = places()?;
+    let n = r.word()? as usize;
+    let mut picked_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        picked_views.push((u8::try_from(r.word()?).ok()?, u8::try_from(r.word()?).ok()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -365,6 +394,9 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         half_views,
+        atomic_views,
+        written_views,
+        picked_views,
     })
 }
 
@@ -400,6 +432,9 @@ mod tests {
                 shift: 5,
             }],
             half_views: vec![(0, 8), (4, 0)],
+            atomic_views: vec![(1, 4)],
+            written_views: vec![(1, 4), (1, 12), (5, 0)],
+            picked_views: vec![(2, 3)],
         }
     }
 
