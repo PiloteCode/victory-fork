@@ -696,7 +696,18 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let mut behind = None;
+        let chosen = match plan(&does, stage(), placed_order(), &mut behind) {
+            Ok(chosen) => chosen,
+            Err(why) => {
+                #[cfg(feature = "diagnostics")]
+                if why == BEHIND_PLACED {
+                    note_placed(&does, &steps, runs, behind);
+                }
+                let _ = behind;
+                return Err(why);
+            }
+        };
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -891,6 +902,81 @@ type Noted = std::collections::HashMap<(usize, (u64, u64), (u64, u64)), (u64, us
 #[cfg(feature = "diagnostics")]
 static NOTED: Mutex<Option<Noted>> = Mutex::new(None);
 
+/// Diagnostics: since the last frame line, the submissions whose steps a
+/// copy at its place in a list kept off the card ([`BEHIND_PLACED`]), and
+/// what the last one was.
+#[cfg(feature = "diagnostics")]
+static PLACED: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+
+/// Diagnostics: [`plan`] refused `does` for a copy at its place in a list;
+/// `behind` is what it found in the way behind that copy. Names the copy,
+/// where it stands, and the steps that read or write its bytes ahead of it
+/// and behind it, and whether a cut between lists ([`cut_for`]) could part
+/// them.
+#[cfg(feature = "diagnostics")]
+fn note_placed(does: &[Does], steps: &[(usize, usize)], runs: &[&HostList], behind: Option<(usize, usize)>) {
+    use std::fmt::Write;
+    let list = |i: usize| {
+        runs.iter()
+            .position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0)
+            .map_or_else(|| "?".to_owned(), |l| l.to_string())
+    };
+    let what = |i: usize| match does[i] {
+        Does::Copy { dst, src, len, asked } => {
+            format!("a copy of {len:#x} bytes to {dst:#x} from {src:#x}{}", if asked { " (flights stop it)" } else { "" })
+        }
+        Does::Fill { src, len, asked, to } => format!(
+            "a fill of {len:#x} bytes from {src:#x}{}{}",
+            if asked { " (flights stop it)" } else { "" },
+            if to { "" } else { " (the card cannot be given its bytes)" }
+        ),
+        _ => "another step".to_owned(),
+    };
+    let mut text = String::new();
+    for (p, d) in does.iter().enumerate() {
+        let Does::Placed { dst, src, len } = *d else {
+            continue;
+        };
+        let (to, from) = ((dst, dst + len), (src, src + len));
+        let meets = |i: usize| {
+            i != p && reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
+        };
+        let ahead: Vec<usize> = (0..p).filter(|&i| meets(i)).collect();
+        let after: Vec<usize> = (p + 1..does.len()).filter(|&i| meets(i)).collect();
+        if ahead.is_empty() && after.is_empty() {
+            continue;
+        }
+        let _ = write!(
+            text,
+            "the copy at its place of {len:#x} bytes to {dst:#x} from {src:#x}, step {p} of {} in list {} of {}; {} steps ahead of \
+             it and {} behind it read or write its bytes",
+            does.len(),
+            list(p),
+            runs.len(),
+            ahead.len(),
+            after.len()
+        );
+        if let Some(&i) = ahead.last() {
+            let _ = write!(text, "; the last ahead: {} in list {}", what(i), list(i));
+        }
+        if let Some(&i) = after.first() {
+            let _ = write!(text, "; the first behind: {} in list {}", what(i), list(i));
+        }
+        break;
+    }
+    if let Some((p, i)) = behind {
+        let same = list(i) == list(p);
+        let _ = write!(
+            text,
+            "; in the way on the card: step {i} behind it{}",
+            if same { ", in the same list (no cut between lists parts them)" } else { ", in a later list" }
+        );
+    }
+    let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    placed.0 += 1;
+    placed.1 = text;
+}
+
 #[cfg(feature = "diagnostics")]
 fn noted(ops: &[Op]) {
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -939,6 +1025,20 @@ pub(super) fn log(frames: f64) {
                     to.1
                 );
             }
+        }
+        let (n, last) = std::mem::take(&mut *PLACED.lock().unwrap_or_else(|e| e.into_inner()));
+        if n > 0 {
+            tracing::info!(
+                "kept off the card by a copy at its place in a list, per frame: {:.2} submissions (VICTORY_PLACED_ORDER={}: {}); \
+                 the last: {last}",
+                n as f64 / frames,
+                u8::from(placed_order()),
+                if placed_order() {
+                    "only what stands behind the copy is in its way, and a submission is cut behind the copy's list"
+                } else {
+                    "whatever reads or writes its bytes is in its way, wherever it stands"
+                },
+            );
         }
     }
 }
