@@ -5,6 +5,8 @@
 //! `crate::ab::pick("VICTORY_X")`), so a name the Markdown files give must
 //! appear quoted in at least one Rust file. xtask's own files are left out
 //! of the search: this module's tests name switches of their own.
+//! `CHANGELOG.md` is left out of the documents: it tells what earlier
+//! versions had, switches since gone among them.
 
 use std::collections::BTreeSet;
 
@@ -48,7 +50,7 @@ fn documented_switches_are_read() {
     let read = |path: &String| std::fs::read_to_string(root.join(path)).ok();
     let mut documented = BTreeSet::new();
     let mut doc_of = Vec::new();
-    for path in files.iter().filter(|p| p.ends_with(".md")) {
+    for path in files.iter().filter(|p| p.ends_with(".md") && p.as_str() != "CHANGELOG.md") {
         for name in names(&read(path).unwrap_or_default()) {
             doc_of.push((name.clone(), path.clone()));
             documented.insert(name);
