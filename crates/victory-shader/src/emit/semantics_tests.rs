@@ -839,7 +839,7 @@ fn mods_in(x: u32, k: usize, m: M) -> u32 {
 
 /// Output modifiers of a float result: the multiplier, which turns -0
 /// into +0, then the clamp to [0, 1], which gives +0 for NaN (DX10 clamp)
-/// and for -0. Measured on RDNA2 by the Leonida project (gfx1031 and
+/// and for -0. Measured on RDNA2 by a community project (gfx1031 and
 /// gfx1036 for the multiplier with IEEE off and denormals flushed; the
 /// clamp's -0 and NaN on gfx1036 for f16).
 fn mods_out(r: u32, m: M) -> u32 {
@@ -888,7 +888,7 @@ fn mul(a: u32, b: u32) -> u32 {
 
 /// DX9's multiply: a zero operand (a denormal read as one) gives +0 against
 /// anything, infinity and NaN included (RDNA2 ISA `V_MUL_LEGACY_F32`; the
-/// +0 and the denormal operands measured on RDNA2 by the Leonida project).
+/// +0 and the denormal operands measured on RDNA2 by a community project).
 fn mul_legacy(a: u32, b: u32) -> u32 {
     let (a, b) = (ftz(a), ftz(b));
     if a & 0x7FFF_FFFF == 0 || b & 0x7FFF_FFFF == 0 {
@@ -912,7 +912,7 @@ fn mad_legacy(a: u32, b: u32, c: u32) -> u32 {
 }
 
 /// Minimum or maximum: one NaN operand gives the other, two give the
-/// first; -0 orders below +0 (measured on RDNA2, RX 6800, by the Leonida
+/// first; -0 orders below +0 (measured on RDNA2, RX 6800, by a community
 /// project with the AnyPS5 hardware oracle).
 fn min_max(max: bool, a: u32, b: u32) -> u32 {
     let (a, b) = (ftz(a), ftz(b));
@@ -967,7 +967,7 @@ fn to_u32(x: u32) -> u32 {
 
 /// `v_cvt_flr_i32_f32` and `v_cvt_rpi_i32_f32`: floor of x (of x + 0.5
 /// taken exactly), saturating; a NaN saturates by its sign; a denormal reads
-/// as zero (measured on RDNA2, gfx1035 and gfx1036, by the Leonida project).
+/// as zero (measured on RDNA2, gfx1035 and gfx1036, by a community project).
 fn to_i32_floor(x: u32, half: bool) -> u32 {
     let x = ftz(x);
     if nan(x) {
@@ -1711,7 +1711,7 @@ fn compares_of_denormals_agree_across_adapters() {
 }
 
 /// `v_cmp_class_f32`: the class of the raw operand, denormals never flushed
-/// (RDNA2 ISA; measured on RDNA2 in both denormal modes by the Leonida
+/// (RDNA2 ISA; measured on RDNA2 in both denormal modes by a community
 /// project).
 fn class(x: u32) -> u32 {
     let (neg, mag) = (x >> 31 != 0, x & 0x7FFF_FFFF);
@@ -1835,7 +1835,7 @@ fn conversions_match_the_hardware() {
 }
 
 /// `v_fract_f32`: never 1.0, NaN for infinities, a NaN passes, a denormal
-/// reads as zero (measured on RDNA2 by the Leonida project).
+/// reads as zero (measured on RDNA2 by a community project).
 fn fract(x: u32) -> u32 {
     let x = ftz(x);
     if nan(x) {
@@ -1855,7 +1855,7 @@ fn fract(x: u32) -> u32 {
 
 /// Sine or cosine of `x` turns, reduced first (`x - round_even(x)`, exact):
 /// infinities and NaN give NaN, half turns of sine and quarter turns of
-/// cosine exact zeros, a zero passes (measured on RDNA2 by the Leonida
+/// cosine exact zeros, a zero passes (measured on RDNA2 by a community
 /// project).
 fn turns(x: u32, cosine: bool) -> u32 {
     let x = ftz(x);
@@ -1910,7 +1910,7 @@ fn rounding_matches_the_hardware() {
 /// The transcendental instructions' results: denormals in and out are
 /// zeros of their sign whatever the mode, rcp(±0) = ±inf, rsq(-0) = -inf,
 /// sqrt(-0) = -0, log(±0) = -inf, invalid operations NaN (measured on
-/// RDNA2, RX 6800, by the Leonida project). Ordinary results within the
+/// RDNA2, RX 6800, by a community project). Ordinary results within the
 /// hardware's 1 ULP plus the host's own error.
 fn transcendental(op: u16, x: u32) -> u32 {
     let x = ftz(x);
@@ -2292,7 +2292,7 @@ fn half_pairs() -> Vec<[u32; 4]> {
 // An f16 op works on the low halves, NaN in → NaN out, denormals kept (the
 // console's mode keeps 16-bit denormals), the result rounded once to
 // nearest even into the low half; the high half kept (RDNA2 ISA, 16-bit
-// results; nearest even measured on RDNA2 by the Leonida project).
+// results; nearest even measured on RDNA2 by a community project).
 
 fn f16_min_max(max: bool, a: u32, b: u32) -> u32 {
     let (a, b) = (a & 0xFFFF, b & 0xFFFF);
@@ -2497,7 +2497,7 @@ fn sixteen_bit_floats_match_the_hardware() {
 }
 
 /// `v_fma_mix*`: each source an f32 (a denormal read as zero, measured on
-/// RDNA2 by the Leonida project) or, with `op_sel_hi`, the f16 half
+/// RDNA2 by a community project) or, with `op_sel_hi`, the f16 half
 /// `op_sel` names; `neg_hi` is the absolute value; fused (RDNA2 ISA).
 /// `mixlo`/`mixhi` round the f32 result to nearest even into one half.
 fn mix_source(x: u32, k: u32, opsel: u8, opsel_hi: u8, neg: [u8; 2]) -> f64 {
@@ -3045,7 +3045,7 @@ fn defect_multiply_adds_fused_only_where_the_host_fuses() {
 
 /// The VOP3 output multipliers flush the result and turn a zero into +0
 /// with IEEE mode off (measured on RDNA2, gfx1031 and gfx1036, by the
-/// Leonida project). Was a defect: the host's multiply kept -0.
+/// community project). Was a defect: the host's multiply kept -0.
 #[test]
 #[ignore = "ours: an output multiplier keeps a zero product's sign unless VICTORY_OMOD_ZERO=1 (with it, this passes)"]
 fn output_multipliers_give_positive_zero() {
@@ -3102,7 +3102,7 @@ fn scalar_min_max_set_scc_from_the_compare() {
 
 /// `v_cvt_flr_i32_f32`/`v_cvt_rpi_i32_f32` saturate a NaN by its sign and
 /// add the half exactly (measured on RDNA2, gfx1035/gfx1036, by the
-/// Leonida project). Was a defect: NaN gave 0 and x + 0.5 was rounded
+/// community project). Was a defect: NaN gave 0 and x + 0.5 was rounded
 /// first (0x3effffff gave 1, the hardware 0). The title uses neither.
 #[test]
 #[ignore = "ours: v_cvt_flr/rpi_i32_f32 of NaN and x + 0.5 as the host computes them (the title runs neither)"]
