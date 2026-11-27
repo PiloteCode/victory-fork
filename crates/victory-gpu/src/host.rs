@@ -3887,6 +3887,8 @@ fn land() {
     // that landed meanwhile. A thread that finds another landing leaves it
     // to that one (the submitting thread lands after every flight it sends).
     static LANDING: Mutex<()> = Mutex::new(());
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     let old = {
         let _landing = match LANDING.try_lock() {
             Ok(guard) => guard,
@@ -3905,6 +3907,19 @@ fn land() {
     for (lists, order) in old {
         crate::list::recycle(lists, &order);
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::landed(began.elapsed().as_nanos() as u64);
+}
+
+/// Since the last frame line, microseconds of [`Host::send_late`]: the
+/// submission prepared and sent ([`Host::submit`]); the line of flights
+/// told of it and the waits that asks for; the landed lists given back
+/// ([`land`]).
+static SENT_LATE_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`SENT_LATE_US`] per frame, in milliseconds, taken.
+pub(crate) fn sent_late_ms(frames: f64) -> [f64; 3] {
+    SENT_LATE_US.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames)
 }
 
 /// Of `landed`, the lists of flights that landed, oldest first: `ran` on
@@ -6067,6 +6082,7 @@ impl Host {
     }
 
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+        let began = std::time::Instant::now();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, parts, true).ahead
@@ -6076,6 +6092,8 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        let prepared = std::time::Instant::now();
+        SENT_LATE_US[0].fetch_add((prepared - began).as_micros() as u64, Ordering::Relaxed);
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
@@ -6118,8 +6136,11 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        let lined = std::time::Instant::now();
+        SENT_LATE_US[1].fetch_add((lined - prepared).as_micros() as u64, Ordering::Relaxed);
         let _landing = crate::timeline::span("landed lists reset and given back");
         land();
+        SENT_LATE_US[2].fetch_add(lined.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -7327,7 +7348,7 @@ impl HostList {
         // Reuse only after the old native commands have been discarded.
         drop(texture_backs);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+        crate::copystat::reset(started.elapsed().as_nanos() as u64);
     }
 
     /// Something changed in this list that bringing a draw's textures and

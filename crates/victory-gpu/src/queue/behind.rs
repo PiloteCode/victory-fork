@@ -620,6 +620,11 @@ impl Work for Job {
             Job::Signal(..) => "the line: a signal",
             _ => "the line: a wait that is met",
         });
+        let kind = match self {
+            Job::Run(..) | Job::Joined(..) => 0,
+            Job::Present(..) => 1,
+            _ => 2,
+        };
         if forced {
             STATS[FORCED].fetch_add(1, Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -679,9 +684,16 @@ impl Work for Job {
         }
         // (The mark was this submission's alone.)
         crate::port_journal::set_mark(0);
-        STATS[BUSY].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        let us = began.elapsed().as_micros() as u64;
+        STATS[BUSY].fetch_add(us, Relaxed);
+        KINDS_US[kind].fetch_add(us, Relaxed);
     }
 }
+
+/// Since the last frame-rate line: what our thread worked, in microseconds,
+/// by what it did: submissions (with what is joined to them), presents, the
+/// rest (signals, waits that went).
+static KINDS_US: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 static LANE: Lane<Job> = Lane::new();
 
@@ -961,6 +973,17 @@ pub(super) fn line(frames: f64) {
         s[DRAINS] / frames,
         s[FORCED] / frames,
         s[JOINED] / frames
+    );
+    let kinds = KINDS_US.each_ref().map(|k| k.swap(0, Relaxed) as f64 / 1000.0 / frames);
+    let [prepared, lined, landed] = crate::host::sent_late_ms(frames);
+    tracing::info!(
+        "the thread of ours that prepares submissions (\"victory-submit\"; the title's threads only put them in its line) \
+         worked per frame: submissions {:.1} ms (of them, on whatever thread sent them ahead: {prepared:.1} ms prepared and \
+         sent, from the call on, as \"preparing per frame\" splits it; {lined:.1} ms telling the line of flights and the waits \
+         that asks for; {landed:.1} ms giving back the landed lists), presents {:.1} ms, signals and waits that went {:.1} ms",
+        kinds[0],
+        kinds[1],
+        kinds[2],
     );
 }
 
