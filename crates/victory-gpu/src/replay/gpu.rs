@@ -8,6 +8,9 @@ use windows::core::{Interface, Result};
 
 use super::wire;
 
+/// Whether the replay names its lists and resources ([`Worker::name`]): with `--breadcrumbs`.
+pub(super) static NAMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Lists of our own on a queue, with a fence.
 pub(super) struct Worker {
     pub(super) device: ID3D12Device,
@@ -83,12 +86,126 @@ impl Worker {
 
     pub(super) fn wait(&self, value: u64) -> Result<()> {
         // SAFETY: our fence and event.
-        unsafe {
+        let removed = unsafe {
             if self.fence.GetCompletedValue() < value {
                 self.fence.SetEventOnCompletion(value, self.event)?;
                 WaitForSingleObject(self.event, INFINITE);
             }
             self.device.GetDeviceRemovedReason()
+        };
+        match removed {
+            Err(e) => {
+                let more = removal_report(&self.device);
+                Err(if more.is_empty() { e } else { windows::core::Error::new(e.code(), format!("{}{more}", e.message())) })
+            }
+            ok => ok,
+        }
+    }
+}
+
+/// What the device-removed data say of a removal, where they were turned on (the replay's
+/// `--breadcrumbs`): the faulting address and the allocations it lies in, by their names
+/// (`resource <id>` of the capture where the replay names them), and each list that started
+/// and did not finish (and the first that never started), by name (`frame list <n>` as
+/// `--only` counts them), with the command it stopped at and the kinds of the commands
+/// around it. Empty without them.
+pub(super) fn removal_report(device: &ID3D12Device) -> String {
+    let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
+        return String::new();
+    };
+    let op = |o: D3D12_AUTO_BREADCRUMB_OP| {
+        let named = [
+            (D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED, "draw"),
+            (D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED, "draw indexed"),
+            (D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT, "execute indirect"),
+            (D3D12_AUTO_BREADCRUMB_OP_DISPATCH, "dispatch"),
+            (D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH, "dispatch mesh"),
+            (D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION, "copy buffer"),
+            (D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION, "copy texture"),
+            (D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE, "copy resource"),
+            (D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW, "clear unordered view"),
+            (D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW, "clear target"),
+            (D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW, "clear depth"),
+            (D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER, "barrier"),
+            (D3D12_AUTO_BREADCRUMB_OP_BARRIER, "barrier (enhanced)"),
+            (D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA, "resolve query data"),
+            (D3D12_AUTO_BREADCRUMB_OP_WRITEBUFFERIMMEDIATE, "write buffer immediate"),
+            (D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE, "resolve"),
+        ];
+        named.iter().find(|(k, _)| *k == o).map_or_else(|| format!("op {}", o.0), |(_, n)| (*n).to_owned())
+    };
+    let mut text = String::new();
+    // SAFETY: the outputs are the runtime's, valid while the device lives; nodes are walked
+    // as linked, histories by their counts.
+    unsafe {
+        if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            && fault.PageFaultVA != 0
+        {
+            text.push_str(&format!("; page fault at {:#x}", fault.PageFaultVA));
+            for (what, head) in [
+                ("inside", fault.pHeadExistingAllocationNode),
+                ("inside freed", fault.pHeadRecentFreedAllocationNode),
+            ] {
+                let mut names = Vec::new();
+                let mut node = head;
+                while let Some(n) = node.as_ref()
+                    && names.len() < 8
+                {
+                    names.push(if n.ObjectNameW.is_null() {
+                        "unnamed".to_owned()
+                    } else {
+                        n.ObjectNameW.to_string().unwrap_or_default()
+                    });
+                    node = n.pNext;
+                }
+                if !names.is_empty() {
+                    text.push_str(&format!("; {what} {names:?}"));
+                }
+            }
+        }
+        let Ok(crumbs) = dred.GetAutoBreadcrumbsOutput() else {
+            return text;
+        };
+        let (mut node, mut unstarted) = (crumbs.pHeadAutoBreadcrumbNode, 0);
+        while let Some(p) = node.as_ref() {
+            node = p.pNext;
+            let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+            if done >= p.BreadcrumbCount || (done == 0 && unstarted > 0) {
+                unstarted += u32::from(done == 0);
+                continue;
+            }
+            unstarted += u32::from(done == 0);
+            let name = if p.pCommandListDebugNameW.is_null() {
+                "a list of ours".to_owned()
+            } else {
+                p.pCommandListDebugNameW.to_string().unwrap_or_default()
+            };
+            let around = if p.pCommandHistory.is_null() {
+                String::new()
+            } else {
+                let h = std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                let from = done.saturating_sub(3) as usize;
+                let to = (done as usize + 2).min(h.len());
+                let kinds: Vec<String> = (from..to).map(|i| format!("{i}: {}", op(h[i]))).collect();
+                format!(" ({})", kinds.join(", "))
+            };
+            text.push_str(&format!("; {name} stopped at command {done} of {}{around}", p.BreadcrumbCount));
+        }
+        if unstarted > 1 {
+            text.push_str(&format!("; {} more lists never started", unstarted - 1));
+        }
+    }
+    text
+}
+
+impl Worker {
+    /// Names an object of the replay's for the device-removed data (`--breadcrumbs`).
+    pub(super) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
+        if NAMED.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(object) = object.cast::<ID3D12Object>()
+        {
+            // SAFETY: a plain call on a live object.
+            let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
         }
     }
 

@@ -1180,6 +1180,10 @@ fn list_table(t: &mut [usize; hook::SLOTS]) {
         t,
         ID3D12GraphicsCommandList6_Vtbl.DispatchMesh = dispatch_mesh
     );
+    set!(
+        t,
+        ID3D12GraphicsCommandList7_Vtbl.Barrier = enhanced_barrier
+    );
     let _ = list_rest(t);
 }
 
@@ -1208,7 +1212,6 @@ fn list_rest(t: &mut [usize; hook::SLOTS]) -> &'static [(usize, &'static str)] {
         ID3D12GraphicsCommandList4_Vtbl.DispatchRays,
         ID3D12GraphicsCommandList5_Vtbl.RSSetShadingRate,
         ID3D12GraphicsCommandList5_Vtbl.RSSetShadingRateImage,
-        ID3D12GraphicsCommandList7_Vtbl.Barrier,
         ID3D12GraphicsCommandList8_Vtbl.OMSetFrontAndBackStencilRef,
         ID3D12GraphicsCommandList9_Vtbl.RSSetDepthBias,
         ID3D12GraphicsCommandList9_Vtbl.IASetIndexBufferStripCutValue,
@@ -1239,8 +1242,16 @@ pub(super) fn not_recorded_calls() -> Vec<(String, u64)> {
             all.push((what, hook::count(class, slot)));
         }
     }
+    all.push((
+        "command list method Barrier with texture or buffer barriers (enhanced) is not recorded, and was called".to_owned(),
+        ENHANCED_NOT_RECORDED.load(Ordering::Relaxed),
+    ));
     all
 }
+
+/// Calls of `ID3D12GraphicsCommandList7::Barrier` with groups other than global ones
+/// ([`enhanced_barrier`]).
+static ENHANCED_NOT_RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The recorder, for a call that is the host layer's and not our own, which
 /// succeeded.
@@ -2314,6 +2325,36 @@ unsafe extern "system" fn barrier(this: Ptr, n: u32, all: *const D3D12_RESOURCE_
                 .collect();
             Cmd::Barriers { all }
         });
+    }
+}
+
+/// `ID3D12GraphicsCommandList7::Barrier`. The host layer's only call of it is a global
+/// barrier, "everything before is done, and seen, before what follows" (`host/place.rs`,
+/// around copies it places in a list), whose stand-in where enhanced barriers are missing is
+/// an aliasing and an unordered-access barrier of no resource: recorded as that pair, which
+/// the replay sends as such. A call with texture or buffer barriers is not recorded (counted
+/// in the notes).
+unsafe extern "system" fn enhanced_barrier(this: Ptr, n: u32, groups: *const D3D12_BARRIER_GROUP) {
+    // SAFETY: as above; the caller's groups, `n` of them.
+    unsafe {
+        own!(this, ID3D12GraphicsCommandList7_Vtbl.Barrier)(this, n, groups);
+        let all = if groups.is_null() { &[][..] } else { std::slice::from_raw_parts(groups, n as usize) };
+        if all.iter().any(|g| g.Type != D3D12_BARRIER_TYPE_GLOBAL) {
+            ENHANCED_NOT_RECORDED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if all.iter().any(|g| g.NumBarriers > 0) {
+            note_change(this, |_| Cmd::Barriers {
+                all: vec![
+                    Barrier::Alias {
+                        flags: 0,
+                        before: NONE,
+                        after: NONE,
+                    },
+                    Barrier::Uav { flags: 0, res: NONE },
+                ],
+            });
+        }
     }
 }
 
