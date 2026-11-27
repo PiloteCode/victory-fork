@@ -23,7 +23,7 @@ it is.
 > anyone obtain a game: requests for game files, keys, dumps or links are
 > closed without an answer.
 
-## Where it stands (2026-11-27, version 0.13.0)
+## Where it stands (2026-11-27, version 0.13.1)
 
 Measured on one machine: Windows 11, GeForce RTX 5090 on a PCIe 5.0 x16 link,
 Core i9-14900KF, 128 GB of RAM, a 2560x1440 display, a diagnostics build, one
@@ -43,6 +43,7 @@ or load a save.
 | Stability | no crash and no device loss in eleven automated runs of this version; long sessions are not measured yet |
 | Memory | about 37 GB of private memory and 11-19 GB of video memory: 64 GB of RAM recommended |
 | Shaders | 25,953 of the 25,953 programs of the title's shader archive translate and validate for 32-lane GPUs |
+| Tests | more than 1,100 run on every push, the layer's and the translator's on the software adapter; the translator's whole suite also passes on the card (390 tests on an RTX 5090) |
 
 For comparison, 0.12.2 took 86.9 ms a frame in that scene on a quiet machine
 (with a capture of one frame in eight, which costs about 9 ms a frame: runs
@@ -200,6 +201,25 @@ Direct3D 12 without waiting for the card. The shader recompiler lowers GFX10
 (RDNA2) machine code to DXIL: wave operations, LDS memory, typed and raw
 buffers, images, mesh and geometry stages, ray-tracing structure walks. See
 [docs/architecture.md](docs/architecture.md).
+
+## Tests
+
+Every push and every pull request runs these on GitHub's Windows runners
+(`.github/workflows/ci.yml`; the same commands are in CONTRIBUTING.md):
+
+- the asset policy and the names check: `cargo run -p xtask -- policy`;
+- the release build, and clippy on the packages that are clean;
+- the tests of the packages that need no graphics adapter, and the runtime's:
+  `cargo test -p victory-hle -- --test-threads=1`;
+- the translator's and the layer's tests on the software adapter (WARP):
+  `VICTORY_WARP=1 cargo test -p victory-shader -- --test-threads=1` and
+  `VICTORY_D3D12_WARP=1 cargo test -p victory-gpu --features diagnostics -- --test-threads=1`.
+
+That is more than 1,100 tests. Eleven are skipped by name on the software
+adapter: nine because of the adapter (it orders signed zeros its own way, has
+waves of four lanes, refuses one pipeline and does not reject pixels outside
+the depth bounds), two of ours that still assume a default that changed. On a
+card the translator's whole suite passes (390 tests on an RTX 5090, 0.13.1).
 
 ## Benchmarks: measuring and reporting
 
