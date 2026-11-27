@@ -188,6 +188,13 @@ pub(super) fn copies(line: &Line) -> Vec<Writer> {
     flying.flat_map(Taken::copied).chain(landing).collect()
 }
 
+/// The title memory [`copies`] write, in order and joined.
+pub(super) fn copied_ranges(line: &Line) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    join_ranges(&mut ranges, copies(line).iter().map(|w| (w.from, w.to)));
+    ranges
+}
+
 /// Whether `runs` refresh another host copy of a destination in `copies`,
 /// or read it in a step that flights are not waited for otherwise
 /// (`Step::Host`): that reads title memory, where the copy is not yet.

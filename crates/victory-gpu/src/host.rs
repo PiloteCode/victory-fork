@@ -3678,6 +3678,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod cardsync;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -4263,11 +4264,26 @@ impl Host {
             None => 0,
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
+        let gathered = std::time::Instant::now();
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        cardsync::gathered(&dirty);
+        // (What flights in the air, or being landed, may write, and what
+        // copies done on the card write: the card's side may be newer there.)
+        let air = if cardsync::join_gap() > 0 {
+            let line = line();
+            let mut air = line.written.clone();
+            join_ranges(&mut air, card_steps::copied_ranges(&line));
+            air
+        } else {
+            Vec::new()
+        };
+        cardsync::join(&mut dirty, &air);
+        cardsync::spent(cardsync::AT_GATHER_US, gathered);
         gathering.end();
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
+        cardsync::STATS[cardsync::AT_SUBMISSIONS].fetch_add(1, Ordering::Relaxed);
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
         // A copy whose shader writes are declared for the first time gets
@@ -4289,8 +4305,11 @@ impl Host {
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
+        let taken = std::time::Instant::now();
         let own = if send::own() { send::take(self, &dirty) } else { None };
+        cardsync::spent(cardsync::AT_TAKE_US, taken);
         taking.end();
+        let listing = std::time::Instant::now();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4376,6 +4395,9 @@ impl Host {
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        if !declared.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                            cardsync::STATS[cardsync::AT_REHASH_UNDECLARED].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        }
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -4393,6 +4415,8 @@ impl Host {
             used.push((false, sync));
         }
         drop(order);
+        cardsync::spent(cardsync::AT_LIST_US, listing);
+        let comparing = std::time::Instant::now();
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4499,6 +4523,7 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
+        cardsync::spent(cardsync::AT_COMPARE_US, comparing);
         Some(plan)
     }
 
@@ -8903,6 +8928,7 @@ impl Meter {
                     per_frame(5),
                     per_frame(6) / 1e3
                 );
+                cardsync::log(frames);
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \

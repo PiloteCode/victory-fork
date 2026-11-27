@@ -314,6 +314,23 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// Since the last frame line: the runs of copies in the card's memory noted
+/// to go up, as they were noted (before any joining), by where they came
+/// from (the `NOTED_` places; `crate::host::cardsync` says them).
+pub(crate) static CARD_NOTED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// A refreshed range copied whole ([`Shadow::copy`]).
+const NOTED_COPIED: usize = 0;
+/// The words a refresh found changed (`Shadow::take`).
+const NOTED_WORDS: usize = 1;
+/// Pages of 4 KiB a landing had written that title memory has otherwise.
+const NOTED_LANDED: usize = 2;
+/// The title's bytes put in under flights' shader writes.
+const NOTED_UNDER: usize = 3;
+/// What shaders wrote, merged back without the relay ([`Shadow::card_merge`]).
+const NOTED_MERGED: usize = 4;
+/// Ranges sent again ([`Shadow::resend`]).
+const NOTED_AGAIN: usize = 5;
+
 pub(crate) fn live_span_bytes() -> u64 {
     CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
@@ -3591,7 +3608,7 @@ impl Shadow {
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
-                self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
+                self.card_changed_runs(NOTED_UNDER, runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
@@ -4009,7 +4026,7 @@ impl Shadow {
                         ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
                         held.copy_from_slice(title);
                         self.changed(at - start, next - start);
-                        self.card_changed(at - start, next - start);
+                        self.card_changed(NOTED_LANDED, at - start, next - start);
                     }
                     at = next;
                 }
@@ -4052,7 +4069,7 @@ impl Shadow {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
                 }
-                self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
+                self.card_changed_runs(NOTED_WORDS, runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
                 if let Some(was) = was {
                     crate::host::upcheck::note(self.id, at - start, &was, held);
                 }
@@ -4086,7 +4103,7 @@ impl Shadow {
         }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
-        self.card_changed(from - start, to - start);
+        self.card_changed(NOTED_COPIED, from - start, to - start);
         to - from
     }
 
@@ -4102,19 +4119,26 @@ impl Shadow {
         self.changes_only.store(true, Ordering::Relaxed);
     }
 
+    /// Whether shaders store in it what is not declared
+    /// ([`Shadow::keep_stores`]): its card side may hold their bytes anywhere.
+    pub(crate) fn stores_kept(&self) -> bool {
+        self.changes_only.load(Ordering::Relaxed)
+    }
+
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
     pub(crate) fn resend(&self, from: usize, to: usize) {
-        self.card_changed(from, to);
+        self.card_changed(NOTED_AGAIN, from, to);
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
-    /// card's side before the next submission.
-    fn card_changed(&self, from: usize, to: usize) {
-        self.card_changed_runs(std::iter::once((from, to)));
+    /// card's side before the next submission. `source` is where the change
+    /// came from ([`CARD_NOTED`]).
+    fn card_changed(&self, source: usize, from: usize, to: usize) {
+        self.card_changed_runs(source, std::iter::once((from, to)));
     }
 
     /// [`Shadow::card_changed`] of each of `runs`.
-    fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
+    fn card_changed_runs(&self, source: usize, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
             return;
         };
@@ -4122,8 +4146,10 @@ impl Shadow {
         if runs.peek().is_none() {
             return;
         }
+        let mut noted = 0;
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         for (from, to) in runs {
+            noted += 1;
             match dirty.last_mut() {
                 Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
                 _ => dirty.push((from, to)),
@@ -4131,6 +4157,8 @@ impl Shadow {
         }
         // (Under the lock: what takes the list sees it or finds it set.)
         card.touched.store(true, Ordering::Release);
+        drop(dirty);
+        CARD_NOTED[source].fetch_add(noted, Ordering::Relaxed);
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4344,7 +4372,7 @@ impl Shadow {
             old.copy_from_slice(gpu);
         }
         // The card's side and its "before" take the result.
-        self.card_changed(at, at + n);
+        self.card_changed(NOTED_MERGED, at, at + n);
         written
     }
 
