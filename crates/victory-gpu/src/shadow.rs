@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+pub(crate) mod placement;
 pub(crate) mod wanted;
 
 /// A title buffer's host copy.
@@ -239,6 +240,17 @@ fn card_limits() -> (u64, u64) {
         {
             min_bytes = kib << 10;
         }
+        // What shaders touch on the card's side (`placement`), where no
+        // switch of its own says a size.
+        let mut max_bytes = max_bytes;
+        if let Some(set) = placement::set() {
+            if env_mb("VICTORY_CARD_BUFFERS_MIN_MB").is_none() && std::env::var_os("VICTORY_CARD_BUFFERS_MIN_KB").is_none() {
+                min_bytes = set.buffers_least;
+            }
+            if env_mb("VICTORY_CARD_BUFFERS_MB").is_none() {
+                max_bytes = set.buffers_most;
+            }
+        }
         if card_all() {
             min_bytes = 0;
         }
@@ -322,6 +334,22 @@ pub(crate) fn card_room_kept() -> u64 {
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
+    // With `placement` the totals are its own, sized for the card, windows
+    // with them; kept up to what they came to with every title buffer and
+    // window on the card (1.3 GB of buffers; the windows filled 2 GB), for
+    // the same reason as above.
+    if placement::set().is_some() {
+        const BUFFERS_SEEN: u64 = 3 << 29;
+        const WINDOWS_SEEN: u64 = 2 << 30;
+        let buffers = card_limits()
+            .1
+            .min(BUFFERS_SEEN)
+            .saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed));
+        let windows = window_card_most().max(window_mapped_most()).min(WINDOWS_SEEN).saturating_sub(
+            WINDOW_CARD_BYTES.load(Ordering::Relaxed) + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed),
+        );
+        return buffers + windows;
+    }
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
@@ -492,9 +520,25 @@ fn card_room_for(size: u64, any_size: bool) -> Option<ID3D12Resource> {
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // (With `placement`: where the card's memory cannot be written through
+    // the bus.)
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        placement::mb_or("VICTORY_CARD_WINDOWS_MB", |set| if windows_through_bus() { 0 } else { set.windows_most })
+            .unwrap_or(0)
     })
+}
+
+/// Whether the CPU can write card memory it maps (`placement`'s choice for
+/// windows).
+fn windows_through_bus() -> bool {
+    host().is_some_and(|h| h.mapped_card_memory())
+}
+
+/// Up to which hundredth of the card's budget a window goes there: while a
+/// fifth is free, or with `placement` up to 97 hundredths, as a title
+/// buffer's copy whose room the texture queue kept (`card_room_kept`).
+fn windows_hundredths() -> u64 {
+    if placement::set().is_some() && card_room_kept_on() { 97 } else { 80 }
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
@@ -530,8 +574,11 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// [`window_room_for`], which this comes before.
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // (With `placement`: where the card's memory can be written through the
+    // bus.)
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        placement::mb_or("VICTORY_WINDOWS_BAR_MB", |set| if windows_through_bus() { set.windows_most } else { 0 })
+            .unwrap_or(0)
     })
 }
 
@@ -547,7 +594,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * windows_hundredths()
     {
         return None;
     }
@@ -583,7 +630,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * windows_hundredths()
     {
         return None;
     }
