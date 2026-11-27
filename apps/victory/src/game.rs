@@ -1,8 +1,9 @@
 //! Where the game is, and the profile it is played with: what `play`,
 //! `bench`, `check` and `doctor` share.
 //!
-//! The executable is looked for in this order: `--game`, `VICTORY_GAME_DIR`,
-//! the config file's `[paths] game_dir` (`victory.toml`; the environment
+//! The executable is looked for in this order: `--game`, `PILOTEBOX_GAME_DIR`
+//! (or `VICTORY_GAME_DIR`), the config file's `[paths] game_dir`
+//! (`pilotebox.toml` or `victory.toml`; the environment
 //! takes its place when set, as for every path of the config), then beside
 //! this program and in each folder above it (the folder above the
 //! repository, for a program built in it), then in the working folder and
@@ -61,18 +62,19 @@ pub(crate) struct Profile {
     /// The console profile: x is Series X (the default), s is Series S.
     #[arg(long, value_enum, default_value_t = Mode::X)]
     pub mode: Mode,
-    /// Turns the ray-tracing structure builder on (VICTORY_BVH_BUILDER=1).
+    /// Turns the ray-traced light's structure builder on
+    /// (PILOTEBOX_BVH_BUILDER=1): for looking, not for playing yet.
     #[arg(long)]
     pub rt: bool,
     /// The play defaults without their newest ways
-    /// (VICTORY_PLAY_DEFAULTS=safe): the first thing to try when something
+    /// (PILOTEBOX_PLAY_DEFAULTS=safe): the first thing to try when something
     /// is wrong.
     #[arg(long)]
     pub safe: bool,
-    /// The game's executable, or its folder. Default: VICTORY_GAME_DIR, then
-    /// victory.toml's [paths] game_dir, then a game_scarlett_master.exe
-    /// beside this program or in a folder above it (the one above the
-    /// repository).
+    /// The title's executable, or its folder. Default: PILOTEBOX_GAME_DIR,
+    /// then the config file's [paths] game_dir (pilotebox setup writes it),
+    /// then the title's executable beside this program or in a folder above
+    /// it (the one above the repository).
     #[arg(long, value_name = "PATH")]
     pub game: Option<PathBuf>,
 }
@@ -107,7 +109,7 @@ impl Profile {
 pub(crate) struct Places {
     /// `--game`: an executable or a folder.
     pub arg: Option<PathBuf>,
-    /// `VICTORY_GAME_DIR`.
+    /// `PILOTEBOX_GAME_DIR`, which start-up copies to `VICTORY_GAME_DIR`.
     pub env: Option<PathBuf>,
     /// The config file's `[paths] game_dir` (when the environment sets none).
     pub config: Option<PathBuf>,
@@ -173,13 +175,13 @@ pub(crate) fn find(places: &Places) -> Result<Found> {
         return match exe_in(arg) {
             Some(exe) => Ok(found(&exe, "--game".into(), Vec::new())),
             None => bail!(
-                "--game {}: no game there (no {DEFAULT_EXE}, and no {MANIFEST} naming an executable that is there)",
+                "--game {}: no game there (neither the title's executable nor a {MANIFEST} naming one that is there)",
                 arg.display()
             ),
         };
     }
     let mut notes = Vec::new();
-    for (place, from) in [(&places.env, "VICTORY_GAME_DIR"), (&places.config, "victory.toml's [paths] game_dir")] {
+    for (place, from) in [(&places.env, "PILOTEBOX_GAME_DIR"), (&places.config, "the config file's [paths] game_dir")] {
         let Some(place) = place else { continue };
         let exe = if place.is_file() { Some(place.clone()) } else { exe_in(place) };
         match exe {
@@ -193,9 +195,9 @@ pub(crate) fn find(places: &Places) -> Result<Found> {
         }
     }
     let mut message = format!(
-        "no game found: pass --game <its executable or folder>, set VICTORY_GAME_DIR, set [paths] game_dir in \
-         victory.toml (see victory.example.toml), or keep this program in a folder under the game's (a \
-         {DEFAULT_EXE} is looked for beside it and in each folder above it)"
+        "no game found: run `pilotebox setup --game <the title's executable or folder>` (it writes pilotebox.toml), \
+         or set PILOTEBOX_GAME_DIR, or keep this program in a folder under the title's (the title's executable \
+         is looked for beside it and in each folder above it)"
     );
     for note in &notes {
         message.push_str("; ");
@@ -307,7 +309,7 @@ mod tests {
         // Then the environment, then the config.
         places.arg = None;
         let found = find(&places).unwrap();
-        assert_eq!((found.exe, found.from.as_str()), (at("env").join(DEFAULT_EXE), "VICTORY_GAME_DIR"));
+        assert_eq!((found.exe, found.from.as_str()), (at("env").join(DEFAULT_EXE), "PILOTEBOX_GAME_DIR"));
         places.env = None;
         let found = find(&places).unwrap();
         assert_eq!(found.exe, at("cfg").join(DEFAULT_EXE));
@@ -331,7 +333,7 @@ mod tests {
         let found = find(&places).unwrap();
         assert_eq!(found.exe, at("top").join(DEFAULT_EXE));
         assert_eq!(found.notes.len(), 1);
-        assert!(found.notes[0].starts_with("VICTORY_GAME_DIR is "), "{:?}", found.notes);
+        assert!(found.notes[0].starts_with("PILOTEBOX_GAME_DIR is "), "{:?}", found.notes);
     }
 
     #[test]
@@ -349,7 +351,8 @@ mod tests {
         }
         // Nowhere: the message says what to do.
         let error = find(&Places::default()).unwrap_err().to_string();
-        assert!(error.contains("--game") && error.contains("VICTORY_GAME_DIR") && error.contains("victory.toml"));
+        assert!(error.contains("--game") && error.contains("PILOTEBOX_GAME_DIR") && error.contains("pilotebox setup"));
+        assert!(!error.contains(DEFAULT_EXE));
     }
 
     #[test]

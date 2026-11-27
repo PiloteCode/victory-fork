@@ -11,10 +11,13 @@ use crate::sys::gb;
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Doctor {
-    /// The game's executable, or its folder (default: found as `play` finds
-    /// it).
+    /// The title's executable, or its folder (default: found as `play`
+    /// finds it).
     #[arg(long, value_name = "PATH")]
     pub game: Option<PathBuf>,
+    /// Prints the checks as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,7 +28,7 @@ pub(crate) enum Level {
 }
 
 impl Level {
-    fn word(self) -> &'static str {
+    pub(crate) fn word(self) -> &'static str {
         match self {
             Level::Ok => "OK",
             Level::Warning => "warning",
@@ -112,6 +115,35 @@ fn card() -> Result<Card, String> {
 #[cfg(not(windows))]
 fn card() -> Result<Card, String> {
     Err("no Direct3D 12 on this system".into())
+}
+
+/// The graphics card's name, short (`RTX 5090`), from the system's list of
+/// adapters alone (no device is made).
+#[cfg(windows)]
+pub(crate) fn card_name() -> Option<String> {
+    use windows::Win32::Graphics::Dxgi::*;
+    // SAFETY: plain DXGI queries.
+    let desc = unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        factory.EnumAdapters1(0).ok()?.GetDesc1().ok()?
+    };
+    let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+    Some(short_card(&String::from_utf16_lossy(&desc.Description[..len])))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn card_name() -> Option<String> {
+    None
+}
+
+/// A card's name without its maker's marks: `NVIDIA GeForce RTX 5090` is
+/// `RTX 5090`.
+fn short_card(name: &str) -> String {
+    let mut out = name.to_owned();
+    for mark in ["NVIDIA ", "GeForce ", "AMD ", "(TM)", "(R)", "(tm)", "(r)"] {
+        out = out.replace(mark, "");
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A driver version as the system counts it (`a.b.c.d`), and for NVIDIA
@@ -244,6 +276,20 @@ fn cache_check(cache: &Path) -> Check {
 /// Every check, the card's first.
 pub(crate) fn checks(game_arg: Option<&Path>) -> Vec<Check> {
     let mut out = card_checks();
+    out.push(match victory_core::Config::load() {
+        Ok(cfg) if cfg.legacy => check(Level::Warning, "folders", crate::play::legacy_note(&cfg).unwrap_or_default()),
+        Ok(cfg) => check(
+            Level::Ok,
+            "folders",
+            format!(
+                "data {}, cache {}{}",
+                cfg.data_dir.display(),
+                cfg.cache_dir.display(),
+                cfg.source.as_ref().map_or_else(String::new, |s| format!(", config {}", s.display()))
+            ),
+        ),
+        Err(_) => check(Level::Problem, "folders", "the config could not be read (see the config line)"),
+    });
     out.push(if crate::sys::avx2() {
         check(Level::Ok, "processor", "AVX2")
     } else {
@@ -323,19 +369,40 @@ pub(crate) fn print(checks: &[Check]) {
     }
 }
 
+/// What the worst of `checks` means, in one sentence.
+pub(crate) fn verdict(checks: &[Check]) -> &'static str {
+    match checks.iter().map(|c| c.level).max().unwrap_or(Level::Ok) {
+        Level::Ok => "Everything needed is there.",
+        Level::Warning => "Ready, with the warnings above.",
+        Level::Problem => "Not ready: see the problems above.",
+    }
+}
+
+/// `checks` as a JSON array.
+pub(crate) fn json(checks: &[Check]) -> String {
+    let items: Vec<String> = checks
+        .iter()
+        .map(|c| {
+            format!(
+                "{{\"level\": {}, \"name\": {}, \"text\": {}}}",
+                crate::bench::json_string(c.level.word()),
+                crate::bench::json_string(c.name),
+                crate::bench::json_string(&c.text)
+            )
+        })
+        .collect();
+    format!("[\n  {}\n]", items.join(",\n  "))
+}
+
 pub(crate) fn run(d: Doctor) -> Result<()> {
-    println!("{} doctor", victory_core::product::banner());
     let checks = checks(d.game.as_deref());
+    if d.json {
+        println!("{}", json(&checks));
+        return Ok(());
+    }
+    println!("{}", victory_core::product::heading("doctor"));
     print(&checks);
-    let worst = checks.iter().map(|c| c.level).max().unwrap_or(Level::Ok);
-    println!(
-        "{}",
-        match worst {
-            Level::Ok => "Everything needed is there.",
-            Level::Warning => "Ready, with the warnings above.",
-            Level::Problem => "Not ready: see the problems above.",
-        }
-    );
+    println!("{}", verdict(&checks));
     Ok(())
 }
 
@@ -360,6 +427,23 @@ mod tests {
         assert!(fallen.text.starts_with("generation 1 (the card's best: 5), x16: below 4"), "{}", fallen.text);
         assert_eq!(pcie("[N/A], [N/A], 16").level, Level::Warning);
         assert_eq!(pcie_check(Some(0x1002)).level, Level::Ok);
+    }
+
+    #[test]
+    fn card_names_lose_their_makers_marks() {
+        assert_eq!(short_card("NVIDIA GeForce RTX 5090"), "RTX 5090");
+        assert_eq!(short_card("AMD Radeon RX 7900 XTX"), "Radeon RX 7900 XTX");
+        assert_eq!(short_card("Intel(R) Arc(TM) A770 Graphics"), "Intel Arc A770 Graphics");
+    }
+
+    #[test]
+    fn checks_read_as_json() {
+        let checks = [check(Level::Warning, "disk", "12.0 GB \"free\"")];
+        assert_eq!(
+            json(&checks),
+            "[\n  {\"level\": \"warning\", \"name\": \"disk\", \"text\": \"12.0 GB \\\"free\\\"\"}\n]"
+        );
+        assert_eq!(verdict(&checks), "Ready, with the warnings above.");
     }
 
     #[test]
