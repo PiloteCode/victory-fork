@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod names;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,23 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Print the hash `policy` looks names up by, for each text given (a
+    /// word or a phrase, made as `names.rs` says), to add to its list.
+    NamesHash {
+        texts: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::NamesHash { texts } => {
+            for text in texts {
+                println!("{}", names::hash_of(&text));
+            }
+            Ok(())
+        }
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

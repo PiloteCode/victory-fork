@@ -21,6 +21,24 @@ pub(crate) struct Check {
     /// Keys pressed by script, as for bench.
     #[arg(long, value_name = "KEYS")]
     pub keys: Option<String>,
+    /// Prints the outcome as JSON at the end: doctor's checks, the bench's
+    /// report, each condition and the verdict (the progress goes to stderr).
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The outcome as JSON.
+fn json(checks: &[doctor::Check], outcome: Option<&Outcome>, verdict: &[(bool, String)], pass: bool) -> String {
+    let conditions: Vec<String> = verdict
+        .iter()
+        .map(|(ok, text)| format!("{{\"ok\": {ok}, \"text\": {}}}", bench::json_string(text)))
+        .collect();
+    format!(
+        "{{\n\"pass\": {pass},\n\"conditions\": [{}],\n\"doctor\": {},\n\"bench\": {}\n}}\n",
+        conditions.join(", "),
+        doctor::json(checks),
+        outcome.map_or_else(|| "null".to_owned(), |o| o.report.json().trim_end().to_owned())
+    )
 }
 
 /// DXGI_ERROR_DEVICE_REMOVED, the code a run ends with when the card goes.
@@ -59,25 +77,43 @@ pub(crate) fn verdict(outcome: &Outcome) -> Vec<(bool, String)> {
 }
 
 pub(crate) fn run(c: Check) -> Result<()> {
-    println!("{} check", victory_core::product::banner());
     let checks = doctor::checks(c.profile.game.as_deref());
-    doctor::print(&checks);
     if checks.iter().any(|c| c.level == Level::Problem) {
-        println!("FAIL: doctor found a problem (above); no run was started");
+        let why = "doctor found a problem; no run was started".to_owned();
+        if c.json {
+            print!("{}", json(&checks, None, &[(false, why)], false));
+        } else {
+            println!("{}", victory_core::product::heading("check"));
+            doctor::print(&checks);
+            println!("FAIL: {why} (fix what is above, then check again)");
+        }
         std::process::exit(1);
     }
-    println!();
+    if !c.json {
+        println!("{}", victory_core::product::heading("check"));
+        doctor::print(&checks);
+        println!();
+    }
     let outcome = bench::measure(&Options {
         seconds: c.seconds,
         label: format!("check-{}", c.profile.label()),
         profile: c.profile,
         keep_data: false,
         keys: c.keys,
+        json: c.json,
     })?;
+    let verdict = verdict(&outcome);
+    let pass = verdict.iter().all(|(ok, _)| *ok);
+    if c.json {
+        print!("{}", json(&checks, Some(&outcome), &verdict, pass));
+        if !pass {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     println!();
     print!("{}", outcome.report.text());
     println!();
-    let verdict = verdict(&outcome);
     for (ok, text) in &verdict {
         line(if *ok { "ok" } else { "FAILED" }, text);
     }
@@ -99,11 +135,11 @@ pub(crate) fn run(c: Check) -> Result<()> {
     for file in &outcome.files {
         line("written", file.display());
     }
-    if verdict.iter().all(|(ok, _)| *ok) {
+    if pass {
         println!("PASS");
         Ok(())
     } else {
-        println!("FAIL");
+        println!("FAIL: see the FAILED lines above, and the log named there (pilotebox report makes a bug report of it)");
         std::process::exit(1);
     }
 }
@@ -135,6 +171,7 @@ mod tests {
             code,
             summary: tally.summary(None),
             problem_lines: Vec::new(),
+            card: None,
         };
         Outcome { report, tally, files: Vec::new() }
     }

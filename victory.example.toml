@@ -1,19 +1,21 @@
-# Copy to `victory.toml` (git-ignored) and point it at YOUR files.
-# Every path must be OUTSIDE the repository; the tools refuse otherwise.
-# Environment variables (shown below) take precedence over this file.
-# VICTORY_CONFIG selects a different config file.
+# Copy to `pilotebox.toml` (or upstream's `victory.toml`; both git-ignored)
+# and point it at YOUR files, or let `pilotebox setup` write one in
+# %LOCALAPPDATA%\PiloteBox. Every path must be OUTSIDE the repository; the
+# tools refuse otherwise. Environment variables (shown below) take
+# precedence over this file; each PILOTEBOX_ name also works as VICTORY_.
+# PILOTEBOX_CONFIG selects a different config file.
 
 [paths]
-# Your own dump of the title.     env: VICTORY_GAME_DIR
-game_dir = 'D:\victory-data\game'
+# Your own dump of the title.     env: PILOTEBOX_GAME_DIR
+game_dir = 'D:\pilotebox-data\game'
 
-# Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
-# cache_dir = 'D:\victory-data\cache'
+# Derived data. Default: %LOCALAPPDATA%\PiloteBox\cache.   env: PILOTEBOX_CACHE_DIR
+# cache_dir = 'D:\pilotebox-data\cache'
 
 # What titles save (persistent local storage), kept apart from the cache.
-# Default: %LOCALAPPDATA%\victory\data.   env: VICTORY_DATA_DIR
-# data_dir = 'D:\victory-data\data'
+# Default: %LOCALAPPDATA%\PiloteBox\data.   env: PILOTEBOX_DATA_DIR
+# data_dir = 'D:\pilotebox-data\data'
 
 # Other Xbox Series titles used to test platform-level code.
-# env: VICTORY_TEST_TITLES (separated by ';')
+# env: PILOTEBOX_TEST_TITLES (separated by ';')
 test_titles = []

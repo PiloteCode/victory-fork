@@ -166,6 +166,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             problems.push(format!("looks like a {what}"));
         }
     }
+    if !content.contains(&0) {
+        for line in crate::names::hits(content) {
+            problems.push(format!(
+                "line {line}: a name that must not be in the tree (the asset policy: say \"the title\")"
+            ));
+        }
+    }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
     } else if let Some(run) = longest_encoded_run(content)

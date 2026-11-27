@@ -30,12 +30,13 @@ pub(crate) const DEFAULT_KEYS: &str = "30:Enter,40:Enter,50:Enter,60:Enter,70:En
 const GRACE: Duration = Duration::from_secs(20);
 
 pub(crate) const AFTER_HELP: &str = "\
-The figures are the layer's own frame lines (victory_gpu::host, logged at info level by every build: \
-one second's frames, every five seconds); bench asks the run for them whatever VICTORY_LOG says. The \
+The figures are the layer's own frame lines (gpu::host, logged at info level by every build: one \
+second's frames, every five seconds); bench asks the run for them whatever PILOTEBOX_LOG says. The \
 dropped draws' reasons are logged by diagnostics builds only \
 (cargo build --profile diag -p victory --features diagnostics). Means are over the intervals of the \
 world (1,000 draws a frame or more) with no pipeline being made. The report (.md, .json and the whole \
-.log) goes to a bench folder beside the cache folder: %LOCALAPPDATA%\\victory\\bench by default.";
+.log) goes to a bench folder beside the cache folder: %LOCALAPPDATA%\\PiloteBox\\bench by default. \
+The last line is a one-line summary to paste into an issue.";
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Bench {
@@ -52,11 +53,14 @@ pub(crate) struct Bench {
     /// copy of it.
     #[arg(long)]
     pub keep_data: bool,
-    /// Keys pressed by script (VICTORY_KEYS: seconds:key,...), or none.
-    /// Default: VICTORY_KEYS if set, else Enter every ten seconds from 30 s to
-    /// 90 s.
+    /// Keys pressed by script (PILOTEBOX_KEYS: seconds:key,...), or none.
+    /// Default: PILOTEBOX_KEYS if set, else Enter every ten seconds from 30 s
+    /// to 90 s.
     #[arg(long, value_name = "KEYS")]
     pub keys: Option<String>,
+    /// Prints the report as JSON at the end (the progress goes to stderr).
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// What a measured run is asked to be.
@@ -67,6 +71,8 @@ pub(crate) struct Options {
     pub label: String,
     pub keep_data: bool,
     pub keys: Option<String>,
+    /// The progress to stderr, stdout being kept for JSON.
+    pub json: bool,
 }
 
 impl From<Bench> for Options {
@@ -78,8 +84,23 @@ impl From<Bench> for Options {
             profile: b.profile,
             keep_data: b.keep_data,
             keys: b.keys,
+            json: b.json,
         }
     }
+}
+
+/// Prints progress: to stdout, or to stderr when stdout is for JSON.
+fn say(json: bool, text: impl std::fmt::Display) {
+    if json {
+        eprintln!("{text}");
+    } else {
+        println!("{text}");
+    }
+}
+
+/// One line of a block, as [`line`] prints it, by [`say`].
+fn say_line(json: bool, label: &str, value: impl std::fmt::Display) {
+    say(json, format_args!("  {label:<11}{value}"));
 }
 
 /// A label made fit for a file name.
@@ -98,7 +119,7 @@ pub(crate) fn sanitize(label: &str) -> String {
 
 /// The folder reports go to: beside the cache folder.
 pub(crate) fn reports_dir(cfg: &victory_core::Config) -> PathBuf {
-    cfg.cache_dir.with_file_name("bench")
+    crate::state::beside_cache(cfg, "bench")
 }
 
 /// A copy of the data folder in a temporary folder, removed when dropped.
@@ -184,10 +205,12 @@ pub(crate) struct Report {
     pub code: Option<i32>,
     pub summary: Summary,
     pub problem_lines: Vec<(Problem, Vec<String>)>,
+    /// The graphics card, short (`RTX 5090`).
+    pub card: Option<String>,
 }
 
 /// A count with thousands set apart: 5,123.
-fn thousands(n: f64) -> String {
+pub(crate) fn thousands(n: f64) -> String {
     let digits = format!("{:.0}", n.max(0.0));
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -206,6 +229,54 @@ fn code_text(code: i32) -> String {
 }
 
 impl Report {
+    /// The run in one line, for an issue or a table: `PiloteBox 0.12.2 |
+    /// RTX 5090 | Series X | 4,800 draws | 84.3 ms (11.9 fps) | card 75 %
+    /// busy | 5 min, no crash`.
+    pub(crate) fn one_line(&self) -> String {
+        let s = &self.summary;
+        let mut parts = vec![format!("{} {}", victory_core::product::NAME, victory_core::product::VERSION)];
+        parts.extend(self.card.clone());
+        let mut mode = self.mode.name().to_owned();
+        for switch in &self.switches {
+            match switch.as_str() {
+                "VICTORY_BVH_BUILDER=1" => mode.push_str(" --rt"),
+                "VICTORY_PLAY_DEFAULTS=safe" => mode.push_str(" --safe"),
+                _ => {}
+            }
+        }
+        parts.push(mode);
+        if self.build != "release" {
+            parts.push(format!("{} build", self.build));
+        }
+        if s.measured > 0 {
+            parts.push(format!("{} draws", thousands(s.draws)));
+            parts.push(format!("{:.1} ms ({:.1} fps)", s.ms, s.fps));
+            if let Some(c) = s.clock {
+                parts.push(format!("card {:.0} % busy", c.busy));
+            }
+        } else if s.reached_world {
+            parts.push("the world reached, nothing measured".to_owned());
+        } else {
+            parts.push("the world not reached".to_owned());
+        }
+        let length =
+            if self.ran >= 120.0 { format!("{:.0} min", self.ran / 60.0) } else { format!("{:.0} s", self.ran) };
+        let problems: Vec<&str> =
+            Problem::ALL.iter().zip(s.problems).filter(|(_, n)| *n > 0).map(|(p, _)| p.name()).collect();
+        let how = match (problems.is_empty(), self.ended) {
+            (true, Ended::ByItself) => "ended by itself".to_owned(),
+            (true, _) => "no crash".to_owned(),
+            (false, _) => problems.join(", "),
+        };
+        parts.push(format!("{length}, {how}"));
+        parts.join(" | ")
+    }
+
+    /// The switches by the names the user knows.
+    fn shown_switches(&self) -> Vec<String> {
+        self.switches.iter().map(|s| victory_core::product::shown(s)).collect()
+    }
+
     pub(crate) fn ended_text(&self) -> String {
         let code = self.code.map_or_else(|| "no exit code".to_owned(), code_text);
         match self.ended {
@@ -221,7 +292,8 @@ impl Report {
         let mut rows = vec![
             ("when", self.when.clone()),
             ("mode", self.mode.name().to_owned()),
-            ("switches", if self.switches.is_empty() { "the play defaults".to_owned() } else { self.switches.join(" ") }),
+            ("switches", if self.switches.is_empty() { "the play defaults".to_owned() } else { self.shown_switches().join(" ") }),
+            ("card", self.card.clone().unwrap_or_else(|| "not known".to_owned())),
             ("build", self.build.to_owned()),
             ("game", self.game.clone()),
             ("data", self.data.clone()),
@@ -298,11 +370,13 @@ impl Report {
         rows
     }
 
+    /// The summary as printed; the one-line summary last.
     pub(crate) fn text(&self) -> String {
         let mut out = format!("{} bench {}\n", victory_core::product::NAME, self.label);
         for (label, value) in self.rows() {
             out.push_str(&format!("  {label:<16}{value}\n"));
         }
+        out.push_str(&format!("\n{}\n", self.one_line()));
         out
     }
 
@@ -318,6 +392,7 @@ impl Report {
         for (label, value) in self.rows() {
             out.push_str(&format!("| {} | {} |\n", cell(label.trim()), cell(&value)));
         }
+        out.push_str(&format!("\nIn one line:\n\n    {}\n", self.one_line()));
         for (p, lines) in &self.problem_lines {
             out.push_str(&format!("\n## {}\n\n```\n", p.name()));
             for l in lines {
@@ -336,10 +411,12 @@ impl Report {
         let list = |items: &[String]| items.iter().map(|i| json_string(i)).collect::<Vec<_>>().join(", ");
         let mut fields: Vec<(&str, String)> = vec![
             ("product", json_string(&format!("{} {}", victory_core::product::NAME, victory_core::product::VERSION))),
+            ("line", json_string(&self.one_line())),
             ("label", json_string(&self.label)),
             ("when", json_string(&self.when)),
+            ("card", self.card.as_deref().map_or_else(|| "null".to_owned(), json_string)),
             ("mode", json_string(self.mode.name())),
-            ("switches", format!("[{}]", list(&self.switches))),
+            ("switches", format!("[{}]", list(&self.shown_switches()))),
             ("build", json_string(self.build)),
             ("game", json_string(&self.game)),
             ("data", json_string(&self.data)),
@@ -412,7 +489,7 @@ impl Report {
 }
 
 /// `s` as a JSON string.
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -507,21 +584,25 @@ pub(crate) fn measure(o: &Options) -> Result<Outcome> {
         None => Some(std::env::var("VICTORY_KEYS").unwrap_or_else(|_| DEFAULT_KEYS.to_owned())),
     };
     let switches: Vec<String> = o.profile.switches().iter().map(|(n, v, _)| format!("{n}={v}")).collect();
+    let card = crate::doctor::card_name();
 
-    println!("{}", victory_core::product::banner());
-    line("bench", format!("{} s, {}", o.seconds, o.label));
-    line("mode", o.profile.mode.name());
-    line("game", format!("{} ({})", found.exe.display(), found.from));
-    for note in &found.notes {
-        line("note", note);
+    let json = o.json;
+    say(json, victory_core::product::heading(&format!("bench {}", o.label)));
+    say_line(json, "length", format!("{} s, then the window is closed", o.seconds));
+    say_line(json, "mode", o.profile.mode.name());
+    say_line(json, "card", card.as_deref().unwrap_or("not known"));
+    say_line(json, "game", format!("{} ({})", found.exe.display(), found.from));
+    for note in found.notes.iter().cloned().chain(crate::play::legacy_note(&cfg)) {
+        say_line(json, "note", note);
     }
-    line("data", &data);
-    line("cache", cfg.cache_dir.display());
-    line("keys", keys.as_deref().unwrap_or("none"));
+    say_line(json, "data", &data);
+    say_line(json, "cache", cfg.cache_dir.display());
+    say_line(json, "keys", keys.as_deref().unwrap_or("none"));
     if !switches.is_empty() {
-        line("switches", switches.join(" "));
+        let shown: Vec<String> = switches.iter().map(|s| victory_core::product::shown(s)).collect();
+        say_line(json, "switches", shown.join(" "));
     }
-    line("log", log_path.display());
+    say_line(json, "log", log_path.display());
 
     let mut command = Command::new(std::env::current_exe().context("finding this program")?);
     command.arg("run").arg(&found.exe).arg("--execute");
@@ -577,21 +658,27 @@ pub(crate) fn measure(o: &Options) -> Result<Outcome> {
                 let seen = tally.feed(&text);
                 let at = started.elapsed().as_secs_f64();
                 match (stream, seen) {
-                    (Stream::Out, _) => println!("  | {text}"),
+                    (Stream::Out, _) => say(json, format_args!("  | {text}")),
                     (_, Seen::Frame) => {
                         let i = tally.intervals.last().expect("a frame line was just read");
                         let first = i.world() && !world;
                         world |= i.world();
-                        println!(
-                            "  {at:>5.0} s  {:>5.1} fps {:>7.1} ms/frame {:>6} draws, dropped {}{}",
-                            i.fps,
-                            i.ms,
-                            thousands(i.draws),
-                            thousands(i.dropped),
-                            if first { "  <- the world" } else { "" }
+                        say(
+                            json,
+                            format_args!(
+                                "  {at:>5.0} s  {:>5.1} fps {:>7.1} ms/frame {:>6} draws, dropped {}{}",
+                                i.fps,
+                                i.ms,
+                                thousands(i.draws),
+                                thousands(i.dropped),
+                                if first { "  <- the world" } else { "" }
+                            ),
                         );
                     }
-                    (_, Seen::Problem(p)) => println!("  {at:>5.0} s  {}: {}", p.name(), text.chars().take(200).collect::<String>()),
+                    (_, Seen::Problem(p)) => say(
+                        json,
+                        format_args!("  {at:>5.0} s  {}: {}", p.name(), text.chars().take(200).collect::<String>()),
+                    ),
                     _ => {}
                 }
             }
@@ -602,12 +689,12 @@ pub(crate) fn measure(o: &Options) -> Result<Outcome> {
                     let asked = crate::sys::close_windows(target);
                     closing = Some(Instant::now());
                     if asked > 0 {
-                        println!("  {at:>5.0} s  time is up: the window is asked to close");
+                        say(json, format_args!("  {at:>5.0} s  time is up: the window is asked to close"));
                         continue;
                     }
-                    println!("  {at:>5.0} s  time is up, and the run has no window to close: it is ended");
+                    say(json, format_args!("  {at:>5.0} s  time is up, and the run has no window to close: it is ended"));
                 } else if !killed {
-                    println!("  {at:>5.0} s  the run did not close in {} s: it is ended", GRACE.as_secs());
+                    say(json, format_args!("  {at:>5.0} s  the run did not close in {} s: it is ended", GRACE.as_secs()));
                 } else {
                     // Its output is held by something else: done all the same.
                     break;
@@ -627,7 +714,7 @@ pub(crate) fn measure(o: &Options) -> Result<Outcome> {
     let ran = started.elapsed().as_secs_f64();
     let _ = log.flush();
     if by_itself {
-        println!("  {ran:>5.0} s  the run ended by itself");
+        say(json, format_args!("  {ran:>5.0} s  the run ended by itself"));
     }
     // Ends a run that kept going after its output closed.
     if !matches!(child.try_wait(), Ok(Some(_))) && !by_itself {
@@ -675,6 +762,7 @@ pub(crate) fn measure(o: &Options) -> Result<Outcome> {
             .map(|p| (*p, tally.lines(*p).to_vec()))
             .collect(),
         summary,
+        card,
     };
     let mut files = Vec::new();
     for (extension, text) in [("md", report.markdown()), ("json", report.json())] {
@@ -688,13 +776,26 @@ pub(crate) fn measure(o: &Options) -> Result<Outcome> {
 }
 
 pub(crate) fn run(b: Bench) -> Result<()> {
-    let outcome = measure(&Options::from(b))?;
+    let options = Options::from(b);
+    let outcome = measure(&options)?;
+    if options.json {
+        for (i, file) in outcome.files.iter().enumerate() {
+            say_line(true, if i == 0 { "written" } else { "" }, file.display());
+        }
+        print!("{}", outcome.report.json());
+        return Ok(());
+    }
     println!();
-    print!("{}", outcome.report.text());
+    let text = outcome.report.text();
+    let (summary, one_line) = text.trim_end().rsplit_once('\n').unwrap_or((&text, ""));
+    println!("{}", summary.trim_end());
     println!();
     for (i, file) in outcome.files.iter().enumerate() {
         line(if i == 0 { "written" } else { "" }, file.display());
     }
+    // Last, to paste into an issue.
+    println!();
+    println!("{one_line}");
     Ok(())
 }
 
@@ -729,6 +830,7 @@ mod tests {
             code: Some(0),
             problem_lines: vec![(Problem::PipelineRefused, tally.lines(Problem::PipelineRefused).to_vec())],
             summary: tally.summary(None),
+            card: Some("RTX 5090".into()),
         }
     }
 
@@ -746,9 +848,37 @@ mod tests {
             "the card about ",
             "pipeline refused (1 lines)",
             "its window closed after 301 s",
+            "switches        PILOTEBOX_BVH_BUILDER=1",
+            "card            RTX 5090",
         ] {
             assert!(text.contains(wanted), "{wanted:?} not in\n{text}");
         }
+    }
+
+    #[test]
+    fn the_run_fits_in_one_line() {
+        let mut r = report();
+        let ms = (6.1 * 163.4 + 10.5 * 94.8) / 16.6;
+        let busy = (6.1 * 31.0 + 10.5 * 0.0) / 6.1;
+        assert_eq!(
+            r.one_line(),
+            format!(
+                "PiloteBox 0.12.2 | RTX 5090 | Series X --rt | 2,182 draws | {ms:.1} ms ({:.1} fps) | card {busy:.0} % busy | \
+                 5 min, pipeline refused",
+                1000.0 / ms
+            )
+        );
+        assert!(r.text().trim_end().ends_with(&r.one_line()));
+        assert!(r.json().contains(&format!("\"line\": {}", json_string(&r.one_line()))));
+        // A short run that never reached the world, cleanly.
+        r.summary = Tally::default().summary(None);
+        r.ran = 90.0;
+        r.card = None;
+        r.build = "diagnostics";
+        assert_eq!(
+            r.one_line(),
+            "PiloteBox 0.12.2 | Series X --rt | diagnostics build | the world not reached | 90 s, no crash"
+        );
     }
 
     #[test]
