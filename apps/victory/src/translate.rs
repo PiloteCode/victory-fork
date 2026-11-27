@@ -879,6 +879,19 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         "\tc_d16={d16}\tc_d16_image={d16_image}\tc_d16_image_load={d16_image_load}\thalf_views={}",
         shader.half_views.len()
     ));
+    // The table places it uses buffers with atomics through and writes, the tables it picks
+    // such buffers from at run time (`HostShader::atomic_views` and its kin), and how many of
+    // its buffer atomics and stores each kind of place covers (`emit::VIEW_CENSUS`: the
+    // program this thread lowered last, the same in every form).
+    line.push_str(&format!(
+        "\tatomic_views={}\twritten_views={}\tpicked_views={}",
+        shader.atomic_views.len(),
+        shader.written_views.len(),
+        shader.picked_views.len()
+    ));
+    for (name, n) in emit::VIEW_CENSUS.iter().zip(emit::take_view_census()) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
     line.push('\n');
     let _ = lock(out).write_all(line.as_bytes());
 }
