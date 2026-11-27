@@ -229,7 +229,7 @@ fn code_text(code: i32) -> String {
 }
 
 impl Report {
-    /// The run in one line, for an issue or a table: `PiloteBox 0.12.2 |
+    /// The run in one line, for an issue or a table: `PiloteBox 0.13.0 |
     /// RTX 5090 | Series X | 4,800 draws | 84.3 ms (11.9 fps) | card 75 %
     /// busy | 5 min, no crash`.
     pub(crate) fn one_line(&self) -> String {
@@ -863,7 +863,7 @@ mod tests {
         assert_eq!(
             r.one_line(),
             format!(
-                "PiloteBox 0.12.2 | RTX 5090 | Series X --rt | 2,182 draws | {ms:.1} ms ({:.1} fps) | card {busy:.0} % busy | \
+                "PiloteBox 0.13.0 | RTX 5090 | Series X --rt | 2,182 draws | {ms:.1} ms ({:.1} fps) | card {busy:.0} % busy | \
                  5 min, pipeline refused",
                 1000.0 / ms
             )
@@ -877,7 +877,7 @@ mod tests {
         r.build = "diagnostics";
         assert_eq!(
             r.one_line(),
-            "PiloteBox 0.12.2 | Series X --rt | diagnostics build | the world not reached | 90 s, no crash"
+            "PiloteBox 0.13.0 | Series X --rt | diagnostics build | the world not reached | 90 s, no crash"
         );
     }
 

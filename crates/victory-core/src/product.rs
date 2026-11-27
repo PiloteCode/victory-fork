@@ -21,8 +21,10 @@ pub const DESCRIPTION: &str = "plays Xbox Series titles natively on Windows";
 
 /// The fork's version: its wave, then the steps since (0.12: the new layer;
 /// 0.12.1: mouths and shaders; 0.12.2: the upscaler's containers and the
-/// commands for playing). The crates keep the workspace's version.
-pub const VERSION: &str = "0.12.2";
+/// commands for playing; 0.13.0: avatarmanz's newer layer, TaynanGT's tree,
+/// title buffers placed on the card's side and the settle's cause). The
+/// crates keep the workspace's version.
+pub const VERSION: &str = "0.13.0";
 
 /// The prefix of the switches as the user sets them.
 pub const PREFIX: &str = "PILOTEBOX_";
@@ -82,8 +84,8 @@ mod tests {
     #[test]
     fn the_banner_names_the_product() {
         let banner = banner();
-        assert!(banner.starts_with("PiloteBox 0.12.2 | "), "{banner}");
-        assert_eq!(heading("doctor"), "PiloteBox 0.12.2 | doctor");
+        assert!(banner.starts_with("PiloteBox 0.13.0 | "), "{banner}");
+        assert_eq!(heading("doctor"), "PiloteBox 0.13.0 | doctor");
         assert!(BINARY.chars().all(|c| c.is_ascii_lowercase()));
     }
 
