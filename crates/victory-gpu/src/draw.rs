@@ -1920,6 +1920,11 @@ impl State {
         writes: bool,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
+        let _asking = crate::shadow::wanted::asking(if writes {
+            crate::shadow::wanted::Use::Written
+        } else {
+            crate::shadow::wanted::Use::Read
+        });
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
             std::env::var("VICTORY_ROOT_UAV_MB")
@@ -3663,6 +3668,7 @@ impl State {
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+        let _asking = crate::shadow::wanted::asking(crate::shadow::wanted::by_kind(Some(u.kind)));
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -3954,6 +3960,7 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
+                        let _asking = crate::shadow::wanted::asking(crate::shadow::wanted::by_kind(used.map(|u| u.kind)));
                         let twin = if twin_here {
                             crate::descriptor::half_views::half_view(&view)
                         } else {

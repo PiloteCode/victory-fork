@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+pub(crate) mod wanted;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -94,6 +96,9 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    /// A bind that wanted it in the card's memory found it in the PC's
+    /// (`wanted::found`, counted once).
+    wanted_noted: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -363,8 +368,8 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = card_room_for(size);
+fn card_for(size: u64, any_size: bool) -> Option<ID3D12Resource> {
+    let there = card_room_for(size, any_size);
     if there.is_some() || !card_all() || size >= 1 << 30 {
         return there;
     }
@@ -392,13 +397,14 @@ fn card_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
 }
 
-/// [`card_for`] in the card's own memory.
-fn card_room_for(size: u64) -> Option<ID3D12Resource> {
+/// [`card_for`] in the card's own memory; `any_size`: under the least size
+/// too ([`wanted`]).
+fn card_room_for(size: u64, any_size: bool) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
+    if (size < least && !any_size) || size >= 1 << 30 {
         return None;
     }
     let host = host()?;
@@ -3009,6 +3015,7 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            wanted_noted: Default::default(),
             mapped: false,
             place: None,
         }
@@ -4924,7 +4931,11 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    let shadow = lookup(address, len, false);
+    if let Some(shadow) = &shadow {
+        wanted::found(shadow);
+    }
+    shadow
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -5003,7 +5014,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && (size >= card_limits().0 || card_all());
+        // (Or one a shader's atomics or stores want there: `wanted`.)
+        let wanted = wanted::made_on_card(len);
+        let big = cards() && (size >= card_limits().0 || card_all() || wanted);
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -5012,8 +5025,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, card) = match card_for(size, wanted) {
             Some(on_card) => {
+                if wanted && size < card_limits().0 {
+                    wanted::made(len);
+                }
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
