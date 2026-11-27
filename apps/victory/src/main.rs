@@ -1,15 +1,27 @@
-//! `victory`: the command-line front end.
+//! `pilotebox` (the `victory` package): the command-line front end.
 //!
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
+//!
+//! The commands for playing (`play`, `bench`, `check`, `doctor`, `clean`)
+//! come first; the developers' (`run`, `shaders`, `warm`, `translate`,
+//! `replay` and the others) stay as upstream has them.
 
+mod bench;
 mod census;
+mod check;
+mod clean;
 mod defaults;
+mod doctor;
+mod frames;
+mod game;
 mod inspect;
+mod play;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
 mod shader;
+mod sys;
 mod translate;
 mod translate_diff;
 #[cfg(windows)]
@@ -19,21 +31,44 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+
+use victory_core::product;
+
+/// Under the commands in `--help`.
+const AFTER_HELP: &str = "\
+First time: `pilotebox doctor`, then `pilotebox play`. A benchmark: `pilotebox bench`. \
+Every VICTORY_* switch of the layer still works as it is.";
 
 #[derive(Parser)]
 #[command(
-    name = "victory",
-    version,
-    about = "Run an Xbox Series title natively on Windows"
+    name = product::BINARY,
+    version = product::VERSION,
+    about = product::banner(),
+    after_help = AFTER_HELP
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Plays the game, found with no path to type (Series X unless --mode s).
+    Play(play::Play),
+    /// A timed run that ends by itself, then its figures, printed and written
+    /// beside the cache folder.
+    #[command(after_help = bench::AFTER_HELP)]
+    Bench(bench::Bench),
+    /// Checks this PC: card, driver, PCIe link, processor, memory, disk,
+    /// cache, the game's files, other runs.
+    Doctor(doctor::Doctor),
+    /// doctor, then a short bench on a copy of the data folder, ending with
+    /// PASS or FAIL.
+    Check(check::Check),
+    /// Lists what in the cache folder is old and removes it with --yes. Never
+    /// the data folder.
+    Clean(clean::Clean),
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
         file: PathBuf,
@@ -194,19 +229,33 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    let first = std::env::args().nth(1);
     // The switches the title is played with, before anything reads them
     // (`defaults`).
-    if std::env::args().nth(1).as_deref() == Some("run") {
+    if first.as_deref() == Some("run") {
+        println!("{}", product::banner());
         defaults::apply();
     }
-    victory_core::logging::init("info");
+    // The checks print their own lines: the layer's, opening the card, are
+    // left out unless they warn.
+    let quiet = matches!(first.as_deref(), Some("doctor" | "check" | "clean"));
+    victory_core::logging::init(if quiet { "warn" } else { "info" });
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        return Ok(());
+    };
+    match command {
+        Command::Play(options) => play::run(options),
+        Command::Bench(options) => bench::run(options),
+        Command::Doctor(options) => doctor::run(options),
+        Command::Check(options) => check::run(options),
+        Command::Clean(options) => clean::run(options),
         Command::Inspect {
             file,
             imports,
@@ -326,11 +375,78 @@ mod tests {
     use super::*;
 
     fn jobs(args: &[&str]) -> Result<Option<usize>, clap::Error> {
-        let all = [&["victory", "translate", "shaders"][..], args].concat();
+        let all = [&["pilotebox", "translate", "shaders"][..], args].concat();
         match Cli::try_parse_from(all)?.command {
-            Command::Translate { jobs, .. } => Ok(jobs.map(NonZeroUsize::get)),
+            Some(Command::Translate { jobs, .. }) => Ok(jobs.map(NonZeroUsize::get)),
             _ => unreachable!(),
         }
+    }
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        let all = [&["pilotebox"][..], args].concat();
+        Ok(Cli::try_parse_from(all)?.command.expect("a command"))
+    }
+
+    #[test]
+    fn the_cli_is_valid_and_named() {
+        Cli::command().debug_assert();
+        assert_eq!(Cli::command().get_name(), "pilotebox");
+        assert!(Cli::try_parse_from(["pilotebox"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn play_takes_a_mode_by_name() {
+        let Command::Play(p) = parse(&["play"]).unwrap() else { panic!() };
+        assert_eq!((p.profile.mode, p.profile.rt, p.profile.safe, p.profile.game), (game::Mode::X, false, false, None));
+        let Command::Play(p) = parse(&["play", "--mode", "s", "--rt", "--safe", "--game", r"D:\g", "--", "-x=1"]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(p.profile.mode, game::Mode::S);
+        assert!(p.profile.rt && p.profile.safe && !p.crash_log);
+        assert_eq!(p.profile.game, Some(PathBuf::from(r"D:\g")));
+        assert_eq!(p.title_args, ["-x=1"]);
+        // The long names too; nothing else.
+        assert!(matches!(parse(&["play", "--mode", "series-s"]), Ok(Command::Play(p)) if p.profile.mode == game::Mode::S));
+        assert!(parse(&["play", "--mode", "one"]).is_err());
+    }
+
+    #[test]
+    fn bench_check_and_clean_take_their_options() {
+        let Command::Bench(b) = parse(&["bench"]).unwrap() else { panic!() };
+        assert_eq!((b.seconds, b.keep_data, b.name.as_deref(), b.keys.as_deref()), (300, false, None, None));
+        let Command::Bench(b) =
+            parse(&["bench", "--seconds", "120", "--mode", "s", "--rt", "--name", "A b", "--keep-data", "--keys", "none"])
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!((b.seconds, b.keep_data, b.keys.as_deref()), (120, true, Some("none")));
+        let options = bench::Options::from(b);
+        assert_eq!(options.label, "A-b");
+        let Command::Bench(b) = parse(&["bench", "--rt"]).unwrap() else { panic!() };
+        assert_eq!(bench::Options::from(b).label, "series-x-rt");
+        assert!(parse(&["bench", "--seconds", "soon"]).is_err());
+        let Command::Check(c) = parse(&["check"]).unwrap() else { panic!() };
+        assert_eq!(c.seconds, 90);
+        let Command::Check(c) = parse(&["check", "--seconds", "30"]).unwrap() else { panic!() };
+        assert_eq!(c.seconds, 30);
+        let Command::Clean(c) = parse(&["clean"]).unwrap() else { panic!() };
+        assert!(!c.all && !c.yes);
+        let Command::Clean(c) = parse(&["clean", "--all", "--yes"]).unwrap() else { panic!() };
+        assert!(c.all && c.yes);
+        assert!(matches!(parse(&["doctor"]), Ok(Command::Doctor(d)) if d.game.is_none()));
+    }
+
+    #[test]
+    fn run_keeps_its_interface() {
+        let Command::Run { exe, execute, console, .. } =
+            parse(&["run", r"D:\g\t.exe", "--execute", "--console", "series-s"]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(exe, PathBuf::from(r"D:\g\t.exe"));
+        assert!(execute && matches!(console, Console::SeriesS));
     }
 
     #[test]
