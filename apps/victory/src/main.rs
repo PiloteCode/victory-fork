@@ -464,6 +464,33 @@ mod tests {
     }
 
     #[test]
+    fn the_new_commands_take_their_options() {
+        let Command::Setup(s) = parse(&["setup", "--game", r"D:\g", "--no-shaders", "--jobs", "4"]).unwrap() else {
+            panic!()
+        };
+        assert_eq!((s.game, s.no_shaders, s.jobs), (Some(PathBuf::from(r"D:\g")), true, Some(4)));
+        assert!(matches!(parse(&["migrate"]), Ok(Command::Migrate(m)) if !m.yes));
+        assert!(matches!(parse(&["migrate", "--yes"]), Ok(Command::Migrate(m)) if m.yes));
+        assert!(matches!(parse(&["report"]), Ok(Command::Report(r)) if r.game.is_none()));
+        assert!(matches!(parse(&["doctor", "--json"]), Ok(Command::Doctor(d)) if d.json));
+        assert!(matches!(parse(&["bench", "--json"]), Ok(Command::Bench(b)) if b.json));
+        assert!(matches!(parse(&["check", "--json", "--mode", "s"]), Ok(Command::Check(c)) if c.json && c.profile.mode == game::Mode::S));
+        assert!(matches!(parse(&["play", "--crash-log"]), Ok(Command::Play(p)) if p.crash_log));
+    }
+
+    #[test]
+    fn the_status_screen_lists_every_command_once() {
+        let cli = Cli::command();
+        let names: Vec<&str> = cli.get_subcommands().map(|c| c.get_name()).collect();
+        for name in status::PLAYING {
+            assert!(names.contains(&name), "{name}");
+        }
+        // The playing commands come first in --help too.
+        assert_eq!(&names[..status::PLAYING.len()], &["setup", "play", "bench", "check", "doctor", "clean", "migrate", "report"]);
+        assert!(names.contains(&"run") && names.contains(&"shaders") && names.contains(&"warm"));
+    }
+
+    #[test]
     fn run_keeps_its_interface() {
         let Command::Run { exe, execute, console, .. } =
             parse(&["run", r"D:\g\t.exe", "--execute", "--console", "series-s"]).unwrap()

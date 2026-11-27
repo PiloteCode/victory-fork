@@ -194,10 +194,10 @@ pub(crate) fn find(places: &Places) -> Result<Found> {
             return Ok(found(&exe, format!("found {how}"), notes));
         }
     }
-    let mut message = format!(
+    let mut message = String::from(
         "no game found: run `pilotebox setup --game <the title's executable or folder>` (it writes pilotebox.toml), \
          or set PILOTEBOX_GAME_DIR, or keep this program in a folder under the title's (the title's executable \
-         is looked for beside it and in each folder above it)"
+         is looked for beside it and in each folder above it)",
     );
     for note in &notes {
         message.push_str("; ");
