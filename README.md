@@ -38,7 +38,7 @@ or load a save.
 | Playable | yes: a new game's opening and the prologue |
 | Series X profile (full quality) | 68.0 ms a frame (14.7 fps) in the prologue's first playable scene, about 4,850 draws a frame, with title buffers on the card (the default on NVIDIA); 89.2 ms (11.2 fps) with the placement of before. Not 30 fps yet. One four-minute run each, while other builds ran |
 | The card's work (Series X) | 53.8 ms a frame by command with the placement of before, 26.6 ms with every title buffer and the windows on the card's side |
-| Series S profile (lighter, upscaled) | shows a picture since 0.12.2; its frame time is being measured again (44 ms a frame before the upscaler's passes ran) |
+| Series S profile (lighter, upscaled) | shows a picture since 0.12.2; 60.6 ms a frame (16.5 fps) in 0.13.0, one run in the same scene: the same thread of the processor's side bounds it |
 | Ray-traced indirect light (`--rt`) | runs, far too slow to play with today |
 | Stability | no crash and no device loss in eleven automated runs of this version; long sessions are not measured yet |
 | Memory | about 37 GB of private memory and 11-19 GB of video memory: 64 GB of RAM recommended |
@@ -66,9 +66,6 @@ Known to be wrong:
 
 - Textures of what just came into view appear late: skin and clothes can stay
   grey for seconds.
-- Mouths in cutscenes: the fix (16-bit typed buffers moved as integers) is in
-  0.12.1 and passes its tests on the card; it is not yet confirmed in a
-  cutscene.
 - Rooms with little direct light are too dark without `--rt`.
 - The first run after a build or a driver update stutters while the driver
   makes its pipelines.
@@ -125,7 +122,7 @@ pilotebox check                                 # is this build and this PC all 
 | Mode | What you get | What it costs |
 |---|---|---|
 | `--mode x` (default) | The Series X profile: the title's full quality. | 68.0 ms a frame (14.7 fps) on an RTX 5090 in the prologue's first playable scene. |
-| `--mode s` | The Series S profile: a 960x540 scene upscaled by the title's own upscaler. Softer, and much lighter on the card. | Being measured; the fast mode while the Series X profile is brought to 30 fps. |
+| `--mode s` | The Series S profile: a 960x540 scene upscaled by the title's own upscaler. Softer, and much lighter on the card. | 60.6 ms a frame (16.5 fps) in 0.13.0, one run; the fast mode while the Series X profile is brought to 30 fps. |
 | `--rt` | The title's ray-traced indirect light: the structure builder and the walks. | With the walks really running, a tester measured 333-425 ms a frame on an RTX 4070 SUPER. For looking, not for playing. |
 | `--safe` | The layer's older, slower ways. | Slower; use it to tell a bug of the speed-ups from a bug of the layer. |
 

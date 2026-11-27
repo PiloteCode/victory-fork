@@ -105,12 +105,19 @@ the frame line names.
 - It shows a picture since 0.12.2: the upscaler's 20 programs translate.
 - The scene is drawn at 960x540 in our captures, so this is the fast, soft
   mode.
-- Before the upscaler's passes ran it took 44 ms a frame; with them it is
-  not measured on a quiet machine yet.
+- In 0.13.0, one run in the same scene (the process at high priority while
+  other builds ran): 60.6 ms a frame (16.5 fps), about 4,440 draws a frame,
+  the card with work queued 60 % of the frame. The thread of ours that
+  prepares submissions worked 54.4 ms: the same bound as the Series X
+  profile, so this profile gains little until that thread is cut (track 1).
+- One poster in the scene shows as a flat patch of colour where the Series X
+  profile shows its print: a texture's detail is missing there.
 
 **Next:**
-- Measure the profile on a quiet machine.
-- Compare its picture with the Series X profile's.
+- Track 1 first: it bounds both profiles.
+- Compare the picture with the Series X profile's, texture by texture.
+- PC upscaling in place of the title's own (switches from TaynanGT's tree,
+  off; they need libraries the user supplies).
 
 ## 5. The ray-traced light
 
@@ -127,12 +134,15 @@ the frame line names.
 - Look at the structure builder's own passes.
 - Try a cheaper stand-in for the indirect light (`VICTORY_AMBIENT`).
 
-## 6. Mouths: fixed in 0.12.1, to confirm in a cutscene
+## 6. Mouths: fixed in 0.12.1, confirmed in 0.13.0
 
 16-bit typed buffer accesses through a table's places now move their bits as
 unsigned integers (`VICTORY_HALF_BITS`, on; a port of fxceless #927). On the
 card every one of the 65,536 patterns now comes back, where the old form
-read zeros. Still to confirm in a cutscene.
+read zeros. Confirmed in 0.13.0 on an RTX 5090: in a new game's opening
+cutscene, three captures eight frames apart show a face with its mouth
+closed, open in speech, and closed again, with the eyes moving too and clean
+skin. `VICTORY_HALF_BITS=0` gives the old translation for comparison.
 
 ## Also on the way
 

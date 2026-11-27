@@ -37,6 +37,15 @@ For reference:
 - Wave 13's layer took 171 ms before its structured-view rule went behind a
   switch.
 
+Also run with this version, one run each:
+- **A new game's opening**, seven minutes from an empty data folder: no
+  device loss, no error, and **mouths move in the cutscene** (three captures
+  eight frames apart show a face with its mouth closed, open in speech, and
+  closed again). That confirms 0.12.1's fix.
+- **The Series S profile**: 60.6 ms a frame (16.5 fps) over 29 lines of five
+  seconds, about 4,440 draws a frame, the card with work queued 60 % of the
+  frame, the same thread of ours working 54.4 ms.
+
 **The card is no longer the bound: it waits for us 23 ms a frame. The
 processor is.**
 - One thread of ours prepares the title's submissions and sends them. It
