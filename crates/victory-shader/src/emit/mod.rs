@@ -1368,7 +1368,7 @@ fn emit_program(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.make_comparison();
                 }
                 s
             })
@@ -2471,7 +2471,7 @@ mod static_sampler_tests {
             assert_eq!(shader.samplers, [WORDS, WORDS], "cmp_first {cmp_first}");
             let plain = StaticSampler::from_words(WORDS);
             let mut cmp = plain;
-            cmp.filter |= 0x80;
+            cmp.make_comparison();
             let want = if cmp_first { [cmp, plain] } else { [plain, cmp] };
             assert_eq!(shader.static_samplers, want, "cmp_first {cmp_first}");
             #[cfg(windows)]

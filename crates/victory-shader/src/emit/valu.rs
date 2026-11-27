@@ -618,7 +618,7 @@ impl Lower<'_> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc).copied() {
+                let mut acc = match self.floats.get(&acc).copied() {
                     Some(x) => x,
                     None => match self.raw_float(acc) {
                         Some(x) => x,
@@ -628,6 +628,15 @@ impl Lower<'_> {
                         }
                     },
                 };
+                // In VOP3, bit 2 of abs and neg is the accumulator's (the third source, which
+                // is the destination): RDNA 2 computes fma(a, b, -d) and fma(a, b, |d|).
+                if v.abs >> 2 & 1 != 0 {
+                    acc = self.unary(6, acc);
+                }
+                if v.neg >> 2 & 1 != 0 {
+                    let z = self.s.m.f32(0x8000_0000);
+                    acc = self.s.m.bin(c, Bin::Sub, z, acc);
+                }
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
@@ -641,6 +650,11 @@ impl Lower<'_> {
                 };
                 float(self, r)
             }
+            // v_mad_legacy_f32 (VOP3 0x140) and v_mac_legacy_f32 (VOP2 0x06) are unfused, as on
+            // GFX10.1. GFX10.3 reuses both encodings for the fused v_fma_legacy_f32 and
+            // v_fmac_legacy_f32, and in the same step drops v_mad_f32, v_mac_f32, v_madak_f32
+            // and v_madmk_f32. The title's programs use those last four (about 400,000 times
+            // in over 7,000 programs), so the console keeps the GFX10.1 family.
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let m = if name == "v_mad_legacy_f32" {
