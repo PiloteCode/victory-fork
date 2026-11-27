@@ -14,8 +14,11 @@
 //! So a copy is made on the card, whatever its size, when the bind that asks
 //! for it knows that a shader does atomics on it (`VICTORY_CARD_ATOMIC=1`), or
 //! stores to it and it is under `VICTORY_CARD_WRITTEN_KB` (0: none). The bind
-//! says so while it asks ([`asking`]); a copy made earlier for another
-//! use stays where it is, and is counted.
+//! knows it from the places the translator names (`HostShader::atomic_views`,
+//! `written_views`, `picked_views`; `draw::TablePlan::with_uses`) and says so
+//! while it asks ([`asking`]); a copy made earlier for another use stays where
+//! it is, and is counted. Or (`VICTORY_CARD_UNORDERED_KB`) a copy goes there
+//! when it is made if the title made the buffer to allow unordered access.
 
 use super::*;
 use std::cell::Cell;

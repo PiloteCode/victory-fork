@@ -30,6 +30,10 @@ pub(crate) struct TablePlan {
     // Direct entries can interleave slots. Preserve their declaration order
     // when recording resource reads, writes, and transitions.
     direct: Vec<(usize, usize)>,
+    /// The root views (by root parameter) the shader does atomics on and
+    /// stores to ([`TablePlan::with_uses`]).
+    root_atomic: Vec<u8>,
+    root_written: Vec<u8>,
 }
 
 struct TableGroup {
@@ -109,18 +113,38 @@ impl TablePlan {
             // first; review on #927): the table reaches them.
             group.max_dword = group.half.iter().fold(group.max_dword, |m, &at| m.max(at));
         }
-        Self { groups, direct }
+        Self { groups, direct, root_atomic: Vec::new(), root_written: Vec::new() }
     }
 
-    /// The plan with what the shader does to the buffers of its tables:
-    /// `HostShader::atomic_views`, `written_views` and `picked_views`.
+    /// The plan with what the shader does to the buffers of its tables and
+    /// root views: `HostShader::atomic_views`, `written_views` (a root view
+    /// as dword `emit::ROOT_VIEW`) and `picked_views`.
     pub(crate) fn with_uses(mut self, atomic: &[(u8, u32)], written: &[(u8, u32)], picked: &[(u8, u8)]) -> Self {
+        use victory_shader::emit::ROOT_VIEW;
+        let in_table = |places: &[(u8, u32)], slot: u8| -> Vec<u32> {
+            places.iter().filter(|p| p.0 == slot && p.1 != ROOT_VIEW).map(|p| p.1).collect()
+        };
         for group in &mut self.groups {
-            group.atomic = atomic.iter().filter(|p| p.0 == group.slot).map(|p| p.1).collect();
-            group.written = written.iter().filter(|p| p.0 == group.slot).map(|p| p.1).collect();
+            group.atomic = in_table(atomic, group.slot);
+            group.written = in_table(written, group.slot);
             group.picked = picked.iter().filter(|p| p.0 == group.slot).fold(0, |bits, p| bits | p.1);
         }
+        let roots = |places: &[(u8, u32)]| -> Vec<u8> { places.iter().filter(|p| p.1 == ROOT_VIEW).map(|p| p.0).collect() };
+        self.root_atomic = roots(atomic);
+        self.root_written = roots(written);
         self
+    }
+
+    /// What the shader does with the buffer of its root view at `slot`.
+    pub(crate) fn root_use(&self, slot: u8) -> crate::shadow::wanted::Use {
+        use crate::shadow::wanted::Use;
+        if self.root_atomic.contains(&slot) {
+            Use::Atomic
+        } else if self.root_written.contains(&slot) {
+            Use::Written
+        } else {
+            Use::Read
+        }
     }
 }
 
@@ -1928,6 +1952,7 @@ impl State {
                         None
                     }
                 };
+                let _asking = crate::shadow::wanted::asking(t.tables.root_use(slot));
                 if !self.root_uav(list, address, param, compute, writes) {
                     return false;
                 }
@@ -1959,11 +1984,6 @@ impl State {
         writes: bool,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
-        let _asking = crate::shadow::wanted::asking(if writes {
-            crate::shadow::wanted::Use::Written
-        } else {
-            crate::shadow::wanted::Use::Read
-        });
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
             std::env::var("VICTORY_ROOT_UAV_MB")
@@ -5240,5 +5260,11 @@ mod use_tests {
         assert_eq!(group(4).use_of(0, Some(ResourceType::Uav)), Use::Written);
         assert_eq!(group(4).use_of(8, Some(ResourceType::Srv)), Use::Read);
         assert_eq!(group(4).use_of(8, None), Use::Read);
+        // Root views, named by their parameter alone.
+        let root = victory_shader::emit::ROOT_VIEW;
+        let plan = TablePlan::new(&used, &[], &[]).with_uses(&[(2, root)], &[(2, root), (3, root), (5, 0)], &[]);
+        assert_eq!((plan.root_use(2), plan.root_use(3), plan.root_use(7)), (Use::Atomic, Use::Written, Use::Read));
+        // (A root view's place is no table's.)
+        assert_eq!(plan.groups.iter().find(|g| g.slot == 5).unwrap().written, [0]);
     }
 }
