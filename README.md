@@ -36,23 +36,25 @@ or load a save.
 | Menus, videos, loading screens | yes, 30 fps |
 | In the world | yes |
 | Playable | yes: a new game's opening and the prologue |
-| Series X profile (full quality) | 68.0 ms a frame (14.7 fps) in the prologue's first playable scene, about 4,850 draws a frame, with title buffers on the card (the default on NVIDIA); 89.2 ms (11.2 fps) with the placement of before. Not 30 fps yet. One four-minute run each, while other builds ran |
+| Series X profile (full quality) | 46.6 and 48.8 ms a frame (21.5 and 20.5 fps) in the prologue's first playable scene, about 4,850 draws a frame; 0.13.0 took 53.7 and 53.8 ms in the same session, and the placement of before 0.13.0 about 85 ms. Not 30 fps yet. Measured as two runs of four minutes each, alternated, the median frame of each run's last minute, the process at high priority, no captures, another program drawing on the card |
 | The card's work (Series X) | 53.8 ms a frame by command with the placement of before, 26.6 ms with every title buffer and the windows on the card's side |
-| Series S profile (lighter, upscaled) | shows a picture since 0.12.2; 60.6 ms a frame (16.5 fps) in 0.13.0, one run in the same scene: the same thread of the processor's side bounds it |
+| Series S profile (lighter, upscaled) | shows a picture since 0.12.2; 60.6 ms a frame (16.5 fps) in 0.13.0, one run in the same scene with captures on (about 9 ms a frame of that run): the same thread of the processor's side bounds it |
 | Ray-traced indirect light (`--rt`) | runs, far too slow to play with today |
 | Stability | no crash and no device loss in eleven automated runs of this version; long sessions are not measured yet |
 | Memory | about 37 GB of private memory and 11-19 GB of video memory: 64 GB of RAM recommended |
 | Shaders | 25,953 of the 25,953 programs of the title's shader archive translate and validate for 32-lane GPUs |
 
-For comparison, 0.12.2 took 86.9 ms a frame in that scene on a quiet machine.
+For comparison, 0.12.2 took 86.9 ms a frame in that scene on a quiet machine
+(with a capture of one frame in eight, which costs about 9 ms a frame: runs
+before 0.13.1 all had them).
 
 **What bounds the frame now is the processor's side.** The card's work was
 halved by where title buffers live: with every title buffer's copy and the
 windows of title memory on the card's side, the card's work by command fell
 from 53.8 to 26.6 ms a frame (dispatches 29.9 to 7.5 ms). The card now waits
-for us 23 ms a frame. One thread of ours, the one that prepares the title's
-submissions and sends them, works 64 ms of the 68: it sets the frame, and the
-title's threads wait 35 ms at the present for it.
+for us more than 10 ms a frame. One thread of ours, the one that prepares the
+title's submissions and sends them, works 43.6 and 45.5 ms of the frame: it
+sets the frame, and the title's threads wait at the present for it.
 
 The one settle a frame has its cause and its answer. A 240-byte copy at its
 place in a list is read as constants by a draw of the same list;
@@ -139,9 +141,12 @@ the goal, with what they are by default:
 
 | Switch | Default | What it does |
 |---|---|---|
-| `VICTORY_CARD_SIDE` | on with NVIDIA cards, else off | Every title buffer's copy and the windows of title memory on the card's side (the windows as two-sided copies), up to totals by the card's budget (the 8 and 12 GB sizes are guesses still to be measured), their room kept by the texture queue; each buffer's own switch still wins. `=0`: the placement of before; `=1` on other cards (not measured there). The card's work by command: 53.8 ms a frame without it, 26.6 ms with it; the frame 89.2 ms without it, 68.0 ms with it. |
+| `VICTORY_CARD_SIDE` | on with NVIDIA cards, else off | Every title buffer's copy and the windows of title memory on the card's side (the windows through the bus where the card's memory can be mapped, two-sided copies elsewhere), up to totals by the card's budget (the 8 and 12 GB sizes are guesses still to be measured), their room kept by the texture queue; each buffer's own switch still wins. `=0`: the placement of before; `=1` on other cards (not measured there). The card's work by command: 53.8 ms a frame without it, 26.6 ms with it; the frame 89.2 ms without it, 68.0 ms with it. |
 | `VICTORY_FILL_FORWARD` | on | A fill of upload memory that reads only what a copy at its place in the same list just wrote reads the copy's source instead, on the card (the cause of the one settle a frame). `=0`: it waits for the flights, as before. |
-| `VICTORY_CARD_WRITTEN_KB`, `VICTORY_CARD_ATOMIC=1`, `VICTORY_CARD_UNORDERED_KB` | off | Narrower placements: buffers that shaders store to or do atomics on (from the translator's lists of written and atomic views), buffers the title made for unordered access. |
+| `VICTORY_CARD_DIRTY_FLAGS` | on | Copies in the card's memory with nothing to go up are passed over by a shared flag. `=0`: each is asked, as before. |
+| `VICTORY_LAND_ASIDE=1` | off | The thread that sends submissions leaves the lists that have run to a helper thread. Measured inside the spread (58.7 against 61.0 ms a frame). |
+| `VICTORY_THREAD_TICKET` | on | Console threads of two-dimensional compute groups are each given once (host waves of such a group are not consecutive on NVIDIA). `=0`: the flat thread number rounded, as before. |
+| `VICTORY_BPERMUTE_HALVES` | on | A wave64 backward permute reads within each 32-lane half, as the console does. `=0`: across all 64 lanes. |
 | `VICTORY_PORT_RT=1` | off | When a fill of upload memory reads bytes that a copy at its place declared written, the card brings them, or the fill takes them from the copy's source, instead of the submission waiting for every flight (the one settle a frame). Its frame line counts the cases even when off. |
 | `VICTORY_PORT_CONSTANTS=1` | off | The title's 174 MB constants heap is read by the card where the title writes it: no uploads and no fills of it. With it, indirect executions whose arguments sit there are prepared alone right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on; 2-5 ms). |
 | `VICTORY_FILL_TITLE=2` | off | Small fills of upload memory go on without waiting for flights where no shader wrote the page lately. |
@@ -224,9 +229,10 @@ Done in 0.13.0:
   program reaches its limit.
 
 Next:
-1. **The processor's side**, now the bound: the card waits for us 23 ms a
-   frame, and the one thread of ours that prepares the title's submissions
-   and sends them works 64 ms of the 68.
+1. **The processor's side**, now the bound: the one thread of ours that
+   prepares the title's submissions and sends them works 43.6 and 45.5 ms a
+   frame, and the frame is that plus about 4 ms. Next: the first half of the
+   next submission prepared on a second thread while this one's steps run.
 2. **The placement on other cards**: the 8 and 12 GB sizes measured, and the
    placement tried on AMD and Intel cards.
 3. **The console's 64-lane programs on 32 lanes**: their forms measured

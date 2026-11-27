@@ -3,21 +3,21 @@
 **The goal:** the Series X profile, at full quality, at a steady 30 frames a
 second (33.3 ms a frame) on NVIDIA cards.
 
-**Today (0.13.0):** 68.0 ms a frame, 14.7 fps, not 30. These figures are from
-one four-minute run while other builds ran, on an RTX 5090 with an
-i9-14900KF, the Series X profile, a diagnostics build, in the prologue's first
-playable scene at about 4,850 draws a frame.
+**Today (0.13.1):** 46.6 and 48.8 ms a frame, 21.5 and 20.5 fps, not 30. On an RTX 5090
+with an i9-14900KF, the Series X profile, a diagnostics build, in the
+prologue's first playable scene at about 4,850 draws a frame; two runs of four minutes each, alternated, the median frame of each run's last minute, the process at high priority, no captures, another program drawing on the card.
 
-| Placement | A frame | The thread that prepares submissions | The card |
-|---|---|---|---|
-| As before | 89.2 ms (11.2 fps) | worked 80.6 ms | work queued about 89 % of the frame |
-| Title buffers on the card, windows through the bus | 75.5 ms (13.2 fps) | worked 54.4 ms | work queued 51 ms |
-| Title buffers on the card, two-sided windows (the default on NVIDIA) | 68.0 ms (14.7 fps) | worked 63.9 ms | work queued 34 ms |
+| Version | A frame | The thread that prepares submissions |
+|---|---|---|
+| 0.12.2, and 0.13.0 with the placement of before | about 85 ms, with captures | worked about 80 ms |
+| 0.13.0 | 53.7 and 53.8 ms | |
+| 0.13.1 | 46.6 and 48.8 ms | worked 43.6 and 45.5 ms |
 
-For comparison, 0.12.2 took 86.9 ms a frame on a quiet machine.
+Runs before 0.13.1 captured one frame in eight for pictures, which costs
+about 9 ms a frame on that thread; the rows above say which had them.
 
-The card is no longer the bound: it waits for us 23 ms a frame. The processor
-is.
+The card is no longer the bound: it waits for us. The processor is: the
+frame is that one thread's work plus about 4 ms.
 
 Each track below says what is measured and on what. A figure without its card
 and scene is not one. To add yours, run `pilotebox bench` and paste its last
@@ -25,35 +25,45 @@ line.
 
 ## 1. The processor's side: the thread that prepares the title's submissions
 
-**Measured** (the default placement, the run above):
+**Measured** (0.13.1):
 - One thread of ours prepares the title's submissions and sends them. It
-  works 64 ms of the 68 and sets the frame; the title's threads wait 35 ms at
-  the present for it.
-- Its parts, a frame: about 44 ms preparing (the write watch 5, the title's
-  bytes put under flights' writes 4.5, the lists' steps 19 with the refreshes
-  of host copies at 12.6, copies in the card's memory 11), about 10 ms
-  planning the steps done on the card, and 14 ms between submissions, giving
-  back the lists that have run.
-- Of 10,200 refreshes a frame, 9,000 find nothing to copy. Of 80,000 ranges a
-  frame that go up to the card's copies, nearly all are a few bytes of the
-  title's put under a flight's write.
+  works 43.6 and 45.5 ms a frame and sets the frame; the title's threads wait
+  at the present for it.
+- Its parts, a frame: the write watch 4, the title's bytes put under flights'
+  writes 6, the lists' steps 16 (the refreshes of host copies 10), copies in
+  the card's memory 12, planning the steps done on the card 4, sending 2.
+- Of 10,000 refreshes a frame, 1,245 copy something (75 MB a frame). About a
+  third of their cost is the guards over memory the system cannot watch.
+- Of 80,000 ranges a frame that go up to the card's copies, nearly all are a
+  few bytes of the title's put under a flight's write.
 
-**The levers.** None of these is measured on our card yet:
+**For 30 frames a second that thread must come under about 29 ms.** No sum
+of small cuts gets there, so the plan is to prepare two submissions at once:
+the first half of the next one (the write watch, the bytes under flights, the
+refreshes: about 20 ms) on a second thread while this one's steps run. The
+first step overlaps only this submission's tail (about 14 ms).
+
+**The other levers,** measured or not:
 - **The other trees' processor-side work.** It is in this tree since 0.13.0,
   as defaults or as switches.
   - TaynanGT's tree: Vladimir's bitmask of uncopied pages, lock-free mirrors
     and AVX2 `Shadow::take`, and the AVX2 detiler, both on.
   - avatarmanz's renderer ports 2, 6 and 7 (`VICTORY_PORT_DESCRIPTORS`,
-    `VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL`), off.
+    `VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL`), off. Port 6 measured: 57.3
+    ms a frame against 61.0 and 62.8 (the wait for the guards' lock goes from
+    8 ms to 0.3); to be confirmed, then made the default. Port 7 adds nothing
+    to the frame. Port 1 (`VICTORY_PORT_CONSTANTS`) costs 301 ms a frame on a
+    discrete card.
 - **The thread counts.** TaynanGT's tree runs an RTX 4090 with
   `VICTORY_THIN_THREADS=12`, `VICTORY_UNDER_THREADS=8`,
   `VICTORY_LAND_THREADS=6` and `VICTORY_MAP_THREADS=auto`. Our defaults are
   tuned on an AMD card (`VICTORY_MAP_THREADS=1`, `VICTORY_CARD_AWAKE=1`).
+  One run with that tree's counts on our card: inside the spread of ours.
 - **Where the time goes**, step by step: the timeline (`VICTORY_TIMELINE`)
   and a profile of both threads.
-- **Windows through the bus.** The preparing thread worked 54.4 ms with them,
-  against 63.9 ms with two-sided windows, while the card had more work queued
-  (51 ms against 34). `VICTORY_WINDOWS_BAR_MB` is the switch.
+- **Windows through the bus** are the placement's choice again since 0.13.1
+  (see the CHANGELOG's correction): the faster or the equal way in every
+  pair of runs, and no second copy in the PC's memory.
 
 ## 2. The card's time: halved by placement
 

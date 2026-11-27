@@ -12,6 +12,119 @@ Every figure says what it was measured on. Unless it says otherwise:
 - the profile is the Series X one;
 - the scene is the prologue's first playable scene, about 4,800 draws a frame.
 
+## 0.13.1 (2026-11-27)
+
+The first cuts on the thread that sets the frame, five ports to the
+translator, and a correction of 0.13.0's own figures.
+
+### A correction to 0.13.0
+
+0.13.0 said that two-sided windows beat windows written through the bus (68.0
+against 75.5 ms a frame) and that the bus cost the card 17 ms more. Those
+figures did not hold: the frame figures were each run's mean, which a slow
+first minute weighed on unequally, and the card's were one line of its clock
+each. Measured again on the same build and scene, runs alternated, by the
+median frame of each run's last minute:
+
+| Windows | The frame, ms | The thread that prepares submissions, ms worked |
+|---|---|---|
+| The placement of before (one run) | 85.5 | 79.8 |
+| Through the bus (three runs) | 62.1, 71.8, 74.0 | 56.3, 67.8, 68.8 |
+| Two sides (four runs) | 66.7, 69.6, 83.7, 74.5 | 65.3, 63.0, 84.7, 73.7 |
+
+The later runs of both kinds had another program drawing on the card and
+using three cores. Run for run the bus is the faster or the equal way; it
+spares that thread about 7 ms and keeps no second copy of the windows in the
+PC's memory. So **the placement's windows go through the bus again** where
+the card's memory can be mapped (`VICTORY_WINDOWS_BAR_MB=0` asks for two
+sides).
+
+What holds from 0.13.0: the placement itself (85.5 ms a frame without it, 62
+to 75 ms with it over those seven runs), the card's work by command (53.8 to
+26.6 ms, from timing runs), and that one thread of ours sets the frame: in
+every run the frame is that thread's work plus about 5 ms.
+
+From now on a figure here is a median over a run's steady part, from two
+runs of each kind at least, alternated.
+
+### The thread that prepares submissions
+
+**46.6 and 48.8 ms a frame (21.5 and 20.5 fps)** in the same scene, where 0.13.0 took
+53.7 and 53.8 ms in the same session (two runs of four minutes each, alternated, the median frame of each run's last minute, the process at high priority, no captures, another program drawing on the card). The thread
+worked 43.6 and 45.5 ms a frame. Not 30 yet.
+
+- **Planning the steps done on the card: about 10 ms a frame down to 3.8.**
+  0.13.0's own fill forwarding went back over every step ahead of each fill;
+  it now looks at the copies alone.
+- **Copies in the card's memory with nothing to go up** are passed over by a
+  shared flag (`VICTORY_CARD_DIRTY_FLAGS`, on; `=0` as before) instead of
+  each being asked.
+- **New frame lines** (diagnostics builds): what that thread worked, by part
+  (submissions prepared and sent, the line of flights told, landed lists
+  given back, presents); the refreshes of host copies split into checks and
+  copies; the list resets by whose thread they ran on.
+- **What those lines show**, for the next cuts:
+  - Of 10,000 refreshes a frame, 1,245 copy something: 75 MB a frame, 38 ms
+    of the helper threads' time.
+  - About a third of that is the guards over title memory the system cannot
+    watch: 8 ms waiting for their lock and 5 ms changing protections.
+  - The list resets (13 ms a frame) were already on helper threads.
+    `VICTORY_LAND_ASIDE=1` (off) leaves the landed lists to a helper too:
+    58.7 ms a frame against 61.0, one run each, inside the spread.
+- **Measured and left off:**
+  - `VICTORY_CARD_JOIN_GAP=4096` (ranges joined over short gaps): 60.2 ms a
+    frame against 58.7 and 61.0 without it.
+  - `VICTORY_PORT_CONSTANTS=1` (the title's large heap read in place): 301 ms
+    a frame. In place means in the PC's memory, so every shader that reads or
+    writes that heap crosses the bus again; the card's work went to about
+    235 ms a frame. It suits a card that shares the PC's memory, not this
+    one.
+- **The narrow rule is gone** (`VICTORY_CARD_ATOMIC`,
+  `VICTORY_CARD_WRITTEN_KB`, `VICTORY_CARD_UNORDERED_KB`): with every title
+  buffer on the card it had nothing left to win.
+- A frame captured for a picture (`VICTORY_CAPTURE`) settles every flight at
+  its present, so runs with captures measure them too; they are a testing
+  aid and are off in play.
+
+### The translator: five ports from TaynanGT's tree
+
+Each is credited in its commit to the author its history names. Our card's
+tests: the whole suite on an RTX 5090, 390 passed, none failed.
+
+- **Console threads of two-dimensional groups, each given once**
+  (`VICTORY_THREAD_TICKET`, on; by Garu667). The old way rounded the flat
+  thread number, and host waves of an 8x8 group are not consecutive on
+  NVIDIA: in the test on our card it wrote 32 of the 64 dwords. Four programs
+  of the title change: two temporal resolves, the gather of raymarched local
+  lights, and the terrain's visibility.
+- **A wave64 backward permute reads within each 32-lane half**
+  (`VICTORY_BPERMUTE_HALVES`, on), as the console does. No program of the
+  title changes on a 32-lane host.
+- **The comparison sampler** keeps its reduction (by rayane-creato1r): ours
+  turned a minimum into a maximum.
+- **The section scan** goes on past an unmatched saveexec (by shh), and
+  **`v_fmac_f32`** takes its accumulator's modifiers (by Bartosz). Neither
+  changes a program of the title.
+- **Not taken:** the fused legacy multiply-add. The title uses the unfused
+  multiply-add family that the later instruction set removed, and none of
+  that set's own instructions, so the console decodes this family as the
+  earlier set does and the operation is not fused there.
+
+All 25,953 programs still translate and validate; four change.
+
+### Also
+
+- **The release build on the card**, through `pilotebox check` and
+  `pilotebox bench` on 0.13.0: the check passes, and the bench's line is
+  `PiloteBox 0.13.0 | RTX 5090 | Series X | 4,272 draws | 62.8 ms (15.9 fps)
+  | card 58 % busy | 4 min, no crash` (with another program on the card).
+- **Draws dropped for want of a pipeline** (about 350 to 420 a frame in that
+  scene) are the ray-traced light's passes, left out while its structure
+  builder is off (`--rt` turns it on; see the ROADMAP).
+- **The same scene comes up brighter** in about one run in thirteen since
+  wave 10 (the sun's glare through the glass, no rain on it). It is not new,
+  and whether it is the title's weather or ours is not known yet.
+
 ## 0.13.0 (2026-11-27)
 
 Waves 13, 14 and 15: avatarmanz's newer layer, TaynanGT's tree, title
