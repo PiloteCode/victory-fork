@@ -39,9 +39,14 @@ For reference:
 
 **The card is no longer the bound: it waits for us 23 ms a frame. The
 processor is.**
-- The title's own submitting thread spends 56 ms of the 68 inside its
-  submissions.
-- The thread that prepares them works 64 ms.
+- One thread of ours prepares the title's submissions and sends them. It
+  works 64 ms of the 68 and sets the frame: the title's threads only hand it
+  their submissions, and wait 35 ms at the present for it.
+- Its parts, a frame: about 44 ms preparing (the write watch 5, the title's
+  bytes put under flights' writes 4.5, the lists' steps 19 with the refreshes
+  of host copies at 12.6, copies in the card's memory 11), about 10 ms
+  planning the steps done on the card, and 14 ms between submissions, giving
+  back the lists that have run.
 
 - **The card's work, halved by placement** (sync12).
   - The commands' times on the card went from 53.8 ms a frame with the

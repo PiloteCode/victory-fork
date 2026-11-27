@@ -50,8 +50,9 @@ For comparison, 0.12.2 took 86.9 ms a frame in that scene on a quiet machine.
 halved by where title buffers live: with every title buffer's copy and the
 windows of title memory on the card's side, the card's work by command fell
 from 53.8 to 26.6 ms a frame (dispatches 29.9 to 7.5 ms). The card now waits
-for us 23 ms a frame. The title's own submitting thread spends 56 ms of the 68
-inside its submissions, and the thread that prepares them works 64 ms.
+for us 23 ms a frame. One thread of ours, the one that prepares the title's
+submissions and sends them, works 64 ms of the 68: it sets the frame, and the
+title's threads wait 35 ms at the present for it.
 
 The one settle a frame has its cause and its answer. A 240-byte copy at its
 place in a list is read as constants by a draw of the same list;
@@ -227,8 +228,8 @@ Done in 0.13.0:
 
 Next:
 1. **The processor's side**, now the bound: the card waits for us 23 ms a
-   frame, the title's own submitting thread spends 56 ms of the 68 inside its
-   submissions, and the thread that prepares them works 64 ms.
+   frame, and the one thread of ours that prepares the title's submissions
+   and sends them works 64 ms of the 68.
 2. **The placement on other cards**: the 8 and 12 GB sizes measured, and the
    placement tried on AMD and Intel cards.
 3. **The console's 64-lane programs on 32 lanes**: their forms measured

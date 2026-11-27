@@ -23,12 +23,20 @@ Each track below says what is measured and on what. A figure without its card
 and scene is not one. To add yours, run `pilotebox bench` and paste its last
 line.
 
-## 1. The processor's side: the title's submissions and the thread that prepares them
+## 1. The processor's side: the thread that prepares the title's submissions
 
 **Measured** (the default placement, the run above):
-- The title's own submitting thread spends 56 ms of the 68 inside its
-  submissions.
-- The thread that prepares them works 64 ms.
+- One thread of ours prepares the title's submissions and sends them. It
+  works 64 ms of the 68 and sets the frame; the title's threads wait 35 ms at
+  the present for it.
+- Its parts, a frame: about 44 ms preparing (the write watch 5, the title's
+  bytes put under flights' writes 4.5, the lists' steps 19 with the refreshes
+  of host copies at 12.6, copies in the card's memory 11), about 10 ms
+  planning the steps done on the card, and 14 ms between submissions, giving
+  back the lists that have run.
+- Of 10,200 refreshes a frame, 9,000 find nothing to copy. Of 80,000 ranges a
+  frame that go up to the card's copies, nearly all are a few bytes of the
+  title's put under a flight's write.
 
 **The levers.** None of these is measured on our card yet:
 - **The other trees' processor-side work.** It is in this tree since 0.13.0,
