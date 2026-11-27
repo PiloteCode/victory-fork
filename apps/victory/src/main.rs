@@ -3,9 +3,10 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 //!
-//! The commands for playing (`play`, `bench`, `check`, `doctor`, `clean`)
-//! come first; the developers' (`run`, `shaders`, `warm`, `translate`,
-//! `replay` and the others) stay as upstream has them.
+//! The commands for playing (`setup`, `play`, `bench`, `check`, `doctor`,
+//! `clean`, `migrate`, `report`) come first; the developers' (`run`,
+//! `shaders`, `warm`, `translate`, `replay` and the others) stay as
+//! upstream has them. A bare `pilotebox` says where things stand.
 
 mod bench;
 mod census;
@@ -16,11 +17,16 @@ mod doctor;
 mod frames;
 mod game;
 mod inspect;
+mod migrate;
 mod play;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
+mod report;
 mod run;
+mod setup;
 mod shader;
+mod state;
+mod status;
 mod sys;
 mod translate;
 mod translate_diff;
@@ -37,8 +43,8 @@ use victory_core::product;
 
 /// Under the commands in `--help`.
 const AFTER_HELP: &str = "\
-First time: `pilotebox doctor`, then `pilotebox play`. A benchmark: `pilotebox bench`. \
-Every VICTORY_* switch of the layer still works as it is.";
+First time: `pilotebox setup`, then `pilotebox play`. A benchmark: `pilotebox bench`. A bare \
+`pilotebox` says where things stand. The switches are PILOTEBOX_* (the VICTORY_* names work too).";
 
 #[derive(Parser)]
 #[command(
@@ -55,21 +61,30 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
+    /// The first run in one command: finds the title, writes pilotebox.toml,
+    /// runs doctor, translates the shaders ahead.
+    Setup(setup::Setup),
     /// Plays the game, found with no path to type (Series X unless --mode s).
     Play(play::Play),
     /// A timed run that ends by itself, then its figures, printed and written
     /// beside the cache folder.
     #[command(after_help = bench::AFTER_HELP)]
     Bench(bench::Bench),
-    /// Checks this PC: card, driver, PCIe link, processor, memory, disk,
-    /// cache, the game's files, other runs.
-    Doctor(doctor::Doctor),
     /// doctor, then a short bench on a copy of the data folder, ending with
     /// PASS or FAIL.
     Check(check::Check),
+    /// Checks this PC: card, driver, PCIe link, processor, memory, disk,
+    /// folders, cache, the game's files, other runs.
+    Doctor(doctor::Doctor),
     /// Lists what in the cache folder is old and removes it with --yes. Never
     /// the data folder.
     Clean(clean::Clean),
+    /// Moves from the old %LOCALAPPDATA%\victory to %LOCALAPPDATA%\PiloteBox
+    /// with --yes: the saves copied and checked, never removed.
+    Migrate(migrate::Migrate),
+    /// Writes one text file for a bug report: doctor, the last play and
+    /// benchmark, the logs' last lines, user names taken out.
+    Report(report::Report),
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
         file: PathBuf,
@@ -240,6 +255,9 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // `PILOTEBOX_X` stands for `VICTORY_X`, before anything reads either.
+    // SAFETY: no other thread is running yet.
+    unsafe { product::alias_switches() };
     let first = std::env::args().nth(1);
     // The switches the title is played with, before anything reads them
     // (`defaults`).
@@ -249,8 +267,12 @@ fn main() -> Result<()> {
     }
     // The checks print their own lines: the layer's, opening the card, are
     // left out unless they warn.
-    let quiet = matches!(first.as_deref(), Some("doctor" | "check" | "clean"));
-    victory_core::logging::init(if quiet { "warn" } else { "info" });
+    let quiet = matches!(first.as_deref(), Some("doctor" | "check" | "clean" | "setup" | "report" | "migrate"));
+    // A play's log also goes to a file, for `report` (the one before is kept).
+    let play_log = (first.as_deref() == Some("play") && !std::env::args().any(|a| a == "--crash-log"))
+        .then(|| victory_core::Config::load().ok().and_then(|cfg| state::rotate_play_log(&cfg)))
+        .flatten();
+    victory_core::logging::init_with_file(if quiet { "warn" } else { "info" }, play_log.as_deref());
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -258,15 +280,18 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     let Some(command) = cli.command else {
-        Cli::command().print_help()?;
+        status::run(&Cli::command());
         return Ok(());
     };
     match command {
-        Command::Play(options) => play::run(options),
+        Command::Setup(options) => setup::run(options),
+        Command::Play(options) => play::run(options, play_log),
         Command::Bench(options) => bench::run(options),
         Command::Doctor(options) => doctor::run(options),
         Command::Check(options) => check::run(options),
         Command::Clean(options) => clean::run(options),
+        Command::Migrate(options) => migrate::run(options),
+        Command::Report(options) => report::run(options),
         Command::Inspect {
             file,
             imports,
@@ -448,6 +473,33 @@ mod tests {
         let Command::Clean(c) = parse(&["clean", "--all", "--yes"]).unwrap() else { panic!() };
         assert!(c.all && c.yes);
         assert!(matches!(parse(&["doctor"]), Ok(Command::Doctor(d)) if d.game.is_none()));
+    }
+
+    #[test]
+    fn the_new_commands_take_their_options() {
+        let Command::Setup(s) = parse(&["setup", "--game", r"D:\g", "--no-shaders", "--jobs", "4"]).unwrap() else {
+            panic!()
+        };
+        assert_eq!((s.game, s.no_shaders, s.jobs), (Some(PathBuf::from(r"D:\g")), true, Some(4)));
+        assert!(matches!(parse(&["migrate"]), Ok(Command::Migrate(m)) if !m.yes));
+        assert!(matches!(parse(&["migrate", "--yes"]), Ok(Command::Migrate(m)) if m.yes));
+        assert!(matches!(parse(&["report"]), Ok(Command::Report(r)) if r.game.is_none()));
+        assert!(matches!(parse(&["doctor", "--json"]), Ok(Command::Doctor(d)) if d.json));
+        assert!(matches!(parse(&["bench", "--json"]), Ok(Command::Bench(b)) if b.json));
+        assert!(matches!(parse(&["check", "--json", "--mode", "s"]), Ok(Command::Check(c)) if c.json && c.profile.mode == game::Mode::S));
+        assert!(matches!(parse(&["play", "--crash-log"]), Ok(Command::Play(p)) if p.crash_log));
+    }
+
+    #[test]
+    fn the_status_screen_lists_every_command_once() {
+        let cli = Cli::command();
+        let names: Vec<&str> = cli.get_subcommands().map(|c| c.get_name()).collect();
+        for name in status::PLAYING {
+            assert!(names.contains(&name), "{name}");
+        }
+        // The playing commands come first in --help too.
+        assert_eq!(&names[..status::PLAYING.len()], &["setup", "play", "bench", "check", "doctor", "clean", "migrate", "report"]);
+        assert!(names.contains(&"run") && names.contains(&"shaders") && names.contains(&"warm"));
     }
 
     #[test]
