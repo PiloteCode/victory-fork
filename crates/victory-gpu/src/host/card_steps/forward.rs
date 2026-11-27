@@ -37,6 +37,13 @@ pub(super) fn on() -> bool {
 /// Since the last frame line: fills given the bytes of a copy's source.
 pub(super) static FORWARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Since the last frame line, of the fills that read only what a copy at its
+/// place wrote ahead of them: those left as they were because a step of the
+/// submission writes the copy's source ahead of it, because a shader of the
+/// submission does, or because a shader writes what the fill reads between
+/// the two.
+pub(super) static LEFT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// What `d` writes as a copy (empty for anything else).
 fn writes(d: &Does) -> Option<(usize, usize)> {
     match *d {
@@ -79,10 +86,11 @@ pub(super) fn forward(does: &mut [Does], places: &[(usize, usize)], shader_write
         // copy; no shader writes what the fill reads between the two.
         let ahead = (0..p).any(|j| writes(&does[j]).is_some_and(|w| meet(w, from)));
         let (copy, fill) = (places[p], places[i]);
-        let shaders = shader_writes
-            .iter()
-            .any(|&(place, w)| (place < copy && meet(w, from)) || (copy < place && place < fill && meet(w, read)));
-        if ahead || shaders {
+        let source = shader_writes.iter().any(|&(place, w)| place < copy && meet(w, from));
+        let between = shader_writes.iter().any(|&(place, w)| copy < place && place < fill && meet(w, read));
+        if ahead || source || between {
+            let why = if ahead { 0 } else if source { 1 } else { 2 };
+            LEFT[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
         does[i] = Does::Fill {

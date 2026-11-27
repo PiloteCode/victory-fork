@@ -1014,7 +1014,8 @@ pub(super) fn log(frames: f64) {
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
          copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} fills read a copy's source, the copy at its place being \
-         just ahead of them (VICTORY_FILL_FORWARD={})",
+         just ahead of them (VICTORY_FILL_FORWARD={}); left as they were: {:.2} as a step writes the source ahead of the \
+         copy, {:.2} as a shader does, {:.2} as a shader writes what the fill reads in between",
         stage(),
         d[0],
         d[1],
@@ -1022,6 +1023,9 @@ pub(super) fn log(frames: f64) {
         d[3],
         forward::FORWARDED.swap(0, Ordering::Relaxed) as f64 / frames,
         u8::from(forward::on()),
+        forward::LEFT[0].swap(0, Ordering::Relaxed) as f64 / frames,
+        forward::LEFT[1].swap(0, Ordering::Relaxed) as f64 / frames,
+        forward::LEFT[2].swap(0, Ordering::Relaxed) as f64 / frames,
     );
     #[cfg(feature = "diagnostics")]
     {
