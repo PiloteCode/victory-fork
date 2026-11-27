@@ -72,29 +72,36 @@ your own copy of the title, in a folder outside this repository.
 ```powershell
 git clone https://github.com/PiloteCode/PiloteBox
 cd PiloteBox
-cargo build --release -p victory               # makes target\release\pilotebox.exe
-target\release\pilotebox.exe doctor            # checks the PC, the cache and the title's files
-target\release\pilotebox.exe play --game D:\titles\mine
+cargo build --release -p victory                             # makes target\release\pilotebox.exe
+target\release\pilotebox.exe setup --game D:\titles\mine     # once: remembers the folder, checks the PC, translates the shaders
+target\release\pilotebox.exe play
 ```
 
 Or double-click `PiloteBox.cmd`: it builds when the sources changed, then
-plays. Without `--game`, the title is looked for in `VICTORY_GAME_DIR`, then in
-`victory.toml` (copy `victory.example.toml`), then beside the program and in
-the folder above the repository.
+plays. `pilotebox` alone says where things stand: the title found or not, the
+mode, the cache, the last run and the last benchmark.
+
+Without `--game`, the title is looked for in `PILOTEBOX_GAME_DIR`, then in
+`pilotebox.toml` (which `setup` writes), then beside the program and in the
+folder above the repository.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
+| `pilotebox setup` | The first run in one command: finds the title or takes `--game`, writes `pilotebox.toml`, runs `doctor`, translates the shaders ahead. |
 | `pilotebox play` | Plays the title. `--mode x` is the Series X profile (the default), `--mode s` the Series S profile, `--rt` turns the ray-tracing structure builder on, `--safe` leaves the newest speed-ups out (the first thing to try when something is wrong). |
-| `pilotebox bench` | A timed run that ends by itself (`--seconds 300` by default) on a **copy** of your saves, then its figures: time to the world, mean and worst frame, preparing, card, copy-back, draws, dropped draws. Written as Markdown, JSON and a log beside the cache folder. |
+| `pilotebox bench` | A timed run that ends by itself (`--seconds 300` by default) on a **copy** of your saves, then its figures: time to the world, mean and worst frame, preparing, card, copy-back, draws, dropped draws. Written as Markdown, JSON and a log beside the cache folder; its last line is a one-line summary made for pasting. |
 | `pilotebox doctor` | Checks this PC: card and driver, wave size, view heap, PCIe link, AVX2, memory, disk, the cache's parts, the title's files, other runs. |
 | `pilotebox check` | `doctor`, then a short `bench`, ending with PASS or FAIL. |
 | `pilotebox clean` | Lists what in the cache folder is old and removes it with `--yes`. It never touches saves. |
+| `pilotebox report` | Writes one text file for a bug report: `doctor`, the last run, the last benchmark, the ends of the logs, with user names and the title's folder taken out. |
+| `pilotebox migrate` | Moves an older installation's folders (`%LOCALAPPDATA%\victory`) to `%LOCALAPPDATA%\PiloteBox`. Saves are copied and checked, never removed; it only lists until `--yes`. |
 
 The developer commands of the layer are all still there: `run`, `shaders`,
 `warm`, `translate`, `translate-diff`, `shader-info`, `replay`, `inspect`,
-`census`, `config`. `pilotebox <command> --help` describes each.
+`census`, `config`. `pilotebox <command> --help` describes each, and `doctor`,
+`bench` and `check` take `--json`.
 
 ```powershell
 pilotebox bench --name first                    # five minutes, Series X profile
@@ -111,8 +118,9 @@ pilotebox check                                 # is this build and this PC all 
 | `--rt` | The title's ray-traced indirect light: the structure builder and the walks. | With the walks really running, a tester measured 333-425 ms a frame on an RTX 4070 SUPER. For looking, not for playing. |
 | `--safe` | The layer's older, slower ways. | Slower; use it to tell a bug of the speed-ups from a bug of the layer. |
 
-Every switch of the layer (`VICTORY_*`) still works as it is; the play settings
-are the defaults, so none is needed. The switches are described in
+Every switch of the layer can be written `PILOTEBOX_<NAME>` (the upstream
+spelling `VICTORY_<NAME>` still works); the play settings are the defaults, so
+none is needed. The switches are described in
 [docs/findings.md](docs/findings.md), [docs/README-fxceless.md](docs/README-fxceless.md)
 and each module's notes.
 
@@ -199,15 +207,17 @@ side has to stay under 33.
 - **Something is wrong in the picture:** try `pilotebox play --safe`, then
   open an issue with the output of `pilotebox doctor` and the log lines.
 - **Your saves:** `bench` and `check` run on a copy. `play` uses the data
-  folder (`%LOCALAPPDATA%\victory\data` by default); copy it before trying a
-  new version.
+  folder (`%LOCALAPPDATA%\PiloteBox\data`, or an older installation's
+  `%LOCALAPPDATA%\victory\data` until `pilotebox migrate`); copy it before
+  trying a new version.
 
 ## Contributing
 
 Pull requests are welcome and are checked on every push: the asset policy, the
 build, the lints and the tests on the software adapter. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) first; it is short. We aim to answer within
-a day.
+a day. What changed in each version is in [CHANGELOG.md](CHANGELOG.md); where
+this is going, track by track, in [ROADMAP.md](ROADMAP.md).
 
 ## Credits
 
@@ -216,8 +226,8 @@ PiloteBox stands on other people's work, named exactly in
 fxceless/victory-fork, avatarmanz/VIctory-7900XTX (the layer this tree is built
 on), codec-d/cool_fox, and the people whose pull requests those trees carry.
 
-Internal names (crates, modules, the `VICTORY_*` switches, the data folder)
-stay upstream's on purpose: those trees are merged here regularly, and renaming
+Internal names (crates, modules, the switches as the layer reads them) stay
+upstream's on purpose: those trees are merged here regularly, and renaming
 their insides would turn every merge into conflicts.
 
 ## License

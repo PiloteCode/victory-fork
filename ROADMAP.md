@@ -46,10 +46,19 @@ writes and the other reads must be noticed and moved.
 - 23-26 ms a frame of copy-back (RTX 5090, diagnostics build, the scene
   above).
 
+About 11 ms of the card's 57.5 ms go to nine small programs whose atomics
+and stores land on title buffers kept in the PC's memory, across the bus
+(traced through a recorded frame).
+
 **The levers:**
-- Keep small buffers' copies in the card's memory
-  (`VICTORY_CARD_BUFFERS_MIN_KB`, after fxceless). Not measured on NVIDIA yet.
-- Compare and hash those copies on the card, joining runs.
+- Moving every small copy to the card (`VICTORY_CARD_BUFFERS_MIN_KB=64`) is
+  measured: the wait for the card at the settle fell from 36 to 22 ms a
+  frame, but 49,000 ranges a frame went up instead of 385 and the frame did
+  not get shorter.
+- A narrow rule instead: the translator now lists the views a program uses
+  with atomics and the views it writes; only those buffers go to the card's
+  memory. A first, coarser form of the rule did not move the frame; the
+  form that uses the lists is being measured.
 - Bring back only the dwords that changed.
 
 ## 3. The one settle a frame
@@ -57,10 +66,11 @@ writes and the other reads must be noticed and moved.
 Once a frame, the layer waits until what the card wrote is back in title
 memory before the title reads it.
 
-**Measured today:** the frame lines show 7-13 ms a frame waiting for the card
-in the first world intervals (RTX 5090, diagnostics build). The card's clock
-line shows how much of a frame the card stood idle behind our submitting
-thread.
+**Measured today:** the thread that prepares submissions works 83 ms a
+frame, and 38 ms of that is waiting for the card at this one settle, whose
+reason is a fill of upload memory that reads title memory (RTX 5090, a quiet
+machine, diagnostics build). The layer's own switch for it
+(`VICTORY_PLACED_ORDER=1`) did not remove it in our run.
 
 **The levers.** Our older layer tried three, behind switches; they are in the
 history (0.8 to 0.10) and not yet ported to this layer:
@@ -76,11 +86,10 @@ None of them was measured as a default on NVIDIA.
 - It shows a picture since 0.12.2: the upscaler's 20 programs translate.
 - The scene is drawn at 960x540 in our captures, so this is the fast, soft
   mode.
-- In our first measurement it ran about twice as fast as the Series X
-  profile, with the upscaler's passes still missing.
+- Before the upscaler's passes ran it took 44 ms a frame; with them it is
+  not measured on a quiet machine yet.
 
 **Next:**
-- Give the upscaler's passes their pipelines.
 - Measure the profile on a quiet machine.
 - Compare its picture with the Series X profile's.
 
@@ -99,11 +108,12 @@ None of them was measured as a default on NVIDIA.
 - Look at the structure builder's own passes.
 - Try a cheaper stand-in for the indirect light (`VICTORY_AMBIENT`).
 
-## 6. Mouths: done in 0.12.1
+## 6. Mouths: fixed in 0.12.1, to confirm in a cutscene
 
 16-bit typed buffer accesses through a table's places now move their bits as
-unsigned integers (`VICTORY_HALF_BITS`, on; a port of fxceless #927). The
-face network no longer reads zeros on NVIDIA, and mouths move in cutscenes.
+unsigned integers (`VICTORY_HALF_BITS`, on; a port of fxceless #927). On the
+card every one of the 65,536 patterns now comes back, where the old form
+read zeros. Still to confirm in a cutscene.
 
 ## Also on the way
 

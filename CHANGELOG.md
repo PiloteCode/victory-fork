@@ -21,8 +21,8 @@ The upscaler's containers, and the commands for playing.
     translate. This follows avatarmanz's translator.
   - The scene is drawn at 960x540 in our captures, so this is the fast, soft
     mode.
-  - In our first measurement it ran about twice as fast as the Series X
-    profile, with the upscaler's passes still missing.
+  - Its frame time with the upscaler's passes is not measured on a quiet
+    machine yet (44 ms a frame before those passes ran).
 - **The commands for playing.** `pilotebox.exe` is the program; the package
   is still `victory`.
   - **`setup`:** finds the title, writes `pilotebox.toml`, runs `doctor` and
@@ -61,8 +61,10 @@ The upscaler's containers, and the commands for playing.
 
 Mouths, and shaders.
 
-- **Mouths move on NVIDIA cards.** 16-bit typed buffer accesses through a
-  table's places now move their bits as unsigned integers.
+- **The fix for mouths on NVIDIA cards.** 16-bit typed buffer accesses
+  through a table's places now move their bits as unsigned integers. It
+  passes its tests on the card (all 65,536 patterns come back); it is not
+  yet confirmed in a cutscene.
   - The switch is `VICTORY_HALF_BITS`, on by default.
   - Before, the face network read its tensors as zeros on NVIDIA.
   - This is a port of fxceless #927 by tippythetaidum.
@@ -90,8 +92,9 @@ fixes.
   - host-memory admission for staging;
   - the two presented planes are composed.
 - **Our fixes the layer lacked:**
-  - a texture's own bytes;
-  - stale textures after DirectStorage writes;
+  - a texture's own bytes and stale textures after DirectStorage writes
+    (both behind switches and off: the first put texel noise on textures in
+    this layer);
   - saves and error 4395;
   - keys by their places;
   - the pipeline library;
@@ -99,8 +102,8 @@ fixes.
 - **The play settings are `run`'s defaults.** `VICTORY_PLAY_DEFAULTS=0` gives
   the layer's own, and `=safe` gives the script's `-Safe` set.
 - **Builds** target x86-64-v3, with thin LTO and one codegen unit.
-- **Our older layer (0.5 to 0.10) stays in the history** behind the first
-  parent. Its switches that are not named above went with it.
+- **Our older layer (0.5 to 0.10) is in this repository's history.** Its
+  switches that are not named above went with it.
 
 Measured:
 
