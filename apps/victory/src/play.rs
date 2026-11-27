@@ -55,12 +55,21 @@ pub(crate) fn switches_text(ours: &[(&str, &str, &str)], defaults: usize) -> Str
     parts.join("; ")
 }
 
+/// What `--crash-log` says (PiloteBox.cmd prints it after a failed run).
+fn crash_log_line(crash_log: &std::path::Path) -> String {
+    if crash_log.is_file() {
+        format!("The crash log is {}", crash_log.display())
+    } else {
+        format!("No crash log was written ({}): see the lines above.", crash_log.display())
+    }
+}
+
 pub(crate) fn run(play: Play) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     let found = game::find(&Places::new(play.profile.game.as_deref(), &cfg))?;
     let crash_log: PathBuf = game::crash_log(&cfg.data_dir, &found.exe);
     if play.crash_log {
-        println!("{}", crash_log.display());
+        println!("{}", crash_log_line(&crash_log));
         return Ok(());
     }
     let before = environment_switches();
