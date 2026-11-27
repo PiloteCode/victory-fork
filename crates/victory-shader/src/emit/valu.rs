@@ -618,7 +618,7 @@ impl Lower<'_> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc).copied() {
+                let mut acc = match self.floats.get(&acc).copied() {
                     Some(x) => x,
                     None => match self.raw_float(acc) {
                         Some(x) => x,
@@ -628,6 +628,15 @@ impl Lower<'_> {
                         }
                     },
                 };
+                // In VOP3, bit 2 of abs and neg is the accumulator's (the third source, which
+                // is the destination): RDNA 2 computes fma(a, b, -d) and fma(a, b, |d|).
+                if v.abs >> 2 & 1 != 0 {
+                    acc = self.unary(6, acc);
+                }
+                if v.neg >> 2 & 1 != 0 {
+                    let z = self.s.m.f32(0x8000_0000);
+                    acc = self.s.m.bin(c, Bin::Sub, z, acc);
+                }
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
