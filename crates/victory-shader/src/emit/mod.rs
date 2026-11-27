@@ -158,6 +158,9 @@ pub use bitcode::census;
 pub use link::{link_mesh, link_mesh_alone, mesh_fits};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+/// The places of [`HostShader::atomic_views`] and its kin: the bits of
+/// [`HostShader::picked_views`], and the census of the last program lowered on a thread.
+pub use lower::views::{CENSUS as VIEW_CENSUS, PICKED_ATOMIC, PICKED_WRITTEN, take_census as take_view_census};
 pub use rect::rect_list_gs;
 pub use shader::{
     LOOP_NOTE_DWORDS, LOOP_NOTES, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,
@@ -504,6 +507,19 @@ pub struct HostShader {
     /// picked at run time keeps the float path (its slot, and so its format, is known only
     /// then). Empty with `VICTORY_HALF_BITS=0`.
     pub half_views: Vec<(u8, u32)>,
+    /// The places (root parameter, dword in the table, as [`Self::half_views`]) of the buffer
+    /// descriptors the program loads from a fixed place in a table and uses with atomics
+    /// (`buffer_atomic_*`): a buffer the host keeps in the PC's memory is reached over the bus
+    /// at each atomic, one round trip at a time on one address. Sorted, each once.
+    pub atomic_views: Vec<(u8, u32)>,
+    /// The places of the buffer descriptors the program writes (`buffer_store_*`, and the
+    /// atomics' places too): what crosses the bus at each store where the buffer is in the
+    /// PC's memory. Sorted, each once.
+    pub written_views: Vec<(u8, u32)>,
+    /// Tables (root parameter) from which the program picks buffer descriptors at an index it
+    /// computes, for atomics ([`PICKED_ATOMIC`]) or writes ([`PICKED_WRITTEN`]): which of the
+    /// table's views they reach is known only when the program runs. Sorted by parameter.
+    pub picked_views: Vec<(u8, u8)>,
 }
 
 impl HostShader {
@@ -1363,6 +1379,9 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: l.half_views,
+        atomic_views: l.atomic_views,
+        written_views: l.written_views,
+        picked_views: l.picked_views,
     };
     forms::note(&shader.dxil, l.form);
     Ok((shader, wave_size))
@@ -1756,6 +1775,9 @@ mod tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            atomic_views: Vec::new(),
+            written_views: Vec::new(),
+            picked_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1769,6 +1791,9 @@ mod tests {
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                atomic_views: Vec::new(),
+                written_views: Vec::new(),
+                picked_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2056,6 +2081,9 @@ mod tests {
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            atomic_views: Vec::new(),
+            written_views: Vec::new(),
+            picked_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2210,6 +2238,9 @@ mod tests {
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                atomic_views: Vec::new(),
+                written_views: Vec::new(),
+                picked_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [

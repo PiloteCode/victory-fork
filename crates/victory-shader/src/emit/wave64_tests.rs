@@ -141,6 +141,9 @@ fn lowered_on(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: Vec::new(),
+        atomic_views: Vec::new(),
+        written_views: Vec::new(),
+        picked_views: Vec::new(),
     })
 }
 
@@ -298,6 +301,9 @@ fn exchanges_in_a_row_take_two_pairs_in_turn_and_meet_once_each() {
             root_uavs: lowered.root_uavs,
             root_indexed_views: res.root_indexed_views.clone(),
             half_views: Vec::new(),
+            atomic_views: Vec::new(),
+            written_views: Vec::new(),
+            picked_views: Vec::new(),
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();
@@ -401,6 +407,9 @@ fn an_lds_read_after_a_read_needs_no_meeting_of_its_own() {
             root_uavs: lowered.root_uavs,
             root_indexed_views: res.root_indexed_views.clone(),
             half_views: Vec::new(),
+            atomic_views: Vec::new(),
+            written_views: Vec::new(),
+            picked_views: Vec::new(),
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();
