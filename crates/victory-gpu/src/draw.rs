@@ -5204,3 +5204,41 @@ mod record_hash_tests {
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
 }
+
+#[cfg(test)]
+mod use_tests {
+    use super::*;
+    use crate::shadow::wanted::Use;
+
+    fn entry(slot: u8, dword: u32, kind: ResourceType) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: dword,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 4,
+            user_data: 4,
+            slot,
+        }
+    }
+
+    /// The places the translator names say what a bind asks a buffer's
+    /// copy for; a view of unordered access in a table the shader picks
+    /// from at a computed index may be reached that way too.
+    #[test]
+    fn the_translators_places_say_what_a_buffer_is_asked_for() {
+        let used = [entry(5, 0, ResourceType::Uav), entry(5, 8, ResourceType::Uav), entry(5, 16, ResourceType::Uav), entry(4, 0, ResourceType::Uav)];
+        let plan = TablePlan::new(&used, &[], &[]).with_uses(&[(5, 16)], &[(5, 0), (5, 8), (5, 16)], &[(4, victory_shader::emit::PICKED_WRITTEN)]);
+        let group = |slot: u8| plan.groups.iter().find(|g| g.slot == slot).unwrap();
+        assert_eq!(group(5).use_of(16, Some(ResourceType::Uav)), Use::Atomic);
+        assert_eq!(group(5).use_of(8, Some(ResourceType::Uav)), Use::Written);
+        // A view the shader only reads, in a table nothing is picked from.
+        assert_eq!(group(5).use_of(24, Some(ResourceType::Srv)), Use::Read);
+        assert_eq!(group(5).use_of(24, Some(ResourceType::Uav)), Use::Read);
+        // Picked for writes: its unordered access views, not its others.
+        assert_eq!(group(4).use_of(0, Some(ResourceType::Uav)), Use::Written);
+        assert_eq!(group(4).use_of(8, Some(ResourceType::Srv)), Use::Read);
+        assert_eq!(group(4).use_of(8, None), Use::Read);
+    }
+}
