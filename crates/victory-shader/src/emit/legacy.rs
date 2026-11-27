@@ -1,14 +1,18 @@
-//! The legacy multiply as the product alone where that is exact (a child module of `lower`,
-//! sharing the emitter's state).
+//! The legacy multiply and multiply-add as the IEEE operation alone where that is exact (a
+//! child module of `lower`, sharing the emitter's state).
 //!
 //! `v_mul_legacy_f32` gives +0 where either operand is a zero, whatever the other is,
-//! infinity and NaN included, and the IEEE product otherwise. The default form is the host's
-//! product, a compare of each operand with zero, their OR and a select. Where what is known of
-//! the operands ([`Facts`], `bitcode::facts`) makes the product give the same bits for every
-//! input, it is taken alone (`VICTORY_LEGACY_PLAIN`, on; `=0` turns it off): every zero either factor may be
+//! infinity and NaN included, and the IEEE product otherwise; `v_mad_legacy_f32` and
+//! `v_mac_legacy_f32` add to that product, fused (`Lower::legacy_fmad`: `+0 + c` where a
+//! factor is a zero). The default forms are the host's operation, a compare of each factor
+//! with zero, their OR and a select. Where what is known of the factors ([`Facts`],
+//! `bitcode::facts`) makes the IEEE operation give the same bits for every input, it is taken
+//! alone (`VICTORY_LEGACY_PLAIN`, on; `=0` turns it off): every zero either factor may be
 //! meets a finite other whose sign makes the IEEE product +0 (a +0 only finite numbers of
 //! clear sign, +0 included; a -0 only finite numbers of set sign). Then each zero case is +0
-//! by IEEE, and every other case is the product as before. (A converted unsigned integer times a positive
+//! by IEEE, and every other case is the product as before. In the multiply-add a product
+//! that is exactly +0 is added to `c` as `+0 + c` is, rounded once, so the fused operation
+//! alone is exact under the same condition. (A converted unsigned integer times a positive
 //! constant, the title's most frequent such pair; the reciprocal of one times 2^32 - 256, the
 //! division idiom; a square times the smoothstep factor 3 - 2x.)
 //!
@@ -18,7 +22,7 @@
 use super::{Bin, Lower, V};
 use crate::emit::bitcode::facts::{Facts, Made};
 
-/// The product alone where what is known of the operands makes it exact
+/// The IEEE operation alone where what is known of the factors makes it exact
 /// (`VICTORY_LEGACY_PLAIN=0`: never).
 pub(super) fn plain_on() -> bool {
     #[cfg(test)]
@@ -33,7 +37,7 @@ pub(super) fn plain_on() -> bool {
 thread_local! {
     /// A test's choice for [`plain_on`], for its thread only.
     pub(crate) static TEST_PLAIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    /// The legacy multiplies lowered in the shorter form on this thread.
+    /// The legacy multiplies and multiply-adds lowered in the shorter form on this thread.
     pub(crate) static TEST_SHORT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -70,6 +74,15 @@ impl Lower<'_> {
         let r = self.s.m.bin(self.cur, Bin::Mul, a, b);
         self.s.m.made(r, Made::Legacy(a, b));
         Some(r)
+    }
+
+    /// The legacy multiply-add of `a`, `b` and `c` as the fused multiply-add alone, where the
+    /// product alone is exact; `None` leaves it to the default form.
+    pub(super) fn legacy_short_fmad(&mut self, a: V, b: V, c: V) -> Option<V> {
+        if !self.legacy_plain(a, b) {
+            return None;
+        }
+        Some(self.fmad(a, b, c))
     }
 }
 

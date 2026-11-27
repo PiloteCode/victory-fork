@@ -49,6 +49,9 @@ pub(crate) enum Made {
     Med3(V, V, V),
     /// The legacy multiply: +0 where an operand is a zero, the product otherwise.
     Legacy(V, V),
+    /// A float with its denormals flushed to zeros of their sign (`Lower::ftz`): the same
+    /// facts, since a denormal already counts as a zero of its sign here.
+    Ftz(V),
 }
 
 impl Facts {
@@ -453,6 +456,7 @@ impl Module {
                     let r = fa.legacy(fb);
                     if a == b { r.square() } else { r }
                 }
+                Made::Ftz(x) => self.facts_at(x, d),
             }
         } else {
             self.facts_of(i, d)

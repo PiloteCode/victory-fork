@@ -26,8 +26,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
-/// The legacy multiply as the product alone where exact, a child module so it shares the
-/// emitter's state.
+/// The legacy multiply and multiply-add as the IEEE operation alone where exact, a child
+/// module so it shares the emitter's state.
 #[path = "legacy.rs"]
 pub(super) mod legacy;
 
@@ -3675,13 +3675,19 @@ impl<'a> Lower<'a> {
         let sub = self.s.m.cmp(c, pred::EQ, exp, zero);
         let signed_zero = self.s.m.bin(c, Bin::And, bits, sign_mask);
         let flushed = self.s.m.select(c, sub, signed_zero, bits);
-        self.as_float(flushed)
+        let r = self.as_float(flushed);
+        self.s.m.made(r, Made::Ftz(x));
+        r
     }
 
     /// A legacy multiply-add as RDNA 2 runs it: fused (`v_fma_legacy_f32`),
     /// with the legacy rule that a zero factor makes the product a +0 rather
     /// than turning an infinite or NaN factor into a NaN.
     fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
+        // (the fused multiply-add alone where the product alone is exact: `legacy.rs`)
+        if let Some(r) = self.legacy_short_fmad(a, b, c) {
+            return r;
+        }
         let cur = self.cur;
         let fused = self.fmad(a, b, c);
         let zero = self.s.m.f32(0);
