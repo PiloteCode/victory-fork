@@ -1,26 +1,9 @@
 //! Host-memory admission for speculative texture work and reusable upload storage.
-//!
-//! From codec-d/cool_fox (641835a4, fabb872a, c64fc9b4, 08e4574d, e94d277a; the
-//! values of the last). Only with `VICTORY_RESIDENCY=1` ([`on`]): the memory
-//! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
-//! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
-//! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
-//! commit to 16 MiB; the texture pass stops below 512 MiB of commit, new
-//! staging blocks for textures picked by index below 1 GiB. With 32 GiB of RAM
-//! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.
-//! Off, nothing here changes anything, except that for 500 ms after the card
-//! refused memory (E_OUTOFMEMORY) the texture pass stops ([`upload_refused`]).
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 const MIB: u64 = 1 << 20;
-
-/// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
-pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1"))
-}
 const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
 static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -36,23 +19,28 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
+pub(crate) const UPLOAD_RETRY_MS: u64 = 500;
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
-        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
+        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(UPLOAD_RETRY_MS), Ordering::Relaxed);
     }
 }
 
 thread_local! {
-    static STAGING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UPLOAD_DEFERRALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-pub(crate) fn note_staging_deferred() {
-    STAGING_DEFERRED.set(true);
+pub(crate) fn note_upload_deferred() {
+    UPLOAD_DEFERRALS.set(UPLOAD_DEFERRALS.get().wrapping_add(1));
 }
 
-pub(crate) fn take_staging_deferred() -> bool {
-    STAGING_DEFERRED.replace(false)
+/// Detects upload deferral during this operation. Nested checks can observe
+/// the same deferral without consuming the enclosing operation's signal.
+pub(crate) fn upload_deferred_during<T>(work: impl FnOnce() -> T) -> (T, bool) {
+    let before = UPLOAD_DEFERRALS.get();
+    let result = work();
+    (result, UPLOAD_DEFERRALS.get() != before)
 }
 
 pub(crate) fn upload_refused() -> bool {
@@ -79,11 +67,11 @@ fn has_upload_reserve(commit: u64, bake: bool) -> bool {
     commit >= if bake { 256 * MIB } else { 512 * MIB }
 }
 
-fn has_growth_reserve(commit: u64, bake: bool) -> bool {
+fn has_growth_reserve(commit: u64, bytes: u64, bake: bool) -> bool {
     // Growing a fresh 64 MiB upload block for speculative bindless prefetch
     // requires more headroom than reusing slices already committed inside the
     // staging pool.
-    commit >= if bake { 256 * MIB } else { 1024 * MIB }
+    commit.saturating_sub(bytes) >= if bake { 256 * MIB } else { 1024 * MIB }
 }
 
 /// Leave commit for game allocations and submissions already in flight while
@@ -93,9 +81,6 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    if !on() {
-        return true;
-    }
     has_upload_reserve(sample_commit(now), bake)
 }
 
@@ -103,21 +88,30 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
 /// (reusing existing free ranges in already-committed pool blocks stays open
 /// whenever `admit_texture_pass` is true).
 pub(crate) fn allow_staging_growth(bake: bool) -> bool {
-    if !on() {
-        return true;
-    }
+    allow_growth(0, bake)
+}
+
+/// Whether a second CPU-backed buffer can fit while leaving the existing
+/// growth reserve for streaming and submissions.
+pub(crate) fn allow_optional_buffer_growth(bytes: u64) -> bool {
+    allow_growth(bytes, false)
+}
+
+fn allow_growth(bytes: u64, bake: bool) -> bool {
     let now = crate::host::coarse_ms();
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    has_growth_reserve(sample_commit(now), bytes, bake)
 }
 
+/// A PC with 32 GiB of RAM or less, or `VICTORY_RESIDENCY_LIMITED=1` (the
+/// name avatarmanz/VIctory-7900XTX gives it): the budgets of a smaller PC.
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
     *LIMITED.get_or_init(|| {
-        on() && (std::env::var_os("VICTORY_RESIDENCY_LIMITED").is_some_and(|v| v == "1")
-            || memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+        std::env::var_os("VICTORY_RESIDENCY_LIMITED").is_some_and(|v| v == "1")
+            || memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB)
     })
 }
 
@@ -131,9 +125,6 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
 
 /// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
 pub(crate) fn refresh() {
-    if !on() {
-        return;
-    }
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
@@ -171,9 +162,6 @@ pub(crate) fn pressured() -> bool {
 /// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
 /// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
-    if !on() {
-        return false;
-    }
     let now = crate::host::coarse_ms();
     now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
 }
@@ -195,6 +183,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_upload_deferral_reaches_the_enclosing_operation() {
+        note_upload_deferred();
+        assert!(!upload_deferred_during(|| ()).1);
+        let (_, deferred) = upload_deferred_during(|| {
+            assert!(upload_deferred_during(note_upload_deferred).1);
+            assert!(!upload_deferred_during(|| ()).1);
+        });
+        assert!(deferred);
+    }
+
+    #[test]
     fn bake_and_lookahead_leave_room_for_live_game_allocations() {
         for (commit, bake, lookahead, growth) in [
             (128 * MIB, false, false, false),
@@ -205,8 +204,15 @@ mod tests {
         ] {
             assert_eq!(has_upload_reserve(commit, true), bake);
             assert_eq!(has_upload_reserve(commit, false), lookahead);
-            assert_eq!(has_growth_reserve(commit, false), growth);
+            assert_eq!(has_growth_reserve(commit, 0, false), growth);
         }
+    }
+
+    #[test]
+    fn a_second_buffer_counts_against_the_growth_reserve() {
+        assert!(!has_growth_reserve(GIB, 64 * MIB, false));
+        assert!(has_growth_reserve(GIB + 64 * MIB, 64 * MIB, false));
+        assert!(!has_growth_reserve(512 * MIB, GIB, false));
     }
 
     #[test]

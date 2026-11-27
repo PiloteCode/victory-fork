@@ -113,6 +113,19 @@ struct Last {
     hot_until: u64,
 }
 
+impl Last {
+    /// A sparse read can consist entirely of zero-filled holes. Keep the
+    /// digest of the texels actually staged until a usable read replaces them.
+    fn accept_partial(&mut self, bytes: &[u8]) -> bool {
+        let hash = digest(bytes);
+        if self.hash == Some(hash) || bytes.iter().all(|&b| b == 0) {
+            return false;
+        }
+        self.hash = Some(hash);
+        true
+    }
+}
+
 /// Frames a guarded texture is hashed at every check from its first check,
 /// and after the hash found a change the guard did not see.
 const HOT_FRAMES: u64 = 64;
@@ -275,7 +288,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(placed as usize, to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -290,7 +303,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -1492,12 +1505,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = digest(read);
-                if last.hash == Some(hash) {
-                    return false;
-                }
-                last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if !last.accept_partial(read) {
                     return false;
                 }
                 self.detile(read);
@@ -1961,17 +1969,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+        return mapped_texture_blocks(start, end);
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -1987,6 +1985,34 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
             there += (next - p) as u64;
         }
         p = next;
+    }
+    there
+}
+
+/// Counts readable blocks where the runtime has no mapping record. Query
+/// the extent of a hole only after its first failed read.
+fn mapped_texture_blocks(start: usize, end: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    const BLOCK: usize = 64 << 10;
+    let mut there = 0u64;
+    let mut block = start & !(BLOCK - 1);
+    while block < end {
+        let next = block.saturating_add(BLOCK);
+        let lo = block.max(start);
+        block = next;
+        if readable(lo, 1, true).0 == 1 {
+            there += (next.min(end) - lo) as u64;
+            continue;
+        }
+        // SAFETY: queries an address and fills a structure of the right size.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe { VirtualQuery(lo as *const _, &mut info, size_of_val(&info)) };
+        if queried != 0 && (info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0) {
+            let hole_end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+            block = block.max(hole_end.checked_next_multiple_of(BLOCK).unwrap_or(end));
+        }
     }
     there
 }
@@ -2055,7 +2081,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             if crate::residency::upload_refused()
                 || (speculative && !crate::residency::allow_staging_growth(false))
             {
-                crate::residency::note_staging_deferred();
+                crate::residency::note_upload_deferred();
                 return None;
             }
             let (buffer, data) = host.upload_buffer(total)?;
@@ -2109,6 +2135,22 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn a_zero_sparse_read_keeps_the_digest_of_the_staged_texels() {
+        use super::{Last, digest};
+        let mut last = Last::default();
+        let missing = [0; 128];
+        let visible = [0x7a; 128];
+
+        assert!(!last.accept_partial(&missing));
+        assert_eq!(last.hash, None, "an empty first read must remain eligible for another upload");
+        assert!(last.accept_partial(&visible));
+        assert!(!last.accept_partial(&missing));
+        assert_eq!(last.hash, Some(digest(&visible)));
+        assert_ne!(last.hash, Some(digest(&missing)), "a later complete zero texture still needs detiling");
+        assert!(!last.accept_partial(&visible));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
@@ -2375,6 +2417,31 @@ mod allocation_costs {
             }
             crate::inplace::views_gone(noted, blocks * BLOCK);
         }
+    }
+
+    #[test]
+    fn sparse_texture_blocks_keep_readable_islands_between_holes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: a reservation owned by the test, with separate committed ranges.
+        let (start, end) = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 12 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            for (offset, count, protect) in [
+                (0, 1, PAGE_READWRITE), (5, 1, PAGE_READWRITE),
+                (6, 5, PAGE_NOACCESS), (11, 1, PAGE_READWRITE),
+            ] {
+                let at = base.add(offset * BLOCK).cast();
+                assert_eq!(VirtualAlloc(at, count * BLOCK, MEM_COMMIT, protect), at);
+            }
+            (base as usize, base as usize + 12 * BLOCK)
+        };
+        assert_eq!(super::mapped_texture_blocks(start + 17, end - 31), (3 * BLOCK - 48) as u64);
+        // SAFETY: the test owns the whole reservation and is done reading it.
+        assert_ne!(unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) }, 0);
     }
 
     /// The digest tells every length and every changed byte apart, zeros

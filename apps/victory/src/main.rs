@@ -9,6 +9,8 @@
 //! upstream has them. A bare `pilotebox` says where things stand.
 
 mod bench;
+#[cfg(agility_sdk)]
+mod agility;
 mod census;
 mod check;
 mod clean;
@@ -58,8 +60,8 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
 enum Command {
     /// The first run in one command: finds the title, writes pilotebox.toml,
     /// runs doctor, translates the shaders ahead.
@@ -155,7 +157,7 @@ enum Command {
         #[arg(long)]
         hashes: bool,
         /// Worker threads, at least 1 (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_nonzero_jobs)]
         jobs: Option<NonZeroUsize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line),
@@ -185,7 +187,7 @@ enum Command {
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// Also write every shader that does not translate to this file,
         /// one line each: hash, where it was found, why.
@@ -199,7 +201,7 @@ enum Command {
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// At most this many pipelines.
         #[arg(long)]
@@ -254,6 +256,17 @@ enum Console {
     SeriesS,
 }
 
+fn parse_jobs(value: &str) -> Result<usize, &'static str> {
+    value
+        .parse::<NonZeroUsize>()
+        .map(NonZeroUsize::get)
+        .map_err(|_| "expected a worker count of 1 or more")
+}
+
+fn parse_nonzero_jobs(value: &str) -> Result<NonZeroUsize, &'static str> {
+    parse_jobs(value).map(|n| NonZeroUsize::new(n).expect("at least 1"))
+}
+
 fn main() -> Result<()> {
     // `PILOTEBOX_X` stands for `VICTORY_X`, before anything reads either.
     // SAFETY: no other thread is running yet.
@@ -279,6 +292,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    #[cfg(agility_sdk)]
+    agility::check_runtime()?;
     let Some(command) = cli.command else {
         status::run(&Cli::command());
         return Ok(());

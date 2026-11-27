@@ -68,7 +68,9 @@ fn book() -> Option<&'static Recorder> {
         let mut keys = HashSet::new();
         let mut shaders = HashSet::new();
         let ends = [
-            walk_shaders(&dir, |_, hash, _, _| { let _ = shaders.insert(hash); }),
+            walk_shaders(&dir, |_, hash, _, _| {
+                shaders.insert(hash);
+            }),
             walk_pipelines(&dir, |_, bytes| {
                 keys.extend(bytes.first_chunk::<16>().copied());
             }),
@@ -237,13 +239,48 @@ pub fn count(dir: &Path) -> usize {
     n
 }
 
+fn recipe_key(entry: &[u8]) -> String {
+    entry.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
-    walk_pipelines(dir, |_, e| {
-        all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
-    });
+    walk_pipelines(dir, |_, entry| all.push(recipe_key(entry)));
     all
+}
+
+/// A recorded pipeline and whether the configured shader skip list excludes it.
+pub struct WarmEntry {
+    pub key: String,
+    pub skipped: bool,
+}
+
+/// Entries in their recorded order, so worker indices still name the same pipelines.
+pub fn warm_entries(dir: &Path) -> Vec<WarmEntry> {
+    let skips = super::skip_hashes();
+    let mut entries = Vec::new();
+    walk_pipelines(dir, |_, entry| {
+        entries.push(WarmEntry { key: recipe_key(entry), skipped: matches_skip_list(entry, skips) });
+    });
+    entries
+}
+
+fn matches_skip_list(entry: &[u8], skips: &[String]) -> bool {
+    if skips.is_empty() {
+        return false;
+    }
+    let Some((&count, rest)) = entry.get(16..).and_then(|bytes| bytes.split_first()) else {
+        return false;
+    };
+    let Some(shaders) = rest.get(..usize::from(count) * 33) else {
+        return false;
+    };
+    shaders.chunks_exact(33).any(|shader| {
+        let hash = blake3::Hash::from_bytes(shader[1..].try_into().expect("recorded shader hash"));
+        let hex = hash.to_hex();
+        skips.iter().any(|skip| skip == &hex[..16])
+    })
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
@@ -269,7 +306,9 @@ pub fn use_translations(dir: PathBuf) {
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
     let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| { let _ = places.insert(hash, (stage, at, len)); });
+    walk_shaders(dir, |stage, hash, at, len| {
+        places.insert(hash, (stage, at, len));
+    });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
@@ -544,6 +583,22 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    #[test]
+    fn a_warm_skip_can_match_any_shader_in_a_recipe() {
+        let mut entry = vec![0xff; 16];
+        entry.extend([2, 0]);
+        entry.extend([0x11; 32]);
+        entry.push(1);
+        entry.extend([0x22; 32]);
+        entry.push(0);
+
+        let skips = vec!["22".repeat(8)];
+        assert!(matches_skip_list(&entry, &skips));
+        assert!(!matches_skip_list(&entry, &["33".repeat(8)]));
+        assert!(!matches_skip_list(&entry, &[]));
+        assert!(!matches_skip_list(&entry[..entry.len() - 2], &skips));
     }
 
     #[test]

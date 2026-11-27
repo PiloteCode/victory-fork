@@ -1,4 +1,4 @@
-//! Exercise FidelityFX 4 Quality through the retail title's descriptions and
+//! Exercise the selected FidelityFX upscaler through the title's descriptions and
 //! console objects, then read back the upscaled colour. Requires a host
 //! GPU and `VICTORY_FIDELITYFX_DIR`.
 #![cfg(windows)]
@@ -169,7 +169,8 @@ fn the_titles_upscaler_runs_on_the_host() {
             debug.iter().for_each(|d| d.EnableDebugLayer());
         }
     }
-    victory_hle::modules::fidelityfx::use_host_dir(std::path::Path::new(&dir)).unwrap();
+    let selected =
+        victory_hle::modules::fidelityfx::use_host_dir(std::path::Path::new(&dir)).unwrap();
     let Some(host) = victory_gpu::external::host_device() else {
         panic!("a FidelityFX directory was supplied but no native GPU is available");
     };
@@ -490,11 +491,35 @@ fn the_titles_upscaler_runs_on_the_host() {
     eprintln!("provider {:#x} {:?}", provider.id, unsafe {
         std::ffi::CStr::from_ptr(provider.name)
     });
-    assert!(
-        unsafe { std::ffi::CStr::from_ptr(provider.name) }
-            .to_bytes()
-            .starts_with(b"4.1.2")
+    let provider_name = unsafe { std::ffi::CStr::from_ptr(provider.name) }.to_string_lossy();
+    assert!(provider_name.trim_start_matches("FSR ").starts_with(selected));
+
+    // A rejected dispatch restores the bindings on this still-open list.
+    let output_resource = upscaling.resources[6];
+    let too_small = at(
+        render,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        target | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
     );
+    for invalid in [
+        described(color, 4, render, 0, 0xc),
+        described(too_small, 4, render, 2, 0x2),
+    ] {
+        upscaling.resources[6] = invalid;
+        assert_eq!(dispatch(&mut context, &mut upscaling.header), 6);
+        victory_gpu::external::record(list, |list| {
+            assert_eq!(
+                list.existing_texture_binding(color).unwrap().1,
+                Some(RENDER_TARGET)
+            );
+            assert_eq!(
+                list.existing_texture_binding(upscaled).unwrap().1,
+                Some(RENDER_TARGET)
+            );
+        })
+        .unwrap();
+    }
+    upscaling.resources[6] = output_resource;
     // Two frames: the first resets the history.
     for reset in [1, 0] {
         upscaling.reset = reset;

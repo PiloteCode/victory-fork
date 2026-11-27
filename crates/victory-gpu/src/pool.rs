@@ -42,17 +42,12 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
-        return;
-    }
-    // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
-    // spares while the system is short of memory, and idle blocks let go now,
-    // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
+    // A full pool can become idle while another subsystem needs the VRAM.
+    // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
@@ -203,8 +198,6 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
-    /// No new block is asked for before this time after one was refused
-    /// ([`Pool::grow`]).
     retry_growth_at: u64,
 }
 
@@ -282,9 +275,6 @@ impl<B: Clone> Pool<B> {
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
-    /// A new block from `make`, unless one was refused less than 500 ms ago
-    /// (codec-d/cool_fox 08e4574d: a refused 64 MiB block is not asked for
-    /// again for each small texture; the blocks there are still used).
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
         if now < self.retry_growth_at {
             return None;
@@ -318,8 +308,6 @@ impl<B: Clone> Pool<B> {
         self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
     }
 
-    /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
-    /// empty blocks are looked at even if no piece came back.
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
@@ -397,8 +385,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
     let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
-        // while commit is short; those a draw samples now still get one.)
+        // Only gate speculative bindless prefetch on staging-pool growth
+        // headroom; table-bound textures and decoration bakes are sampled
+        // immediately and would otherwise read uninitialized/reused VRAM.
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
@@ -470,8 +459,13 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 }
 
 /// Whether textures of 64 KiB and less are placed at multiples of 4 KiB in
-/// their block, where the host allows it (`VICTORY_POOL_SMALL=1`; otherwise
-/// at multiples of 64 KiB, as every other texture).
+/// their block, where the host allows it, rather than at multiples of 64 KiB
+/// as every other texture: on any card but an AMD one by default;
+/// `VICTORY_POOL_SMALL=1` or `=0` picks either.
+///
+/// On an RTX 4090 (Series S, 30 minutes) the 4 KiB placement held 3.2 GB less
+/// of the PC's memory and 3.4 GB less of the card's than 64 KiB, with no
+/// device loss; the losses below were on an RX 7900 XTX.
 ///
 /// The two device losses of the night of 2026-11-25 with the pool in the
 /// report (runs steps-ab2 and start-3) faulted in the same kind of texture:
@@ -488,7 +482,10 @@ fn small_placement() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SMALL").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_POOL_SMALL") {
+        Some(v) => v != "0",
+        None => !crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device)),
+    })
 }
 
 /// Diagnostics: whether the card reads a pooled texture inside the piece it
@@ -650,6 +647,7 @@ pub(crate) unsafe fn texture(
     device: &ID3D12Device,
     desc: *const D3D12_RESOURCE_DESC,
     state: D3D12_RESOURCE_STATES,
+    first_attempt: bool,
 ) -> Option<ID3D12Resource> {
     if !on() {
         return None;
@@ -680,7 +678,11 @@ pub(crate) unsafe fn texture(
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
+            // The pool still backs off its own growth when this is the
+            // texture's last attempt, without renewing the global pause.
+            if first_attempt {
+                crate::residency::allocation_error(&e);
+            }
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
@@ -733,13 +735,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ranges_are_cut_aligned_and_join_again() {
+        let mut r = Ranges::new(1024);
+        assert_eq!(r.take(100, 64), Some(0));
+        assert_eq!(r.take(100, 64), Some(128));
+        assert_eq!(r.take(28, 4), Some(100));
+        assert_eq!(r.take(2000, 4), None);
+        r.give(128, 100);
+        r.give(0, 100);
+        assert!(!r.whole(1024));
+        r.give(100, 28);
+        assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn empty_blocks_stay_while_the_card_has_room() {
+        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
         let mut pool: Pool<u32> = Pool::new(2);
         let calls = std::cell::Cell::new(0);
-        let refuse = || {
-            calls.set(calls.get() + 1);
-            None
-        };
+        let refuse = || { calls.set(calls.get() + 1); None };
         for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
             assert!(pool.take(size, 512, 12, refuse).is_none());
         }
@@ -767,28 +788,6 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
-    }
-
-    #[test]
-    fn ranges_are_cut_aligned_and_join_again() {
-        let mut r = Ranges::new(1024);
-        assert_eq!(r.take(100, 64), Some(0));
-        assert_eq!(r.take(100, 64), Some(128));
-        assert_eq!(r.take(28, 4), Some(100));
-        assert_eq!(r.take(2000, 4), None);
-        r.give(128, 100);
-        r.give(0, 100);
-        assert!(!r.whole(1024));
-        r.give(100, 28);
-        assert!(r.whole(1024));
-    }
-
-    #[test]
-    fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
-        assert_eq!(spares(None, true), SPARE);
     }
 
     #[test]
@@ -916,7 +915,7 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: a valid description.
-        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
+        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, true) }) else { return };
         assert_eq!(crate::host::references(&t), 1, "what the texture holds is no reference to it");
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();

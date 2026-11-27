@@ -1,6 +1,6 @@
 //! Series X SDR 4K profiles for the title's PC FidelityFX dispatch.
 use anyhow::{Context, Result, ensure};
-use victory_loader::PreparedImage;
+use victory_loader::{PreparedImage, resolution};
 
 const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
 const SDR_MODE: u32 = 0x0615_c100;
@@ -14,14 +14,16 @@ pub(super) enum FsrPreset {
 }
 
 impl FsrPreset {
-    pub(super) fn requested() -> Result<Option<Self>> {
-        match std::env::var("VICTORY_FSR_4K") {
+    /// The profile `VICTORY_FSR_4K` (AMD FSR 4.1.2) or `VICTORY_DLSS_4K`
+    /// (NVIDIA DLSS) names, if any.
+    pub(super) fn requested(switch: &str) -> Result<Option<Self>> {
+        match std::env::var(switch) {
             Err(std::env::VarError::NotPresent) => Ok(None),
             Ok(name) if name == "0" => Ok(None),
             Ok(name) => Self::from_name(&name.trim().to_ascii_lowercase())
                 .map(Some)
                 .with_context(|| {
-                    format!("VICTORY_FSR_4K={name}: expected quality, balanced, performance or 0")
+                    format!("{switch}={name}: expected quality, balanced, performance or 0")
                 }),
             Err(error) => Err(error.into()),
         }
@@ -53,6 +55,17 @@ impl FsrPreset {
         }
     }
 
+    /// NGX `NVSDK_NGX_PerfQuality_Value` for the same profile (MaxPerf 0,
+    /// Balanced 1, MaxQuality 2). DLSS renders at the size the title picks
+    /// for FSR; this only names the mode its model was tuned for.
+    pub(super) fn dlss_quality(self) -> i32 {
+        match self {
+            Self::Quality => 2,
+            Self::Balanced => 1,
+            Self::Performance => 0,
+        }
+    }
+
     pub(super) fn render_scale(self) -> f32 {
         match self {
             Self::Quality => 2.0 / 3.0,
@@ -63,6 +76,17 @@ impl FsrPreset {
 
     pub(super) fn render_size(self) -> [u32; 2] {
         [3840.0, 2160.0].map(|size| (size * self.render_scale()) as u32)
+    }
+
+    /// The selector and render scale when a PC upscaler serves Series S.
+    pub(super) fn series_s_patches(self) -> [(&'static resolution::Site, Vec<u8>); 2] {
+        [
+            (
+                &resolution::FFX_SCALE,
+                resolution::ffx_scale_code(self.render_scale()),
+            ),
+            (&resolution::PICKER, resolution::picker_code(7)),
+        ]
     }
 }
 
@@ -157,6 +181,31 @@ fn field<const N: usize>(image: &mut PreparedImage, rva: u32) -> Result<&mut [u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presets_name_their_render_sizes_and_dlss_modes() {
+        for (name, size, dlss) in [
+            ("quality", [2560, 1440], 2),
+            ("balanced", [2258, 1270], 1),
+            ("performance", [1920, 1080], 0),
+        ] {
+            let preset = FsrPreset::from_name(name).unwrap();
+            assert_eq!(preset.name(), name);
+            assert_eq!(preset.render_size(), size);
+            assert_eq!(preset.dlss_quality(), dlss);
+        }
+        assert_eq!(FsrPreset::from_name("ultra"), None);
+    }
+
+    #[test]
+    fn series_s_performance_uses_half_size_and_selects_fidelityfx() {
+        let [(scale_site, scale_code), (picker_site, picker_code)] =
+            FsrPreset::Performance.series_s_patches();
+        assert_eq!(scale_site.at, resolution::FFX_SCALE.at);
+        assert_eq!(&scale_code[0x64..0x68], &0.5f32.to_le_bytes());
+        assert_eq!(picker_site.at, resolution::PICKER.at);
+        assert_eq!(picker_code, [0xb8, 7, 0, 0, 0, 0xc3]);
+    }
 
     #[test]
     fn fsr_presets_leave_the_stock_scanout_and_settings_viewport() {

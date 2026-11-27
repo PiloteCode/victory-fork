@@ -12,6 +12,14 @@ game_dir = 'D:\pilotebox-data\game'
 # PC FSR 4.1.2 upscaler for VICTORY_FSR_4K (Series X profile).   env: PILOTEBOX_FIDELITYFX_DIR
 # fidelityfx_dir = 'D:\pilotebox-data\fidelityfx-4.1.2'
 
+# PC FidelityFX frame generation (Series S, VICTORY_FRAMEGEN=1). Defaults to
+# fidelityfx_dir.   env: PILOTEBOX_FFX_FG_DIR
+# ffx_fg_dir = 'D:\pilotebox-data\fidelityfx-signedbin'
+
+# NVIDIA's nvngx_dlss.dll for VICTORY_DLSS / VICTORY_DLSS_4K (optional: the
+# driver's copy otherwise).   env: PILOTEBOX_DLSS_DIR
+# dlss_dir = 'D:\pilotebox-data\dlss'
+
 # Derived data. Default: %LOCALAPPDATA%\PiloteBox\cache.   env: PILOTEBOX_CACHE_DIR
 # cache_dir = 'D:\pilotebox-data\cache'
 
