@@ -186,7 +186,7 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
-    // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
+    // (The title asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
@@ -1096,7 +1096,7 @@ fn port_on() -> bool {
 }
 
 /// The title's reservations of 64 KiB pages for 32-bit graphics memory:
-/// base and bytes (one, of 185 MB, in Grand Theft Auto VI).
+/// base and bytes (one, of 185 MB, in the title).
 static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Pages given another place in their section so far by [`arrange`], and
@@ -1110,7 +1110,7 @@ static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// reservation), so that the reservation becomes one stretch of the section
 /// and the GPU side can open it as one heap.
 ///
-/// Grand Theft Auto VI takes all the pages of its 185 MB heap in one call
+/// The title takes all the pages of its 185 MB heap in one call
 /// and maps its five pieces in another order than their addresses (run
 /// port1-1: "Scattered"). Only fresh slices are exchanged: never mapped,
 /// never written (no commit bit), so every page still reads as zeros and
@@ -2724,7 +2724,7 @@ const FOUR_GIB: usize = 1 << 32;
 /// Guards over the space below 4 GiB. Windows places allocations bottom up,
 /// so the host's own memory (the driver's, heaps, the shader and pipeline
 /// caches read at startup) filled it first: with a large pipeline cache only
-/// 22 MB was left, in pieces, when Grand Theft Auto VI asked for a 185 MB
+/// 22 MB was left, in pieces, when the title asked for a 185 MB
 /// 32-bit placeholder at startup, the request was refused
 /// (`ERROR_NOT_ENOUGH_MEMORY`) and the title stopped at an assertion. The
 /// debug layer's memory did the same. So the free space below 4 GiB is
