@@ -7306,11 +7306,11 @@ mod copied_and_take_tests {
         assert!(shadow.card_dirty_now().is_empty());
 
         // Empty range does not mark dirty.
-        shadow.card_changed(64, 64);
+        shadow.card_changed(NOTED_WORDS, 64, 64);
         assert!(!card.has_dirty.load(Ordering::Acquire));
 
         // Recording runs sets `has_dirty` and exposes them via `card_dirty_now`.
-        shadow.card_changed_runs([(16, 32), (32, 48), (128, 160)].into_iter());
+        shadow.card_changed_runs(NOTED_WORDS, [(16, 32), (32, 48), (128, 160)].into_iter());
         assert!(card.has_dirty.load(Ordering::Acquire));
         assert_eq!(shadow.card_dirty_now(), [(16, 48), (128, 160)]);
 
@@ -7327,7 +7327,7 @@ mod copied_and_take_tests {
         assert_eq!(card.has_sent.load(Ordering::Acquire), relay());
 
         // `send_up` transitions dirty -> sent and clears `has_sent` once pruned.
-        shadow.card_changed(256, 320);
+        shadow.card_changed(NOTED_WORDS, 256, 320);
         assert!(card.has_dirty.load(Ordering::Acquire));
         assert_eq!(shadow.send_up(20, 0), [(256, 320)]);
         assert!(!card.has_dirty.load(Ordering::Acquire));
@@ -7336,7 +7336,7 @@ mod copied_and_take_tests {
         assert!(!card.has_sent.load(Ordering::Acquire));
 
         // `take_dirty` clears `has_dirty`.
-        shadow.card_changed(400, 464);
+        shadow.card_changed(NOTED_WORDS, 400, 464);
         assert!(card.has_dirty.load(Ordering::Acquire));
         assert_eq!(shadow.take_dirty(), [(400, 464)]);
         assert!(!card.has_dirty.load(Ordering::Acquire));
@@ -7353,16 +7353,16 @@ mod copied_and_take_tests {
             if with_dirty {
                 title[64..80].fill(0x71);
                 side[64..80].fill(0x71);
-                shadow.card_changed(64, 80);
+                shadow.card_changed(NOTED_WORDS, 64, 80);
             }
             if with_sent {
                 title[128..144].fill(0x72);
                 side[128..144].fill(0x72);
-                shadow.card_changed(128, 144);
+                shadow.card_changed(NOTED_WORDS, 128, 144);
                 shadow.send_up(30, 0);
                 // Re-apply dirty after `send_up` cleared it when testing both together.
                 if with_dirty {
-                    shadow.card_changed(64, 80);
+                    shadow.card_changed(NOTED_WORDS, 64, 80);
                 }
             }
             assert_eq!(card.has_dirty.load(Ordering::Acquire), with_dirty);
