@@ -88,7 +88,8 @@ pub(crate) struct Set {
 /// copies, the windows 2 GB of a 2 GB limit and 3.3 GB in a captured frame;
 /// the textures picked by index took the rest of a 32 GB card. On the
 /// smaller cards the copies made first take the room and the later ones
-/// stay in the PC's memory, as before.
+/// stay in the PC's memory, as before. Only the 32 GB row is measured; the
+/// 8 GB and 12 GB rows are guesses still to be measured.
 pub(crate) fn set_for(budget: Option<u64>) -> Option<Set> {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
