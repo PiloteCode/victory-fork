@@ -25,10 +25,12 @@ measured on our card; the figures below are that tree's, on its machines.
   pair went from 135 to 68 ms a frame, the card's time from 63 to 2 ms.
   `VICTORY_TITLE_PREWARM_COUNT=<n>` (new) makes up to 3,584 such buffers
   before the world.
-- **Structured views off 16 bytes** keep their own copy by default, because
-  our translator reads them as raw bytes. `VICTORY_STRUCTURED_RAW=0` leaves
-  them on their buffer's copy as that tree does: there, the copies' lock held
-  the list threads about 40 % of the time. To be tried for the picture first.
+- **Structured views off 16 bytes** stay on their buffer's copy, as in every
+  wave up to 12 (`VICTORY_STRUCTURED_RAW=1` gives them a copy of their own).
+  The rule came with wave 13's layer; on our card it sent 2,270 views a frame
+  to copies of their own and made 400 new ones a frame under one lock: the
+  frame took 171 ms where wave 12 took 87 ms. That tree measured the same on
+  an RTX 4090 (21 to 6 fps) and has the same default.
 - **Bookkeeping of host copies**: a bitmask of uncopied pages, lock-free
   mirrors and an AVX2 `Shadow::take` (Vladimir); refreshes keep the page lock
   through the copy, so a refresh no longer lays older bytes over newer ones.

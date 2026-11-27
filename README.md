@@ -132,7 +132,7 @@ the goal, with what they are by default:
 | `VICTORY_RESIDENCY`, `VICTORY_FALLBACK_HEAPS`, `VICTORY_SWEEP_PER_HEAP`, `VICTORY_XMA_REFILL` | 1 | codec-d/cool_fox's memory budgets, heaps of one slot, the heap buffer pass per heap and XMA refill, as on an RTX 5090 before. |
 | `VICTORY_DSTORAGE_STAGING_MB` | 256 | A DirectStorage staging floor (cool_fox). |
 | `VICTORY_CARD_BUFFERS_MIN_KB`, `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB`, `VICTORY_CARD_RESERVE_BUDGETS=1` | unset | Title buffers from that size up, and the windows shaders read, kept on the card within those budgets; with the last one, textures leave the room (TaynanGT's tree's RTX 4070 preset: 64, 1536, 1024, 1). |
-| `VICTORY_STRUCTURED_RAW=0` | 1 | Structured views off 16 bytes without a copy of their own (one lock fewer for the list threads; our translator reads such views as raw bytes, so look at the picture). |
+| `VICTORY_STRUCTURED_RAW=1` | 0 | Structured views off 16 bytes get a copy of their own bytes. Off: on cards whose heaps have no raw twins (NVIDIA) the rule made 400 copies a frame under one lock and doubled the frame's time. |
 
 Renderer port 5 (`VICTORY_PORT_CBV`) needs the layer underneath's own
 translator and does nothing with ours. `VICTORY_FSR_4K=quality` (Series X

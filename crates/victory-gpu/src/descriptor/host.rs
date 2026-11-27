@@ -1645,21 +1645,22 @@ fn view_bytes() -> bool {
 
 /// Whether a structured view whose slot has no raw twin gets a copy of its own
 /// bytes when it begins off 16 bytes, as if its slot were read as raw bytes
-/// ([`off_elements`]'s `has_raw_twins`). On by default in this tree: our
-/// translator reads a structured slot as raw bytes (a ByteAddressBuffer) for
-/// dword loads, stores and atomics, and a raw view begins on 16 bytes, so a
-/// view off 16 bytes needs its own copy to be read right.
+/// ([`off_elements`]'s `has_raw_twins`). Off by default, and
+/// `VICTORY_STRUCTURED_RAW=1` turns it on.
 ///
-/// `VICTORY_STRUCTURED_RAW=0` leaves those views on their buffer's copy, as
-/// TaynanGT's tree does by default (2b51c6cf): on its RTX 4090 the title's
-/// ring positions sent 265 to 1,968 views a frame here and made 16 to 313 new
-/// copies a frame, each a buffer created under [`crate::shadow::exact`]'s
-/// lock; the list threads waited on it about 40% of the time and the frame
-/// rate fell from 21 to 6 (its translator is not ours). A trial on the card,
-/// for the picture first.
+/// No heap of an NVIDIA card has raw twins, so the rule takes every such view
+/// there. On an RTX 5090 the title's ring positions sent 2,270 views a frame
+/// to [`crate::shadow::exact`], which made 400 new copies a frame, each a
+/// buffer created under its one lock: the threads that translate list calls
+/// took 1,249 ms a frame together where they took 156 ms without the rule,
+/// and the frame 171 ms where it took 87 ms. TaynanGT's tree measured the same
+/// on an RTX 4090 (21 to 6 frames a second) and has the same default (its
+/// commit 2b51c6cf). Such a view begins on one of its own elements, and its
+/// slot showed the right bytes as the structured view it is before the rule:
+/// that is the placement every wave up to 12 was played with.
 fn structured_raw() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_STRUCTURED_RAW").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRUCTURED_RAW").is_some_and(|v| v == "1"))
 }
 
 /// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
