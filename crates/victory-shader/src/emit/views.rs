@@ -5,7 +5,7 @@
 //!
 //! An access is placed when its descriptor is one the code loads from a fixed place in a table
 //! (the place of [`Lower::table_place`]: root parameter, dword in the table), as for
-//! `half_views`. A descriptor the code picks from a table at an index it computes is named by
+//! `half_views`, or a root UAV (the parameter, dword [`ROOT_VIEW`]). A descriptor the code picks from a table at an index it computes is named by
 //! its table only ([`super::super::HostShader::picked_views`]): the host can find which of
 //! the table's views it is only when the program runs. Neither covers a descriptor built in the
 //! code around an address, one fixed in the code, one that differs between lanes, nor the
@@ -17,6 +17,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Fields, Lower, Role, RootType, Source};
+use crate::native::ResourceType;
+
+/// The dword of a place that names a root UAV (a root parameter that is a buffer address, no
+/// table): the view of the parameter itself.
+pub const ROOT_VIEW: u32 = u32::MAX;
 
 /// Bit of [`super::super::HostShader::picked_views`]: views of the table are used with atomics.
 pub const PICKED_ATOMIC: u8 = 1;
@@ -109,6 +114,23 @@ impl Lower<'_> {
                             None => Reach::Other,
                         },
                         None => Reach::Other,
+                    },
+                    // A root UAV (a raw buffer by address, no table): the parameter itself.
+                    Source::Built { address, .. } => match self.x.native.layout.get(address.param) {
+                        Some(rp)
+                            if rp.root == RootType::Descriptor
+                                && self.x.native.used.iter().any(|u| {
+                                    u.user_data == rp.user_data && u.kind == ResourceType::Uav
+                                }) =>
+                        {
+                            let place = (rp.slot, ROOT_VIEW);
+                            if is_atomic {
+                                atomic.insert(place);
+                            }
+                            written.insert(place);
+                            Reach::Placed
+                        }
+                        _ => Reach::Other,
                     },
                     _ => Reach::Other,
                 };

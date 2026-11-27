@@ -160,7 +160,7 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 /// The places of [`HostShader::atomic_views`] and its kin: the bits of
 /// [`HostShader::picked_views`], and the census of the last program lowered on a thread.
-pub use lower::views::{CENSUS as VIEW_CENSUS, PICKED_ATOMIC, PICKED_WRITTEN, take_census as take_view_census};
+pub use lower::views::{CENSUS as VIEW_CENSUS, PICKED_ATOMIC, PICKED_WRITTEN, ROOT_VIEW, take_census as take_view_census};
 pub use rect::rect_list_gs;
 pub use shader::{
     LOOP_NOTE_DWORDS, LOOP_NOTES, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,
