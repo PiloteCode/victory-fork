@@ -82,3 +82,4 @@ codegen-units = 1
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+# (Thin LTO and one codegen unit too, as release: the runs are of this build.)

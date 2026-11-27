@@ -117,10 +117,19 @@ street: standing still, then walking and turning the camera.
 | Series X, 1080p output, ray tracing off | 40 ms (25 fps) | ~43 ms (23 fps) | 42 GB |
 | Series S, ray tracing off | 43 ms (23 fps) | ~64 ms (16 fps) | 37 GB |
 
-Known problems with ray tracing on, being worked on now: lighting flickers and
-swings between too dark and too bright even when nothing moves; dark rooms and
-backgrounds; models and textures stay at their lowest detail for a long time
-while the title streams (worst in the intro); trees flicker.
+Fixed 2026-11-26: trees and palms dropping out for a few frames, and most of the
+lighting swinging between too dark and too bright in lamp-lit rooms. Both came from
+indirect draws whose arguments sit in renderer patch 1's in-place memory being
+prepared before the title's culling had written them; they are now prepared one at
+a time right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on by default, about
+2-5 ms). Rooms lit only by bounced light are no longer black with ray tracing
+(`VICTORY_AMBIENT_RT=0.7,1.5`, which `Play-Watched.ps1 -RayTracing` sets).
+
+Still open: models and textures stay at their lowest detail for a long time while
+the title streams (worst in the intro): the title paces its streaming by its own
+frames, so it loads about three times slower at 10 fps than at 30; ray-traced
+structures of moving objects are partly corrupt (the rays follow some 450 stray
+pointers a frame).
 
 Earlier measurements with ray tracing off:
 
@@ -186,6 +195,19 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
 In this branch `target\diag\victory.exe run <exe> --execute` alone plays with the
 script's switches too (above), all but the stand-in light (`VICTORY_AMBIENT`).
+
+For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
+`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
+`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
+`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
+
+`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
+the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
+and `performance` selects 1920×1080. All three output 3840×2160. With
+`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
+The log reports the provider at context creation and the actual input and
+output sizes at the first successful temporal dispatch. The title profile
+and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
 
 On a hybrid-graphics PC the RX 7900 XTX fork prefers a high-performance
 adapter, with a switch to name one; that choice lives in its translator
