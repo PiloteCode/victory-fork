@@ -22,16 +22,32 @@
 //!     (a constant, mostly): `(x + 0) * k`. A zero x becomes +0, +0 times a positive number
 //!     is +0; any other x is unchanged by the add, so the product is the IEEE product; an
 //!     infinite or NaN x gives what the product gives, k being neither zero nor infinite;
-//!   - a negative constant k: `(0 - x) * -k`, the same with the signs of both factors turned
-//!     (0 - x is +0 for either zero and -x otherwise, exactly);
 //!   - both operands finite, one a whole number wherever it is not a zero (a converted
 //!     integer, a rounded value): `x * y + 0`. A zero operand makes a zero product, which the
 //!     add makes +0; two others make a product at least as large as the other operand,
 //!     never a zero (at least the smallest normal, or the smallest denormal on a host that
 //!     keeps them), which the add leaves as it is.
 //!
-//! Each switch is part of the translation (the shader cache keys on it); with both off each
-//! program is as before, bit for bit.
+//! A negative constant k has no form here. `(0 - x) * -k` is exact by IEEE (0 - x is +0 for
+//! either zero), but the RTX 5090's driver turns `0 - x` into a negation, which makes -0 of
+//! +0 (and of a positive denormal): the product is then -0 where the console gives +0
+//! (`legacy_short_forms_are_the_consoles` on the card). Every other way to make +0 of a zero
+//! times a negative number goes through `0 - y` or a negation of it, which the same rewrite
+//! may reach, so none is used without a measurement on the card.
+//!
+//! A value carried round a loop is a join the lowering fills only once every block is
+//! lowered, so what is asked of it while lowering knows nothing. With `VICTORY_LEGACY_LOOPS`
+//! (on; `=0` turns it off) each multiply left in its default form is noted and looked at again
+//! once every join is filled, with facts settled over the loops to a fixed point
+//! (`Module::legacy_after_joins`): the forms above, under the same switches, in place of the
+//! select. With it the bounds of sums and products are the f32s at or beyond the exact
+//! bounds, not widened by a factor, so a product of values within [0, 1] stays within it; and
+//! a multiply with an operand only ever a zero is +0 itself (the product alone would keep the
+//! other operand's chain alive where the default form's select folds away).
+//!
+//! Each switch is part of the translation (the shader cache keys on it); with all three off
+//! each program is as before, bit for bit, and with `VICTORY_LEGACY_LOOPS=0` alone as before
+//! it.
 
 use super::{Bin, Lower, V};
 use crate::emit::bitcode::facts::{Facts, Made};
@@ -62,31 +78,34 @@ thread_local! {
     pub(crate) static TEST_PLAIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// A test's choice for [`zero_on`], for its thread only.
     pub(crate) static TEST_ZERO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`loops_on`], for its thread only.
+    pub(crate) static TEST_LOOPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The legacy multiplies the lowering left in their default form looked at again once every
+/// join is filled, with facts settled over loops (`VICTORY_LEGACY_LOOPS=0`: not).
+pub(crate) fn loops_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LOOPS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_LOOPS").is_none_or(|v| v != "0"))
 }
 
 /// Which shorter form a legacy multiply of operands with these facts takes, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Form {
+pub(crate) enum Form {
     /// `a * b`.
     Plain,
     /// `(a + 0) * b`, b positive (or with the operands swapped: `(b + 0) * a`).
     AddFirst { swap: bool },
-    /// `(0 - a) * -b`, b a negative constant (or swapped).
-    SubFirst { swap: bool },
     /// `a * b + 0`.
     AddAfter,
 }
 
-/// The form for operands with facts `fa` and `fb` (`b_constant`, `a_constant`: whether each
-/// is a constant), under the switches as given.
-pub(super) fn choose(
-    fa: &Facts,
-    fb: &Facts,
-    a_constant: bool,
-    b_constant: bool,
-    plain: bool,
-    zero: bool,
-) -> Option<Form> {
+/// The form for operands with facts `fa` and `fb`, under the switches as given.
+pub(super) fn choose(fa: &Facts, fb: &Facts, plain: bool, zero: bool) -> Option<Form> {
     // A zero of `x` makes +0 against every value `y` may take.
     let zeros_fine = |x: &Facts, y: &Facts| {
         (!x.pz || (y.finite() && y.plus())) && (!x.nz || (y.finite() && y.minus()))
@@ -97,11 +116,9 @@ pub(super) fn choose(
     if !zero {
         return None;
     }
-    for (swap, k, k_constant) in [(false, fb, b_constant), (true, fa, a_constant)] {
-        match k.sign_of_normal() {
-            Some(true) => return Some(Form::AddFirst { swap }),
-            Some(false) if k_constant => return Some(Form::SubFirst { swap }),
-            _ => {}
+    for (swap, k) in [(false, fb), (true, fa)] {
+        if k.sign_of_normal() == Some(true) {
+            return Some(Form::AddFirst { swap });
         }
     }
     if fa.finite() && fb.finite() && (fa.least >= 1.0 || fb.least >= 1.0) {
@@ -119,8 +136,14 @@ impl Lower<'_> {
             return None;
         }
         let (fa, fb) = (self.s.m.facts(a), self.s.m.facts(b));
-        let (ka, kb) = (self.s.m.float_bits(a), self.s.m.float_bits(b));
-        let form = choose(&fa, &fb, ka.is_some(), kb.is_some(), plain, zero)?;
+        // (with `VICTORY_LEGACY_LOOPS`: an operand only ever a zero makes +0 of every input;
+        // the product alone would keep the other operand's chain alive)
+        if loops_on() && (fa.only_zeros() || fb.only_zeros()) {
+            #[cfg(test)]
+            TEST_SHORT.set(TEST_SHORT.get() + 1);
+            return Some(self.s.m.f32(0));
+        }
+        let form = choose(&fa, &fb, plain, zero)?;
         let c = self.cur;
         let r = match form {
             Form::Plain => self.s.m.bin(c, Bin::Mul, a, b),
@@ -128,14 +151,6 @@ impl Lower<'_> {
                 let (x, k) = if swap { (b, a) } else { (a, b) };
                 let zero = self.s.m.f32(0);
                 let x = self.s.m.bin(c, Bin::Add, x, zero);
-                self.s.m.bin(c, Bin::Mul, x, k)
-            }
-            Form::SubFirst { swap } => {
-                let x = if swap { b } else { a };
-                let bits = if swap { ka } else { kb }.expect("a constant");
-                let zero = self.s.m.f32(0);
-                let x = self.s.m.bin(c, Bin::Sub, zero, x);
-                let k = self.s.m.f32(bits ^ 0x8000_0000);
                 self.s.m.bin(c, Bin::Mul, x, k)
             }
             Form::AddAfter => {
@@ -176,33 +191,38 @@ mod tests {
 
     #[test]
     fn forms_by_what_is_known() {
+        assert_eq!(
+            choose(&UINT, &k(0.5), true, false),
+            Some(Form::Plain)
+        );
+        assert_eq!(
+            choose(&k(0.5), &UINT, true, false),
+            Some(Form::Plain)
+        );
+        // +0 times -0.5 is -0: not the product alone; nor `(0 - x) * 0.5`, which the card
+        // makes -0 of +0. A converted integer is a whole number: `x * -0.5 + 0`.
+        assert_eq!(choose(&UINT, &k(-0.5), true, false), None);
+        assert_eq!(
+            choose(&UINT, &k(-0.5), true, true),
+            Some(Form::AddAfter)
+        );
         let any = Facts::ANY;
+        for x in [-0.5, -4.0, -3.0] {
+            assert_eq!(choose(&any, &k(x), true, true), None, "{x}");
+            assert_eq!(choose(&k(x), &any, true, true), None, "{x}");
+        }
+        assert_eq!(choose(&any, &k(0.5), true, false), None);
         assert_eq!(
-            choose(&UINT, &k(0.5), false, true, true, false),
-            Some(Form::Plain)
-        );
-        assert_eq!(
-            choose(&k(0.5), &UINT, true, false, true, false),
-            Some(Form::Plain)
-        );
-        // +0 times -0.5 is -0: not the product alone.
-        assert_eq!(choose(&UINT, &k(-0.5), false, true, true, false), None);
-        assert_eq!(
-            choose(&UINT, &k(-0.5), false, true, true, true),
-            Some(Form::SubFirst { swap: false })
-        );
-        assert_eq!(choose(&any, &k(0.5), false, true, true, false), None);
-        assert_eq!(
-            choose(&any, &k(0.5), false, true, true, true),
+            choose(&any, &k(0.5), true, true),
             Some(Form::AddFirst { swap: false })
         );
         assert_eq!(
-            choose(&k(3.0), &any, true, false, true, true),
+            choose(&k(3.0), &any, true, true),
             Some(Form::AddFirst { swap: true })
         );
         // Infinity, NaN, zero and denormal constants: no short form.
         for x in [f32::INFINITY, f32::NAN, 0.0, -0.0, 1e-40] {
-            assert_eq!(choose(&any, &k(x), false, true, true, true), None, "{x}");
+            assert_eq!(choose(&any, &k(x), true, true), None, "{x}");
         }
         // A finite value times a whole number.
         let unit = Facts {
@@ -214,18 +234,18 @@ mod tests {
             least: 0.0,
         };
         assert_eq!(
-            choose(&unit, &UINT, false, false, true, true),
+            choose(&unit, &UINT, true, true),
             Some(Form::AddAfter)
         );
-        assert_eq!(choose(&unit, &UINT, false, false, true, false), None);
+        assert_eq!(choose(&unit, &UINT, true, false), None);
         assert_eq!(
-            choose(&unit, &unit, false, false, true, true),
+            choose(&unit, &unit, true, true),
             None,
             "a product may underflow"
         );
-        assert_eq!(choose(&any, &any, false, false, true, true), None);
+        assert_eq!(choose(&any, &any, true, true), None);
         assert_eq!(
-            choose(&UINT, &k(0.5), false, true, false, false),
+            choose(&UINT, &k(0.5), false, false),
             None,
             "both switches off"
         );

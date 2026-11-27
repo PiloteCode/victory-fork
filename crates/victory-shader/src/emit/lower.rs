@@ -6,7 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -51,7 +51,7 @@ mod float64;
 /// The paired form's guarded writes read without their guard where only lanes inside it read
 /// them, a child module so it shares the emitter's state.
 #[path = "guarded.rs"]
-mod guarded;
+pub(super) mod guarded;
 /// A geometry program's LDS rings as its inputs and outputs, a child module so it shares the
 /// emitter's state.
 #[path = "rings.rs"]
@@ -94,6 +94,12 @@ mod descriptors;
 #[path = "image.rs"]
 mod image;
 
+/// Forms only the FidelityFX upscaler's compiler makes (byte dot products, `src_scc`, counter
+/// textures, one lane of what a whole-wave section leaves), a child module so it shares the
+/// emitter's state.
+#[path = "upscaler.rs"]
+mod upscaler;
+
 /// Buffer instructions (loads, stores, atomics, typed loads), a child module so it shares the
 /// emitter's state.
 #[path = "buffer.rs"]
@@ -117,6 +123,13 @@ mod export;
 /// the emitter's state.
 #[path = "official.rs"]
 mod official;
+
+/// 16-bit typed buffer accesses that keep their bits (fxceless #927), a child module so it
+/// shares the emitter's state.
+#[path = "half_bits.rs"]
+mod half_bits;
+#[cfg(test)]
+pub(super) use half_bits::with_half_bits_off;
 
 type Why = &'static str;
 
@@ -148,6 +161,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -304,6 +319,13 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel as integers
+    /// ([`super::HostShader::half_views`]): root parameter, dword in the table.
+    half_views: BTreeSet<(u8, u32)>,
+    /// The places every access through which moves halves, and the format loads read only as
+    /// halves ([`Self::half_places`]), found before the code is lowered.
+    half_only: BTreeSet<(u8, u32)>,
+    half_loads: HashSet<Site>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1123,7 +1145,32 @@ pub(super) fn base_direct_on() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "1" || v == "2"))
+}
+
+/// `VICTORY_WAVE_BASE_DIRECT=2`: as `=1`, for host groups of two and three dimensions too,
+/// numbered by their flattened thread index (x fastest, then y, then z), which NVIDIA and AMD
+/// cut into waves as they cut a one-dimension group's (the same promise D3D12 does not
+/// make). Off by default; a measurement of what the entry meeting costs groups of few threads.
+/// Not for NVIDIA: its 8 x 8 groups do not give a wave consecutive thread indices (why
+/// [`Lower::wave_base`] has its counter), so two waves may take one base there;
+/// [`base_free_on`] saves the meeting without that assumption.
+fn base_direct_any_shape() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_DIRECT").is_some_and(|v| v == "2"))
+}
+
+/// `VICTORY_WAVE_BASE_FREE=1`: the wave bases of [`Lower::wave_base`] from the LDS counter
+/// without its reset and without the group's meeting at the entry, where the counter is a
+/// dword of its own (past the program's LDS) and the host group has a power of two of host
+/// waves. Off by default.
+fn base_free_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BASE_FREE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_BASE_FREE").is_some_and(|v| v == "1"))
 }
 
 #[cfg(test)]
@@ -1141,6 +1188,10 @@ thread_local! {
     pub(super) static TEST_BASE_DIRECT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// The wave bases made from thread indices on this thread ([`Lower::wave_base`]).
     pub(super) static TEST_BASES_DIRECT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A test's choice for [`base_free_on`], for its thread only.
+    pub(super) static TEST_BASE_FREE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The wave bases made without the entry's meeting on this thread ([`base_free_on`]).
+    pub(super) static TEST_BASES_FREE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -1691,6 +1742,9 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: BTreeSet::new(),
+            half_only: BTreeSet::new(),
+            half_loads: HashSet::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2565,6 +2619,9 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        if half_bits::half_bits() {
+            (self.half_only, self.half_loads) = self.half_places();
+        }
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -2703,6 +2760,11 @@ impl<'a> Lower<'a> {
             }
             self.fill_phis()?;
         }
+        // The legacy multiplies left in their default form, again with what every join brings.
+        let (plain, zero) = (legacy::plain_on(), legacy::zero_on());
+        let _shortened = self.s.m.legacy_after_joins(|fa, fb| legacy::choose(fa, fb, plain, zero));
+        #[cfg(test)]
+        legacy::TEST_SHORT.set(legacy::TEST_SHORT.get() + _shortened);
         // A linked stage's signatures without what it leaves out; an input left out must not
         // have been read.
         if !self.drop_in.is_empty() || !self.drop_out.is_empty() {
@@ -2724,6 +2786,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         let form = match () {
@@ -2742,6 +2805,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -3812,6 +3876,7 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.source(v)
             }
+            Operand::Const(upscaler::SRC_SCC) => self.src_scc(inst),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4233,17 +4298,29 @@ impl<'a> Lower<'a> {
             };
             if let Some(x) = tested {
                 let z = self.s.m.cmp(c, pred::OEQ, x, zero);
-                return self.s.m.select(c, z, zero, m);
+                let r = self.s.m.select(c, z, zero, m);
+                return self.legacy_site(m, r, a, b);
             }
             let az = self.s.m.cmp(c, pred::OEQ, ra, zero);
             let bz = self.s.m.cmp(c, pred::OEQ, rb, zero);
             let z = self.s.m.bin(c, Bin::Or, az, bz);
-            return self.s.m.select(c, z, zero, m);
+            let r = self.s.m.select(c, z, zero, m);
+            return self.legacy_site(m, r, a, b);
         }
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
-        self.s.m.select(c, z, zero, m)
+        let r = self.s.m.select(c, z, zero, m);
+        self.legacy_site(m, r, a, b)
+    }
+
+    /// `r`, a legacy multiply of `a` and `b` in its default form (`m` its product), noted for
+    /// a second look once every join is filled (`legacy::loops_on`).
+    fn legacy_site(&mut self, m: V, r: V, a: V, b: V) -> V {
+        if legacy::loops_on() && (legacy::plain_on() || legacy::zero_on()) {
+            self.s.m.legacy_site(m, r, a, b);
+        }
+        r
     }
 
     // ---- lane booleans ----
@@ -4348,14 +4425,15 @@ impl<'a> Lower<'a> {
     /// from an LDS counter instead: every thread zeroes it, the group meets, each wave's first
     /// lane adds 32 (64) and the wave takes what it found. Branch-free, in the entry block,
     /// which every thread runs. With [`base_direct_on`], a host group of one dimension takes
-    /// its wave's first thread index instead.
+    /// its wave's first thread index instead; with [`base_free_on`], the counter goes without
+    /// its reset and the meeting.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        if base_direct_on() && matches!(self.s.threads, Some([_, 1, 1])) {
+        if base_direct_on() && (matches!(self.s.threads, Some([_, 1, 1])) || base_direct_any_shape()) {
             // A host group of one dimension (the paired form's always): NVIDIA and AMD give
             // each wave a run of 32 thread indices in a row, the first a multiple of 32, as
             // the lowering already takes it for a console wave run as one host wave. The
@@ -4375,6 +4453,39 @@ impl<'a> Lower<'a> {
             self.wave_base = Some(base);
             return Some(base);
         }
+        let own_lds = matches!(self.x.native.io, StageIo::Cs(cs) if slot < cs.lds_bytes() / 4);
+        let waves = self.s.threads.map(|[x, y, z]| (x * y * z).div_ceil(32));
+        if base_free_on()
+            && !own_lds
+            && let Some(n) = waves.filter(|n| n.is_power_of_two())
+        {
+            // Without the reset and the meeting: each wave's first lane adds 1 to the counter,
+            // the other lanes 0, and the wave takes what its first lane found modulo the
+            // group's n host waves. The n adds of 1 find X, X + 1, ..., X + n - 1 in some
+            // order, X whatever the dword held (LDS starts undefined; the dword is ours, past
+            // the program's, and nothing else writes it), and n divides 2^32, so the residues
+            // are 0 .. n - 1 once each: the bases are distinct and the same set as the
+            // counter's from zero gives (in the order the waves came). No wave waits for
+            // another.
+            let lds = self.s.lds();
+            let k = self.s.m.i32(slot);
+            let ptr = self.s.m.element(e, lds, k);
+            let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+            let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+            let add = self.s.m.select(e, first, one, zero);
+            let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+            let found = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+            let mask = self.s.m.i32(n - 1);
+            let r = self.s.m.bin(e, Bin::And, found, mask);
+            let shift = self.s.m.i32(if self.twin.is_some() { 6 } else { 5 });
+            let base = self.s.m.bin(e, Bin::Shl, r, shift);
+            self.s.flags |= flags::WAVE_OPS;
+            #[cfg(test)]
+            TEST_BASES_FREE.set(TEST_BASES_FREE.get() + 1);
+            self.wave_base = Some(base);
+            return Some(base);
+        }
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
@@ -4391,7 +4502,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         // a counter in the program's own LDS (the paired form's, when it has no dword to
         // spare): every wave has its base before any thread runs the program
-        if matches!(self.x.native.io, StageIo::Cs(cs) if slot < cs.lds_bytes() / 4) {
+        if own_lds {
             self.group_sync(e);
         }
         self.wave_base = Some(base);
@@ -5387,6 +5498,13 @@ impl<'a> Lower<'a> {
         if once {
             self.inst(b, i)?;
             self.mirror(inst);
+            return Ok(());
+        }
+        // One lane of what a whole-wave section left (`upscaler`).
+        if let Some((w, shape)) = self.section_read(inst, b, i) {
+            if let Err(why) = self.section_read_value(w, shape) {
+                self.put_lanes(w, Val::Missing(why), Val::Missing(why));
+            }
             return Ok(());
         }
         let cross = match name {

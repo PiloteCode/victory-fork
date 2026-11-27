@@ -238,20 +238,20 @@ impl Shader {
 impl Shader {
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
-        use victory_shader::{Container, FourCC};
+        use victory_shader::Container;
         let c = Container::parse(&self.container).ok()?;
-        let part = c.part(FourCC::DXIL)?;
+        let part = c.native_part()?;
         victory_shader::native_programs(part.data).ok()
     }
 }
 
 #[cfg(windows)]
 fn translate(container: &[u8], thread_limited: bool) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
+    let programs = match c.native_part() {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
@@ -276,7 +276,7 @@ fn translate(container: &[u8], thread_limited: bool) -> Result<Translated, Strin
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views);
     Ok(Translated {
         host,
         threads,
@@ -333,7 +333,7 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
+    use victory_shader::Container;
     let [shader] = shaders else { return false };
     if shader.stage != "compute" {
         return false;
@@ -341,7 +341,7 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     let Ok(c) = Container::parse(&shader.container) else {
         return false;
     };
-    c.part(FourCC::DXIL)
+    c.native_part()
         .and_then(|part| victory_shader::native_programs(part.data).ok())
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }

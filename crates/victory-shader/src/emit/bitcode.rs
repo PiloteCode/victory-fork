@@ -232,7 +232,9 @@ pub(crate) struct Module {
     /// The console operations several instructions make ([`facts::Made`]), by the last one.
     made: HashMap<u32, facts::Made>,
     /// What is known of instructions' values so far ([`Module::facts`]).
-    facts_seen: HashMap<u32, facts::Facts>,
+    facts_seen: std::cell::RefCell<HashMap<u32, facts::Facts>>,
+    /// Legacy multiplies left in their default form ([`Module::legacy_site`]).
+    legacy_sites: Vec<[V; 4]>,
 }
 
 impl Module {

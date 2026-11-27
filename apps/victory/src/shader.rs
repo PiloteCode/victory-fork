@@ -130,8 +130,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                 t.with_dxil_part += usize::from(dxil.is_some());
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
-                // Independent of the bitcode: titles may strip it.
-                let code = dxil;
+                // Independent of the bitcode: titles may strip it. (An
+                // `ACCC` part holds code another compiler made, no bitcode.)
+                let code = container.native_part();
                 let native = match code.map(|p| native_programs(p.data)) {
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;

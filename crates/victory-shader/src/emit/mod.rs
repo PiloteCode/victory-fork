@@ -104,6 +104,8 @@ mod early_depth_tests;
 #[cfg(all(test, windows))]
 mod geometry_tests;
 #[cfg(all(test, windows))]
+mod half_bits_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(test, windows))]
 mod loop_tests;
@@ -131,6 +133,8 @@ mod shader;
 mod split;
 mod threading;
 mod trip;
+#[cfg(all(test, windows))]
+mod upscaler_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -487,6 +491,19 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword in the table) through which the shader moves a
+    /// typed buffer's 16-bit channels as unsigned integers, in order (fxceless #927): its d16
+    /// accesses (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`) and its format loads
+    /// read only as half floats. On the console each channel's 16 bits move as they are through
+    /// a 16-bit float view and a 16-bit integer one alike (the title keeps half floats, and
+    /// indices beside them, in `R16G16B16A16_UINT` and `R16_UINT` buffers); an unsigned 16-bit
+    /// view carries the integers unchanged, and the host shows the shader a 16-bit float or
+    /// signed buffer view at these places as the unsigned format of the same layout.
+    /// shortcut: a view of wider, normalised or signed 8-bit channels, whose values the console
+    /// would convert to and from halves, is read and written as its integers; a descriptor
+    /// picked at run time keeps the float path (its slot, and so its format, is known only
+    /// then). Empty with `VICTORY_HALF_BITS=0`.
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -549,7 +566,7 @@ pub fn translate_thread_limited(container: &[u8]) -> Result<HostShader, ShaderEr
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
-        .part(FourCC::DXIL)
+        .native_part()
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
@@ -1345,6 +1362,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     forms::note(&shader.dxil, l.form);
     Ok((shader, wave_size))
@@ -1737,6 +1755,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1749,6 +1768,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2035,6 +2055,7 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2188,6 +2209,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
