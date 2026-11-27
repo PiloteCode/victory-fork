@@ -1,7 +1,8 @@
 //! Forms only the FidelityFX upscaler's compiler makes (its programs come in `ACCC` parts, see
-//! `native::fspx`), lowered as avatarmanz's translator does (66afb2b4, 389db9efb); a child
-//! module of the lowering so it shares the emitter's state. No program of the title's shader
-//! archive runs them: none of their translations changes with these.
+//! `native::fspx`), lowered as avatarmanz's translator does (66afb2b4, 389db9ef, e5841a05); a
+//! child module of the lowering so it shares the emitter's state. No program of the title's
+//! shader archive takes them: none of their translations changes with these (the census is
+//! the same, bit for bit).
 
 use super::super::wave::Shape;
 use super::{
@@ -46,8 +47,9 @@ impl Lower<'_> {
     }
 
     /// `v_dot4_i32_i8` (VOP3P): `op_sel` picks the half each multiplicand's low half reads,
-    /// `op_sel_hi` its high half's (both set, the identity, as assemblers write it); the
-    /// accumulator is read whole (as AMD's compilers fold constants into it).
+    /// `op_sel_hi` its high half's (`op_sel` clear and `op_sel_hi` set, as assemblers write
+    /// it, read the dword as it is); the accumulator is read whole (as AMD's compilers fold
+    /// constants into it).
     fn dot4(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
