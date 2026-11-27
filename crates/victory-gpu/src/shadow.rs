@@ -25,7 +25,6 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 pub(crate) mod placement;
-pub(crate) mod wanted;
 
 /// Per-page last copied write-watch sequence, paired with a 64-page-per-word
 /// bitmask of uncopied pages so partially-initialized buffers and windows
@@ -461,9 +460,6 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: AtomicBool,
-    /// A bind that wanted it in the card's memory found it in the PC's
-    /// (`wanted::found`, counted once).
-    wanted_noted: AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -818,8 +814,8 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64, any_size: bool) -> Option<ID3D12Resource> {
-    let there = card_room_for(size, any_size);
+fn card_for(size: u64) -> Option<ID3D12Resource> {
+    let there = card_room_for(size);
     if there.is_some() || !card_all() || size >= 1 << 30 {
         return there;
     }
@@ -847,14 +843,13 @@ fn card_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
 }
 
-/// [`card_for`] in the card's own memory; `any_size`: under the least size
-/// too ([`wanted`]).
-fn card_room_for(size: u64, any_size: bool) -> Option<ID3D12Resource> {
+/// [`card_for`] in the card's own memory.
+fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
     let (least, most) = card_limits();
-    if (size < least && !any_size) || size >= 1 << 30 {
+    if size < least || size >= 1 << 30 {
         return None;
     }
     let host = host()?;
@@ -4173,7 +4168,6 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
-            wanted_noted: Default::default(),
             mapped: false,
             place: None,
         }
@@ -6043,8 +6037,6 @@ mod land_tests {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
-    /// The title made it to allow unordered access ([`unordered`]).
-    unordered: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -6119,18 +6111,11 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    register_with(resource, start, len, false);
-}
-
-/// [`register`] of a buffer the title made to allow unordered access
-/// (`unordered`): shaders may store to it ([`wanted`]).
-pub(crate) fn register_with(resource: usize, start: u64, len: u64, unordered: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
-            unordered,
         },
     );
 }
@@ -6198,11 +6183,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let shadow = lookup(address, len, false);
-    if let Some(shadow) = &shadow {
-        wanted::found(shadow);
-    }
-    shadow
+    lookup(address, len, false)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -6281,10 +6262,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        // (Or one a shader's atomics or stores want there: `wanted`.)
-        let by_bind = wanted::made_on_card(len);
-        let wanted = by_bind || wanted::unordered_on_card(entry.unordered, len);
-        let big = cards() && (size >= card_limits().0 || card_all() || wanted);
+        let big = cards() && (size >= card_limits().0 || card_all());
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
@@ -6299,11 +6277,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size, wanted) {
+        let (buffer, card) = match card_for(size) {
             Some(on_card) => {
-                if wanted && size < card_limits().0 {
-                    wanted::made(len, !by_bind);
-                }
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),

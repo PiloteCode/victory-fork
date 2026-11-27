@@ -10468,7 +10468,6 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                     cardsync::log(&sync);
-                    crate::shadow::wanted::log();
                 }
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
