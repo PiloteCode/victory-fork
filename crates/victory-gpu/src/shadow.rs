@@ -4785,6 +4785,8 @@ mod land_tests {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// The title made it to allow unordered access ([`unordered`]).
+    unordered: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -4859,11 +4861,18 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    register_with(resource, start, len, false);
+}
+
+/// [`register`] of a buffer the title made to allow unordered access
+/// (`unordered`): shaders may store to it ([`wanted`]).
+pub(crate) fn register_with(resource: usize, start: u64, len: u64, unordered: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
+            unordered,
         },
     );
 }
@@ -5015,7 +5024,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         // (Or one a shader's atomics or stores want there: `wanted`.)
-        let wanted = wanted::made_on_card(len);
+        let by_bind = wanted::made_on_card(len);
+        let wanted = by_bind || wanted::unordered_on_card(entry.unordered, len);
         let big = cards() && (size >= card_limits().0 || card_all() || wanted);
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
@@ -5028,7 +5038,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let (buffer, card) = match card_for(size, wanted) {
             Some(on_card) => {
                 if wanted && size < card_limits().0 {
-                    wanted::made(len);
+                    wanted::made(len, !by_bind);
                 }
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(

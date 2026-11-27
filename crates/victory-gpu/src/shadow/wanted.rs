@@ -51,7 +51,26 @@ fn written_most() -> u64 {
     })
 }
 
-/// Whether anything is asked of this module.
+/// The bytes under which a buffer the title made to allow unordered access
+/// goes to the card, whatever asks for its copy first
+/// (`VICTORY_CARD_UNORDERED_KB`, in KiB; 0, the default: none). The title
+/// says when it makes a buffer whether shaders may store to it: no bind needs
+/// to come first, and nothing has to be moved. What it costs: the title may
+/// allow it on buffers that shaders never write.
+fn unordered_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_CARD_UNORDERED_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 10
+    })
+}
+
+/// Whether a copy of `len` bytes of a buffer the title made to allow
+/// unordered access (`unordered`) goes to the card when it is made.
+pub(super) fn unordered_on_card(unordered: bool, len: u64) -> bool {
+    unordered && cards() && len < unordered_most()
+}
+
+/// Whether binds ask anything of this module.
 fn on() -> bool {
     cards() && (atomic_on_card() || written_most() > 0)
 }
@@ -105,14 +124,23 @@ fn wants(used: Use, len: u64, atomic: bool, most: u64) -> bool {
 }
 
 /// Since the start: copies made on the card for a shader's stores, for its
-/// atomics, and their bytes; copies such a bind found in the PC's memory,
-/// made earlier for another use (each once), and their bytes.
-static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// atomics, for the title's word that shaders may store to the buffer, and
+/// their bytes; copies a bind that wanted them on the card found in the PC's
+/// memory, made earlier for another use (each once), and their bytes.
+static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-/// A copy of `len` bytes was made on the card because [`made_on_card`] said so.
-pub(super) fn made(len: u64) {
-    COUNTS[if USE.get() == Use::Atomic { 1 } else { 0 }].fetch_add(1, Ordering::Relaxed);
-    COUNTS[2].fetch_add(len, Ordering::Relaxed);
+/// A copy of `len` bytes was made on the card because [`made_on_card`] said
+/// so, or (`by_flag`) [`unordered_on_card`].
+pub(super) fn made(len: u64, by_flag: bool) {
+    let i = if by_flag {
+        2
+    } else if USE.get() == Use::Atomic {
+        1
+    } else {
+        0
+    };
+    COUNTS[i].fetch_add(1, Ordering::Relaxed);
+    COUNTS[3].fetch_add(len, Ordering::Relaxed);
 }
 
 /// A bind that would have had `shadow` on the card found it in the PC's
@@ -125,27 +153,29 @@ pub(super) fn found(shadow: &Shadow) {
     {
         return;
     }
-    COUNTS[3].fetch_add(1, Ordering::Relaxed);
-    COUNTS[4].fetch_add(shadow.len, Ordering::Relaxed);
+    COUNTS[4].fetch_add(1, Ordering::Relaxed);
+    COUNTS[5].fetch_add(shadow.len, Ordering::Relaxed);
 }
 
 /// The frame line's (since the start).
 pub(crate) fn log() {
-    if !on() {
+    if !on() && unordered_most() == 0 {
         return;
     }
     let c = COUNTS.each_ref().map(|a| a.load(Ordering::Relaxed));
     tracing::info!(
-        "copies in the card's memory for what shaders do (VICTORY_CARD_ATOMIC={}, VICTORY_CARD_WRITTEN_KB={}), since the start: \
-         {} made there for stores and {} for atomics ({} KB); {} that such a bind found made in the PC's memory already ({} KB), \
-         left there",
+        "copies in the card's memory for what shaders do (VICTORY_CARD_ATOMIC={}, VICTORY_CARD_WRITTEN_KB={}, \
+         VICTORY_CARD_UNORDERED_KB={}), since the start: {} made there for stores, {} for atomics and {} for the title's word \
+         that shaders may store ({} KB); {} that a bind wanting them there found made in the PC's memory already ({} KB), left there",
         u8::from(atomic_on_card()),
         written_most() >> 10,
+        unordered_most() >> 10,
         c[0],
         c[1],
-        c[2] >> 10,
-        c[3],
-        c[4] >> 10,
+        c[2],
+        c[3] >> 10,
+        c[4],
+        c[5] >> 10,
     );
 }
 
