@@ -8828,6 +8828,7 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        let sync = cardsync::taken(frames);
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -8928,7 +8929,7 @@ impl Meter {
                     per_frame(5),
                     per_frame(6) / 1e3
                 );
-                cardsync::log(frames);
+                cardsync::log(&sync);
                 crate::shadow::wanted::log();
             }
             tracing::info!(

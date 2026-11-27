@@ -144,12 +144,20 @@ fn join_ranges_over(ranges: &[(usize, usize)], gap: usize, may: impl Fn(usize, u
 }
 
 /// The frame line's.
-pub(super) fn log(frames: f64) {
+/// The counts since the last call, per frame of `frames` (every frame-rate
+/// line, as `crate::shadow::card_stats`): [`STATS`]' and then
+/// `CARD_NOTED`'s.
+pub(super) fn taken(frames: f64) -> (Vec<f64>, Vec<f64>) {
+    let s = STATS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let n = crate::shadow::CARD_NOTED.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    (s, n)
+}
+
+/// The line of what [`taken`] gave (with the long lines, every few seconds).
+pub(super) fn log((s, n): &(Vec<f64>, Vec<f64>)) {
     if !crate::shadow::cards() {
         return;
     }
-    let s: Vec<f64> = STATS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-    let n: Vec<f64> = crate::shadow::CARD_NOTED.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "copies in the card's memory, what goes up per frame (VICTORY_CARD_JOIN_GAP={}): runs noted {:.0} (refreshed ranges \
          copied whole {:.0}, words refreshes found changed {:.0}, pages landings had written {:.0}, the title's bytes under \
