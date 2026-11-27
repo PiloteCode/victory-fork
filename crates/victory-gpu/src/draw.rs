@@ -5087,6 +5087,38 @@ mod tests {
 }
 
 #[cfg(test)]
+mod view_address_tests {
+    use super::{Root, State};
+    use windows::Win32::Graphics::Direct3D12::D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+
+    /// A program that walks a ray-tracing structure takes the structure's
+    /// address out of its view at a fixed place of a table: the host gives
+    /// it the address the view's description holds (the view has no
+    /// resource, so a buffer's range gave 0, and every walk ended at an
+    /// empty root before its first node test; HyperEndgame's finding in
+    /// fxceless #994).
+    #[test]
+    fn a_structure_view_in_a_table_gives_the_structure_address() {
+        use victory_shader::emit::USER_VIEW_ADDRESS;
+        let null = std::ptr::null();
+        let mut table = vec![0u64; 4 * 2]; // two 32-byte slots
+        let base = table.as_mut_ptr() as u64;
+        let mut desc = [0u32; 10];
+        desc[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+        // (the union begins on 8 bytes: the location is words 4 and 5)
+        desc[4] = 0x2345_6700;
+        desc[5] = 0x12;
+        crate::descriptor::create_srv(null, null, &desc, base + 32);
+        let mut state = State::default();
+        state.compute = vec![Root::None, Root::Table(base)];
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS, 1, 8, None), 0x2345_6700);
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS + 1, 1, 8, None), 0x12);
+        // An empty slot, as before: 0.
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS, 1, 0, None), 0);
+    }
+}
+
+#[cfg(test)]
 mod record_hash_tests {
     use super::{Few, RecordHash};
 
