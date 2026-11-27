@@ -30,11 +30,17 @@ use std::sync::Arc;
 /// (`VICTORY_CARD_JOIN_GAP`; 0: none).
 pub(super) fn join_gap() -> usize {
     static GAP: OnceLock<usize> = OnceLock::new();
-    *GAP.get_or_init(|| std::env::var("VICTORY_CARD_JOIN_GAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_JOIN_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Since the last frame line (the `AT_` places).
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 16] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 /// Copies touched (with ranges to go up), and of them those under 1 MiB.
 const AT_TOUCHED: usize = 0;
 const AT_SMALL: usize = 1;
@@ -97,13 +103,18 @@ pub(super) fn gathered(dirty: &[(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>
 /// the gap is the card's already: not in `air` (title memory flights in the
 /// air may write, joined and in order), and the copy's shaders store nothing
 /// undeclared. Then counts what goes up.
-pub(super) fn join(dirty: &mut [(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)], air: &[(usize, usize)]) {
+pub(super) fn join(
+    dirty: &mut [(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+    air: &[(usize, usize)],
+) {
     let gap = join_gap();
     for (shadow, ranges) in dirty.iter_mut() {
         if gap > 0 && ranges.len() > 1 {
             let start = shadow.span().0 as usize;
             let kept = shadow.stores_kept();
-            let (joined, added, left) = join_ranges_over(ranges, gap, |from, to| !kept && !touches(air, start + from, start + to));
+            let (joined, added, left) = join_ranges_over(ranges, gap, |from, to| {
+                !kept && !touches(air, start + from, start + to)
+            });
             *ranges = joined;
             add(AT_GAP_BYTES, added as u64);
             add(AT_GAPS_KEPT, left as u64);
@@ -122,7 +133,11 @@ pub(super) fn join(dirty: &mut [(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>
 /// `ranges` (in order, apart) with each gap of at most `gap` bytes that
 /// `may(from, to)` allows taken in: the result, the bytes taken in, and the
 /// gaps short enough that were not allowed.
-fn join_ranges_over(ranges: &[(usize, usize)], gap: usize, may: impl Fn(usize, usize) -> bool) -> (Vec<(usize, usize)>, usize, usize) {
+fn join_ranges_over(
+    ranges: &[(usize, usize)],
+    gap: usize,
+    may: impl Fn(usize, usize) -> bool,
+) -> (Vec<(usize, usize)>, usize, usize) {
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     let (mut added, mut left) = (0, 0);
     for &(a, b) in ranges {
@@ -148,8 +163,14 @@ fn join_ranges_over(ranges: &[(usize, usize)], gap: usize, may: impl Fn(usize, u
 /// line, as `crate::shadow::card_stats`): [`STATS`]' and then
 /// `CARD_NOTED`'s.
 pub(super) fn taken(frames: f64) -> (Vec<f64>, Vec<f64>) {
-    let s = STATS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-    let n = crate::shadow::CARD_NOTED.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let s = STATS
+        .iter()
+        .map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames)
+        .collect();
+    let n = crate::shadow::CARD_NOTED
+        .iter()
+        .map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames)
+        .collect();
     (s, n)
 }
 
@@ -201,14 +222,26 @@ mod tests {
     fn ranges_are_joined_over_short_gaps_that_are_allowed() {
         let ranges = [(0, 16), (20, 40), (100, 104), (104, 108), (400, 500)];
         // No gap: only what touches.
-        assert_eq!(join_ranges_over(&ranges, 0, |_, _| true), (vec![(0, 16), (20, 40), (100, 108), (400, 500)], 0, 0));
+        assert_eq!(
+            join_ranges_over(&ranges, 0, |_, _| true),
+            (vec![(0, 16), (20, 40), (100, 108), (400, 500)], 0, 0)
+        );
         // Gaps up to 64 bytes: the first three, not the last.
-        assert_eq!(join_ranges_over(&ranges, 64, |_, _| true), (vec![(0, 108), (400, 500)], 4 + 60, 0));
+        assert_eq!(
+            join_ranges_over(&ranges, 64, |_, _| true),
+            (vec![(0, 108), (400, 500)], 4 + 60, 0)
+        );
         // A gap a flight may write stays.
         let (out, added, left) = join_ranges_over(&ranges, 64, |from, _| from != 16);
-        assert_eq!((out, added, left), (vec![(0, 16), (20, 108), (400, 500)], 60, 1));
+        assert_eq!(
+            (out, added, left),
+            (vec![(0, 16), (20, 108), (400, 500)], 60, 1)
+        );
         // Everything, with a gap as wide as the copy.
-        assert_eq!(join_ranges_over(&ranges, 1 << 20, |_, _| true), (vec![(0, 500)], 4 + 60 + 292, 0));
+        assert_eq!(
+            join_ranges_over(&ranges, 1 << 20, |_, _| true),
+            (vec![(0, 500)], 4 + 60 + 292, 0)
+        );
         assert_eq!(join_ranges_over(&[], 64, |_, _| true), (vec![], 0, 0));
     }
 }

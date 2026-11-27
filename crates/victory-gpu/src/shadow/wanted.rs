@@ -50,7 +50,11 @@ fn atomic_on_card() -> bool {
 fn written_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WRITTEN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 10
+        std::env::var("VICTORY_CARD_WRITTEN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            << 10
     })
 }
 
@@ -63,7 +67,11 @@ fn written_most() -> u64 {
 fn unordered_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_UNORDERED_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 10
+        std::env::var("VICTORY_CARD_UNORDERED_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            << 10
     })
 }
 
@@ -103,7 +111,6 @@ pub(crate) fn asking(wanted: Use) -> Asking {
 fn set(wanted: Use) -> Asking {
     Asking(Some(USE.replace(wanted)))
 }
-
 
 /// Whether a copy of a buffer of `len` bytes made now goes to the card's
 /// memory for what the asking bind does with it.
