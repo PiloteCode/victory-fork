@@ -3885,7 +3885,8 @@ pub(crate) fn settle_for_fence() {
 fn land() {
     // One at a time, so that the flights kept go back in front of the ones
     // that landed meanwhile. A thread that finds another landing leaves it
-    // to that one (the submitting thread lands after every flight it sends).
+    // to that one (the submitting thread lands after every flight it sends,
+    // unless that is left to the helper: [`land_aside`]).
     static LANDING: Mutex<()> = Mutex::new(());
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
@@ -3910,6 +3911,21 @@ fn land() {
     #[cfg(feature = "diagnostics")]
     crate::copystat::landed(began.elapsed().as_nanos() as u64);
 }
+
+/// Whether the thread that sends submissions ahead leaves the landed lists
+/// to the helper thread ([`late_helper`]) instead of resetting them and
+/// giving them back itself after each one it sends (`VICTORY_LAND_ASIDE=1`;
+/// off, as before). With `VICTORY_ASYNC_SUBMIT` that thread is ours and
+/// the frame waits for it; the helper is woken for the landed lists anyway
+/// (by the relay after each landing, by a settle).
+fn land_aside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1"))
+        && HELPER_UP.load(Ordering::Acquire)
+}
+
+/// Whether [`late_helper`] was started.
+static HELPER_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Since the last frame line, microseconds of [`Host::send_late`]: the
 /// submission prepared and sent ([`Host::submit`]); the line of flights
@@ -4061,8 +4077,11 @@ fn late_helper() {
 fn late_threads() {
     static HELPER: std::sync::Once = std::sync::Once::new();
     HELPER.call_once(|| {
-        if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
-            tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
+        match std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
+            Ok(_) => HELPER_UP.store(true, Ordering::Release),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
+            }
         }
         tracing::info!(
             most = late_most(),
@@ -6138,8 +6157,13 @@ impl Host {
         drop(submitted);
         let lined = std::time::Instant::now();
         SENT_LATE_US[1].fetch_add((lined - prepared).as_micros() as u64, Ordering::Relaxed);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        if land_aside() {
+            line().poke = true;
+            LINE_MOVED.notify_one();
+        } else {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
         SENT_LATE_US[2].fetch_add(lined.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
