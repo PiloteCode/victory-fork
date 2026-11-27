@@ -637,6 +637,7 @@ dependencies = [
  "clap",
  "memchr",
  "tempfile",
+ "tracing",
  "victory-core",
  "victory-game",
  "victory-hle",
@@ -644,6 +645,8 @@ dependencies = [
  "victory-pe",
  "victory-shader",
  "walkdir",
+ "windows",
+ "windows-sys",
 ]
 
 [[package]]
@@ -655,6 +658,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -678,6 +682,7 @@ dependencies = [
  "blake3",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
@@ -895,6 +900,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "walkdir",
 ]

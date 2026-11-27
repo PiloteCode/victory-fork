@@ -95,6 +95,10 @@ pub(super) fn stage() -> u32 {
 /// place in a list. The whole submission was refused for it, and stood 40 to
 /// 60 ms until the flights had landed (run n19).
 fn placed_order() -> bool {
+    // Renderer port RT: this order is its part 1.
+    if crate::port_rt::on() {
+        return true;
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
         return on;
@@ -498,7 +502,9 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let (placed, reader) = behind?;
     let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
     let cut = place(placed)? + 1;
-    (place(reader)? >= cut).then_some(cut)
+    let apart = place(reader)? >= cut;
+    crate::port_rt::count(if apart { crate::port_rt::CUT } else { crate::port_rt::SAME_LIST });
+    apart.then_some(cut)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -681,8 +687,11 @@ impl Host {
             }
             (line.written.clone(), copies(&line))
         };
+        let looked = crate::timeline::span("steps on the card: whether in the way");
         blocked_by(&written, runs, false)?;
-        let taken = if copied_read(&copies, runs) {
+        let read = copied_read(&copies, runs);
+        looked.end();
+        let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
             self.take_steps(&written, runs)
@@ -704,13 +713,25 @@ impl Host {
         let (mut does, steps) = does_of(written, runs);
         // (Only where a copy at its place is there at all: some 1,200 steps
         // a submission are looked at for it.)
+        let placed = does.iter().any(|d| matches!(d, Does::Placed { .. }));
         let mut forwarded = 0;
-        if forward::on() && does.iter().any(|d| matches!(d, Does::Placed { .. })) {
+        if forward::on() && placed {
             let (places, shader_writes) = forward::places_of(runs, &steps);
             forwarded = forward::forward(&mut does, &places, &shader_writes);
         }
+        let by_order = placed_order();
         let mut behind = None;
-        let chosen = match plan(&does, stage(), placed_order(), &mut behind) {
+        let chosen = plan(&does, stage(), by_order, &mut behind);
+        if placed {
+            match (&chosen, by_order) {
+                (Err(BEHIND_PLACED), false) => crate::port_rt::count(crate::port_rt::REFUSED_OFF),
+                (Ok(_), true) if plan(&does, stage(), false, &mut None) == Err(BEHIND_PLACED) => {
+                    crate::port_rt::count(crate::port_rt::BY_ORDER)
+                }
+                _ => {}
+            }
+        }
+        let chosen = match chosen {
             Ok(chosen) => chosen,
             Err(why) => {
                 #[cfg(feature = "diagnostics")]
@@ -1029,6 +1050,18 @@ pub(super) fn log(frames: f64) {
     );
     #[cfg(feature = "diagnostics")]
     {
+        let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if r.iter().any(|&n| n > 0.0) {
+            tracing::info!(
+                "what a copy at its place writes, found read on the CPU behind it, per frame (looks, all threads): {:.2} by \
+                 another such copy, {:.2} by a buffer copy, {:.2} by a fill, {:.2} by a texture, {:.2} by a step of ours",
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4]
+            );
+        }
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let mut noted: Vec<_> = noted.into_iter().collect();
         noted.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e.0));
@@ -1148,6 +1181,21 @@ mod tests {
 
     /// A copy at its place in a list is in the way of what reads or writes its
     /// bytes behind it, not of what did ahead of it.
+    /// Renderer port RT is the order's switch too: with it a fill ahead of
+    /// a copy at its place is let through, one behind it still refused.
+    #[test]
+    fn the_port_takes_the_order() {
+        crate::port_rt::PORT_RT_IN_TEST.set(true);
+        assert!(placed_order());
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let by_order = placed_order();
+        assert!(plan(&[fill(2032, 64, true), placed], 2, by_order, &mut None).is_ok());
+        assert_eq!(plan(&[placed, fill(2032, 64, true)], 2, by_order, &mut None), Err(BEHIND_PLACED));
+        crate::port_rt::PORT_RT_IN_TEST.set(false);
+        // Without it (and without VICTORY_PLACED_ORDER) both were refused.
+        assert_eq!(plan(&[fill(2032, 64, true), placed], 2, false, &mut None), Err(BEHIND_PLACED));
+    }
+
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
         let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };

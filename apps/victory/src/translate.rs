@@ -514,7 +514,10 @@ pub(crate) fn report<T>(
 }
 
 /// `victory shaders`: every shader found into the cache runs translate from.
-pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf>) -> Result<()> {
+    // `--list <file>`: every shader that does not translate, one line each:
+    // hash, where it was found, why.
+    let lines = Mutex::new(Vec::<String>::new());
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
@@ -551,8 +554,12 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                                     }
                                 }
                                 Err(why) => {
-                                    let mut failed = lock(&failed);
-                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
+                                    let hex = hash.to_hex()[..16].to_owned();
+                                    if list.is_some() {
+                                        let line = format!("{hex}\t{}{}\t{why}", entry.path().display(), job.label());
+                                        lock(&lines).push(line);
+                                    }
+                                    lock(&failed).entry(why).or_insert((0, hex)).0 += 1;
                                 }
                             }
                         }
@@ -560,6 +567,11 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                 }
             });
         }
+    }
+    if let Some(list) = &list {
+        let mut lines = lines.into_inner().unwrap_or_else(|e| e.into_inner());
+        lines.sort();
+        std::fs::write(list, lines.join("\n") + "\n")?;
     }
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(

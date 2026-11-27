@@ -89,7 +89,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     )
 }
 
-fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
+pub(crate) fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
     let git = |args: &[&str]| -> Result<Option<Vec<String>>> {
         let out = Command::new("git")
             .args(args)
@@ -164,6 +164,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     for (magic, what) in FORBIDDEN_MAGIC {
         if content.starts_with(magic) {
             problems.push(format!("looks like a {what}"));
+        }
+    }
+    if !content.contains(&0) {
+        for line in crate::names::hits(content) {
+            problems.push(format!(
+                "line {line}: a name that must not be in the tree (the asset policy: say \"the title\")"
+            ));
         }
     }
     if content.contains(&0) {

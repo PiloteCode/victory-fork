@@ -78,7 +78,9 @@ fn append_to_log(text: &str) {
         .map_or(0, |d| d.as_secs());
     let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
     if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+        let product = victory_core::product::NAME;
+        let version = victory_core::product::VERSION;
+        let _ = write!(f, "{product} {version}, unix time {now}, process {}\n{text}\n", std::process::id());
     }
 }
 

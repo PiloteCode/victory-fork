@@ -64,6 +64,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// Its part in the light probe (`crate::lightprobe`).
+    #[cfg(windows)]
+    pub(crate) probe: Option<crate::lightprobe::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Its range of the loop notes (`crate::loop_notes`), given out on its
@@ -128,6 +131,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
+                probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(all(windows, feature = "diagnostics"))]
                 loop_slot: OnceLock::new(),
@@ -165,7 +170,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container, self.thread_limited);
+                let done = {
+                    let _translation = crate::timeline::span("pipeline: translate a shader");
+                    translate(&self.container, self.thread_limited)
+                };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -223,6 +231,7 @@ impl Shader {
                     hash: self.hash.clone(),
                     container: self.container.clone(),
                     ambient: self.ambient,
+                    probe: self.probe,
                     translated: OnceLock::new(),
                     #[cfg(feature = "diagnostics")]
                     loop_slot: OnceLock::new(),
@@ -904,6 +913,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    known::flush();
 }
 
 #[cfg(test)]

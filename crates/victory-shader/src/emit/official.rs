@@ -18,7 +18,7 @@ fn on(cell: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
 
 /// A VOP3 output multiplier (`mul:2`, `mul:4`, `div:2`) reads its operand's denormal as a zero
 /// of its sign and gives +0 for a zero or denormal product, as RDNA2 does with IEEE mode off
-/// (measured on gfx1031 and gfx1036 by the Leonida project; official 77053a0c). Ours multiplies
+/// (measured on gfx1031 and gfx1036 by a community project; official 77053a0c). Ours multiplies
 /// on the host, where a zero product keeps its sign. Off by default, `VICTORY_OMOD_ZERO=1` to
 /// turn it on: compilers fold every x2, x4 and x0.5 into an output multiplier, so it adds eight
 /// instructions to 12,276 programs of the title, for the sign of a zero.

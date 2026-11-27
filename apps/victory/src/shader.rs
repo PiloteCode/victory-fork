@@ -2,6 +2,8 @@
 //! and list shader packs, naming each stage's container where one of the
 //! given files holds it.
 
+pub(crate) mod scan;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -86,22 +88,10 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
     let mut packs = Vec::new();
+    let mut scan = scan::FileScan::new(MAX_FILE, verbose);
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE {
-                eprintln!("skipping large file {}", path.display());
-                continue;
-            }
-            let Ok(data) = std::fs::read(path) else {
-                continue;
-            };
+        for (path, data) in scan.files(root) {
+            let path = path.as_path();
             if effects {
                 list_effects(path, &data);
                 continue;
@@ -266,6 +256,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
     for (path, data) in &packs {
         list_pack(path, data, &t, verbose);
     }
+    println!("{scan}");
     Ok(())
 }
 

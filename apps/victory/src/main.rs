@@ -1,15 +1,33 @@
-//! `victory`: the command-line front end.
+//! `pilotebox` (the `victory` package): the command-line front end.
 //!
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
+//!
+//! The commands for playing (`setup`, `play`, `bench`, `check`, `doctor`,
+//! `clean`, `migrate`, `report`) come first; the developers' (`run`,
+//! `shaders`, `warm`, `translate`, `replay` and the others) stay as
+//! upstream has them. A bare `pilotebox` says where things stand.
 
+mod bench;
 mod census;
+mod check;
+mod clean;
 mod defaults;
+mod doctor;
+mod frames;
+mod game;
 mod inspect;
+mod migrate;
+mod play;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
+mod report;
 mod run;
+mod setup;
 mod shader;
+mod state;
+mod status;
+mod sys;
 mod translate;
 mod translate_diff;
 #[cfg(windows)]
@@ -19,21 +37,54 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+
+use victory_core::product;
+
+/// Under the commands in `--help`.
+const AFTER_HELP: &str = "\
+First time: `pilotebox setup`, then `pilotebox play`. A benchmark: `pilotebox bench`. A bare \
+`pilotebox` says where things stand. The switches are PILOTEBOX_* (the VICTORY_* names work too).";
 
 #[derive(Parser)]
 #[command(
-    name = "victory",
-    version,
-    about = "Run an Xbox Series title natively on Windows"
+    name = product::BINARY,
+    version = product::VERSION,
+    about = product::banner(),
+    after_help = AFTER_HELP
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
+    /// The first run in one command: finds the title, writes pilotebox.toml,
+    /// runs doctor, translates the shaders ahead.
+    Setup(setup::Setup),
+    /// Plays the game, found with no path to type (Series X unless --mode s).
+    Play(play::Play),
+    /// A timed run that ends by itself, then its figures, printed and written
+    /// beside the cache folder.
+    #[command(after_help = bench::AFTER_HELP)]
+    Bench(bench::Bench),
+    /// doctor, then a short bench on a copy of the data folder, ending with
+    /// PASS or FAIL.
+    Check(check::Check),
+    /// Checks this PC: card, driver, PCIe link, processor, memory, disk,
+    /// folders, cache, the game's files, other runs.
+    Doctor(doctor::Doctor),
+    /// Lists what in the cache folder is old and removes it with --yes. Never
+    /// the data folder.
+    Clean(clean::Clean),
+    /// Moves from the old %LOCALAPPDATA%\victory to %LOCALAPPDATA%\PiloteBox
+    /// with --yes: the saves copied and checked, never removed.
+    Migrate(migrate::Migrate),
+    /// Writes one text file for a bug report: doctor, the last play and
+    /// benchmark, the logs' last lines, user names taken out.
+    Report(report::Report),
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
         file: PathBuf,
@@ -69,8 +120,9 @@ enum Command {
     /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found (and per pack pipeline).
-        #[arg(long)]
+        /// Print one line per container found (and per pack pipeline), and
+        /// show why paths were skipped.
+        #[arg(short, long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
@@ -82,6 +134,9 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
+    ///
+    /// VICTORY_HOST_WAVE (or VICTORY_HOST_MAX_WAVE) translates as for a host
+    /// of waves that wide, including with --warm.
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -123,13 +178,19 @@ enum Command {
         keys: bool,
     },
     /// Translate every shader found (as `translate` finds them) into the
-    /// shader cache, so that no run has to: a few minutes, once per change
-    /// of the translator.
+    /// shader cache, so that no run has to: a few minutes, once per version
+    /// of the translator. Translations an earlier build of the same version
+    /// cached are made again, and those that came out different counted.
+    /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Also write every shader that does not translate to this file,
+        /// one line each: hash, where it was found, why.
+        #[arg(long)]
+        list: Option<PathBuf>,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -194,19 +255,43 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // `PILOTEBOX_X` stands for `VICTORY_X`, before anything reads either.
+    // SAFETY: no other thread is running yet.
+    unsafe { product::alias_switches() };
+    let first = std::env::args().nth(1);
     // The switches the title is played with, before anything reads them
     // (`defaults`).
-    if std::env::args().nth(1).as_deref() == Some("run") {
+    if first.as_deref() == Some("run") {
+        println!("{}", product::banner());
         defaults::apply();
     }
-    victory_core::logging::init("info");
+    // The checks print their own lines: the layer's, opening the card, are
+    // left out unless they warn.
+    let quiet = matches!(first.as_deref(), Some("doctor" | "check" | "clean" | "setup" | "report" | "migrate"));
+    // A play's log also goes to a file, for `report` (the one before is kept).
+    let play_log = (first.as_deref() == Some("play") && !std::env::args().any(|a| a == "--crash-log"))
+        .then(|| victory_core::Config::load().ok().and_then(|cfg| state::rotate_play_log(&cfg)))
+        .flatten();
+    victory_core::logging::init_with_file(if quiet { "warn" } else { "info" }, play_log.as_deref());
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        status::run(&Cli::command());
+        return Ok(());
+    };
+    match command {
+        Command::Setup(options) => setup::run(options),
+        Command::Play(options) => play::run(options, play_log),
+        Command::Bench(options) => bench::run(options),
+        Command::Doctor(options) => doctor::run(options),
+        Command::Check(options) => check::run(options),
+        Command::Clean(options) => clean::run(options),
+        Command::Migrate(options) => migrate::run(options),
+        Command::Report(options) => report::run(options),
         Command::Inspect {
             file,
             imports,
@@ -245,6 +330,7 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            // (`translate` itself also reads `VICTORY_HOST_MAX_WAVE`)
             if let Some(n) = host_wave {
                 victory_shader::emit::set_host_max_wave(n);
             }
@@ -255,7 +341,7 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, hashes, jobs)
         }
         Command::TranslateDiff { old, new, keys } => translate_diff::run(&old, &new, keys),
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {
@@ -326,11 +412,105 @@ mod tests {
     use super::*;
 
     fn jobs(args: &[&str]) -> Result<Option<usize>, clap::Error> {
-        let all = [&["victory", "translate", "shaders"][..], args].concat();
+        let all = [&["pilotebox", "translate", "shaders"][..], args].concat();
         match Cli::try_parse_from(all)?.command {
-            Command::Translate { jobs, .. } => Ok(jobs.map(NonZeroUsize::get)),
+            Some(Command::Translate { jobs, .. }) => Ok(jobs.map(NonZeroUsize::get)),
             _ => unreachable!(),
         }
+    }
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        let all = [&["pilotebox"][..], args].concat();
+        Ok(Cli::try_parse_from(all)?.command.expect("a command"))
+    }
+
+    #[test]
+    fn the_cli_is_valid_and_named() {
+        Cli::command().debug_assert();
+        assert_eq!(Cli::command().get_name(), "pilotebox");
+        assert!(Cli::try_parse_from(["pilotebox"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn play_takes_a_mode_by_name() {
+        let Command::Play(p) = parse(&["play"]).unwrap() else { panic!() };
+        assert_eq!((p.profile.mode, p.profile.rt, p.profile.safe, p.profile.game), (game::Mode::X, false, false, None));
+        let Command::Play(p) = parse(&["play", "--mode", "s", "--rt", "--safe", "--game", r"D:\g", "--", "-x=1"]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(p.profile.mode, game::Mode::S);
+        assert!(p.profile.rt && p.profile.safe && !p.crash_log);
+        assert_eq!(p.profile.game, Some(PathBuf::from(r"D:\g")));
+        assert_eq!(p.title_args, ["-x=1"]);
+        // The long names too; nothing else.
+        assert!(matches!(parse(&["play", "--mode", "series-s"]), Ok(Command::Play(p)) if p.profile.mode == game::Mode::S));
+        assert!(parse(&["play", "--mode", "one"]).is_err());
+    }
+
+    #[test]
+    fn bench_check_and_clean_take_their_options() {
+        let Command::Bench(b) = parse(&["bench"]).unwrap() else { panic!() };
+        assert_eq!((b.seconds, b.keep_data, b.name.as_deref(), b.keys.as_deref()), (300, false, None, None));
+        let Command::Bench(b) =
+            parse(&["bench", "--seconds", "120", "--mode", "s", "--rt", "--name", "A b", "--keep-data", "--keys", "none"])
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!((b.seconds, b.keep_data, b.keys.as_deref()), (120, true, Some("none")));
+        let options = bench::Options::from(b);
+        assert_eq!(options.label, "A-b");
+        let Command::Bench(b) = parse(&["bench", "--rt"]).unwrap() else { panic!() };
+        assert_eq!(bench::Options::from(b).label, "series-x-rt");
+        assert!(parse(&["bench", "--seconds", "soon"]).is_err());
+        let Command::Check(c) = parse(&["check"]).unwrap() else { panic!() };
+        assert_eq!(c.seconds, 90);
+        let Command::Check(c) = parse(&["check", "--seconds", "30"]).unwrap() else { panic!() };
+        assert_eq!(c.seconds, 30);
+        let Command::Clean(c) = parse(&["clean"]).unwrap() else { panic!() };
+        assert!(!c.all && !c.yes);
+        let Command::Clean(c) = parse(&["clean", "--all", "--yes"]).unwrap() else { panic!() };
+        assert!(c.all && c.yes);
+        assert!(matches!(parse(&["doctor"]), Ok(Command::Doctor(d)) if d.game.is_none()));
+    }
+
+    #[test]
+    fn the_new_commands_take_their_options() {
+        let Command::Setup(s) = parse(&["setup", "--game", r"D:\g", "--no-shaders", "--jobs", "4"]).unwrap() else {
+            panic!()
+        };
+        assert_eq!((s.game, s.no_shaders, s.jobs), (Some(PathBuf::from(r"D:\g")), true, Some(4)));
+        assert!(matches!(parse(&["migrate"]), Ok(Command::Migrate(m)) if !m.yes));
+        assert!(matches!(parse(&["migrate", "--yes"]), Ok(Command::Migrate(m)) if m.yes));
+        assert!(matches!(parse(&["report"]), Ok(Command::Report(r)) if r.game.is_none()));
+        assert!(matches!(parse(&["doctor", "--json"]), Ok(Command::Doctor(d)) if d.json));
+        assert!(matches!(parse(&["bench", "--json"]), Ok(Command::Bench(b)) if b.json));
+        assert!(matches!(parse(&["check", "--json", "--mode", "s"]), Ok(Command::Check(c)) if c.json && c.profile.mode == game::Mode::S));
+        assert!(matches!(parse(&["play", "--crash-log"]), Ok(Command::Play(p)) if p.crash_log));
+    }
+
+    #[test]
+    fn the_status_screen_lists_every_command_once() {
+        let cli = Cli::command();
+        let names: Vec<&str> = cli.get_subcommands().map(|c| c.get_name()).collect();
+        for name in status::PLAYING {
+            assert!(names.contains(&name), "{name}");
+        }
+        // The playing commands come first in --help too.
+        assert_eq!(&names[..status::PLAYING.len()], &["setup", "play", "bench", "check", "doctor", "clean", "migrate", "report"]);
+        assert!(names.contains(&"run") && names.contains(&"shaders") && names.contains(&"warm"));
+    }
+
+    #[test]
+    fn run_keeps_its_interface() {
+        let Command::Run { exe, execute, console, .. } =
+            parse(&["run", r"D:\g\t.exe", "--execute", "--console", "series-s"]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(exe, PathBuf::from(r"D:\g\t.exe"));
+        assert!(execute && matches!(console, Console::SeriesS));
     }
 
     #[test]

@@ -35,13 +35,30 @@ const FAST: &[(&str, &str)] = &[("VICTORY_THIN", "1"), ("VICTORY_JOIN_PARTS", "8
 /// What `-Safe` set in their place.
 const SAFE: &[(&str, &str)] = &[("VICTORY_UNDER_WIDE", "0"), ("VICTORY_LAND_ECHO", "0")];
 
+/// What our wave 12 did unasked, measured on an RTX 5090 (0 tables refused,
+/// the picture right), and the RX 7900 XTX fork made switches of, off there:
+/// codec-d/cool_fox's memory budgets, heaps of one slot where a list sets
+/// none, the heap buffer pass per heap, XMA voices refilled after their end,
+/// a DirectStorage staging floor; and textures at their full size.
+const ARCHIVE: &[(&str, &str)] = &[
+    ("VICTORY_RESIDENCY", "1"),
+    ("VICTORY_FALLBACK_HEAPS", "1"),
+    ("VICTORY_SWEEP_PER_HEAP", "1"),
+    ("VICTORY_XMA_REFILL", "1"),
+    ("VICTORY_DSTORAGE_STAGING_MB", "256"),
+    // The RX 9070 XT work (beloooo, e9428969) skips the largest levels of
+    // streamed textures past 1024 texels a side unless told (0: none), for
+    // cards of 16 GB; with 32 the title's own sizes, as in wave 12.
+    ("VICTORY_TEXTURE_MAX", "0"),
+];
+
 /// The defaults for the value of `VICTORY_PLAY_DEFAULTS` (unset: the play
 /// set; `0`: none; `safe`: the play set without the newest ways).
 fn wanted(choice: Option<&str>) -> Vec<(&'static str, &'static str)> {
     match choice.map(str::trim) {
         Some("0") => Vec::new(),
-        Some("safe") => PLAY.iter().chain(SAFE).copied().collect(),
-        _ => PLAY.iter().chain(FAST).copied().collect(),
+        Some("safe") => PLAY.iter().chain(ARCHIVE).chain(SAFE).copied().collect(),
+        _ => PLAY.iter().chain(ARCHIVE).chain(FAST).copied().collect(),
     }
 }
 
@@ -49,6 +66,16 @@ fn wanted(choice: Option<&str>) -> Vec<(&'static str, &'static str)> {
 /// first thing in `main` for `victory run`, before any thread reads the
 /// environment.
 pub(crate) fn apply() {
+    let set = set();
+    if !set.is_empty() {
+        println!("defaults       {} (VICTORY_PLAY_DEFAULTS=0: none)", set.join(" "));
+    }
+}
+
+/// Sets each default the environment does not set, and returns them as
+/// `NAME=value` (`pilotebox play` says it shorter). Before any thread
+/// reads the environment.
+pub(crate) fn set() -> Vec<String> {
     let choice = std::env::var("VICTORY_PLAY_DEFAULTS").ok();
     let mut set = Vec::new();
     for (name, value) in wanted(choice.as_deref()) {
@@ -59,9 +86,7 @@ pub(crate) fn apply() {
             set.push(format!("{name}={value}"));
         }
     }
-    if !set.is_empty() {
-        println!("defaults       {} (VICTORY_PLAY_DEFAULTS=0: none)", set.join(" "));
-    }
+    set
 }
 
 #[cfg(test)]
@@ -76,7 +101,7 @@ mod tests {
         let names = |choice| wanted(choice).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         let all = names(None);
         assert!(all.contains(&"VICTORY_THIN") && all.contains(&"VICTORY_RELAY_COPY"));
-        assert_eq!(all.len(), PLAY.len() + FAST.len());
+        assert_eq!(all.len(), PLAY.len() + ARCHIVE.len() + FAST.len());
         let safe = names(Some("safe"));
         assert!(!safe.contains(&"VICTORY_THIN") && safe.contains(&"VICTORY_UNDER_WIDE"));
         assert!(names(Some("0")).is_empty());

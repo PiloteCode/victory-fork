@@ -1,0 +1,53 @@
+name: Bug report
+description: Something is wrong (a crash, a hang, a wrong picture). No game is named here and no game files or screenshots are attached.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Write "the title", not a game's name. Do not attach game files, screenshots or recordings: describe the picture in words.
+        Questions about obtaining a game are closed without an answer.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `pilotebox doctor`
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "pilotebox --version, or the commit you built"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Series X profile (default)
+        - Series S profile (--mode s)
+        - with --rt
+        - with --safe
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What you did, what you expected, what happened
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log lines
+      description: The lines around the problem, and the crash log's last entry if there is one. Replace your user name in paths.
+      render: text
+  - type: checkboxes
+    id: tried
+    attributes:
+      label: Tried
+      options:
+        - label: "`pilotebox play --safe` (does the problem stay?)"
+        - label: "a second run (the first run after a build makes pipelines)"
