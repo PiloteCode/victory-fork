@@ -4515,11 +4515,13 @@ impl<'a> Lower<'a> {
         }
         let own_lds = matches!(self.x.native.io, StageIo::Cs(cs) if slot < cs.lds_bytes() / 4);
         // The host wave's lanes (32 with `halves`) and the group's threads. Lanes are counted
-        // with `ticket`, and with `halves` in a group whose last host wave is partial (with
-        // [`ticket_on`]; a fixed 32 a wave could shift the full waves off their alignment).
+        // with `ticket`, and with `halves` in a group of several host waves whose last is
+        // partial (with [`ticket_on`]; a fixed 32 a wave could shift the full waves off their
+        // alignment).
         let w = if self.ticket.is_some() { self.s.wave_size.unwrap_or(32) } else { 32 };
         let group: u32 = self.s.threads.map_or(w, |t| t.iter().product());
-        let counted = self.ticket.is_some() || !group.is_multiple_of(w) && ticket_on();
+        // (a group of one host wave takes base 0 whatever it adds)
+        let counted = self.ticket.is_some() || group > w && !group.is_multiple_of(w) && ticket_on();
         let waves = self.s.threads.map(|[x, y, z]| (x * y * z).div_ceil(32)).filter(|_| !counted);
         if base_free_on()
             && !own_lds

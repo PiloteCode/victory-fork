@@ -2095,3 +2095,71 @@ fn the_thread_ticket_fits_a_full_lds_and_leaves_one_dimensional_groups() {
     let row = shaped([64, 1, 1], 0);
     assert_eq!(lower_with(&row, true).dxil, lower_with(&row, false).dxil, "a row keeps the rounding");
 }
+
+/// A console wave64 program with console lanes (`v_mbcnt`) in a 6 x 6 group: two host waves
+/// of 32 and 4 lanes. Thread (x, y) stores 1 at dword 6y + x; every one of the 36 dwords must
+/// be written once and none past them. With a fixed 32 a wave, the 4-lane wave took base 0
+/// when it came first and the full wave threads 32..63, past the group; the waves now count
+/// their lanes (`VICTORY_THREAD_TICKET`). A group of one host wave (4 x 4) is as before.
+#[test]
+fn a_partial_host_wave_of_a_console_wave_takes_the_threads_after_the_full_ones() {
+    let words = [
+        0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x0001_007E,
+        0x1608_0286, // v_mul_u32_u24 v4, 6, v1
+        0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ];
+    let shaped = |threads: [u32; 3]| {
+        let mut native = native_of(&words, true, 64);
+        native.io = StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | 1 << 11, threads });
+        native
+    };
+    let lower_with = |native: &NativeProgram, ticket: bool| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let was = lower::TEST_THREAD_TICKET.replace(Some(ticket));
+        let shader = lowered_on(native, &p, &HashSet::new(), 32);
+        lower::TEST_THREAD_TICKET.set(was);
+        shader.expect("lower")
+    };
+    let small = shaped([4, 4, 1]);
+    assert_eq!(lower_with(&small, true).dxil, lower_with(&small, false).dxil, "one host wave");
+    let native = shaped([6, 6, 1]);
+    let shader = lower_with(&native, true);
+    assert_ne!(shader.dxil, lower_with(&native, false).dxil, "two host waves, the last partial");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let got = &out[0][..64];
+    let wrong: Vec<usize> = (0..64).filter(|&i| got[i] != u32::from(i < 36)).collect();
+    assert!(wrong.is_empty(), "dwords not as 36 threads write them: {wrong:?}");
+    eprintln!("ran on the hardware device: 36 of 36 console threads, each once");
+}
