@@ -77,12 +77,18 @@ keeps its value:
 | `VICTORY_SWEEP_PER_HEAP` | 1 | the heap buffer pass per view heap (cool_fox) |
 | `VICTORY_XMA_REFILL` | 1 | XMA voices go on after their end (cool_fox) |
 | `VICTORY_DSTORAGE_STAGING_MB` | 256 | a DirectStorage staging floor (cool_fox) |
+| `VICTORY_TEXTURE_MAX` | 0 | streamed textures at their full size (the base caps them at 1024 texels a side for 16 GB cards) |
 
 The renderer ports of the RX 7900 XTX fork are switches, off by default as
 there: `VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_DESCRIPTORS=1`,
 `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1` (its runs had 1, 2, 5, 6 and 7
 on). Port 5, `VICTORY_PORT_CBV`, needs that fork's translator (constant buffers
 read as raw bytes) and does nothing with ours.
+Renderer port RT, `VICTORY_PORT_RT=1` (off by default as there), lets the card
+bring the bytes of a fill of upload memory that a copy at its place declared
+written, instead of the submission waiting for every flight;
+`VICTORY_RT_STAMPS=1` (diagnostics builds) times each compute dispatch on the
+card. `VICTORY_PORT_CONSTANTS_ORDER` (on) matters with port 1 only.
 
 `VICTORY_PLAY_DEFAULTS=0` leaves every one at the layer's own default;
 `VICTORY_PLAY_DEFAULTS=safe` is the script's `-Safe` (no `THIN`, `JOIN_PARTS`,
