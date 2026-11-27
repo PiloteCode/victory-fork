@@ -487,10 +487,7 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
     let (mut does, steps) = does_of(&written, runs);
-    if forward::on() {
-        let (places, shader_writes) = forward::places_of(runs, &steps);
-        forward::forward(&mut does, &places, &shader_writes);
-    }
+    forward::forward(&mut does, || forward::places_of(runs, &steps));
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -710,11 +707,7 @@ impl Host {
         // (Only where a copy at its place is there at all: some 1,200 steps
         // a submission are looked at for it.)
         let placed = does.iter().any(|d| matches!(d, Does::Placed { .. }));
-        let mut forwarded = 0;
-        if forward::on() && placed {
-            let (places, shader_writes) = forward::places_of(runs, &steps);
-            forwarded = forward::forward(&mut does, &places, &shader_writes);
-        }
+        let forwarded = if placed { forward::forward(&mut does, || forward::places_of(runs, &steps)) } else { 0 };
         let by_order = placed_order();
         let mut behind = None;
         let chosen = plan(&does, stage(), by_order, &mut behind);

@@ -53,21 +53,44 @@ fn writes(d: &Does) -> Option<(usize, usize)> {
     }
 }
 
-/// The fills of `does` (step `i` is `steps[i]`: its list by address, its place
-/// in it; `runs` in the submission's order) that read only bytes a copy at its
-/// place ahead of them wrote, where that is the source's (see the module):
-/// each made a fill of the source's bytes, to be done on the card. How many.
-/// `shader_writes`: the title memory a shader declares it writes, at a place
-/// (run, step) of the submission.
+/// The fills of `does` that read only bytes a copy at its place ahead of them
+/// wrote, where that is the source's (see the module): each made a fill of the
+/// source's bytes, to be done on the card. How many. `context` gives, when a
+/// fill may be one, the place (run, step) of each step and the title memory
+/// a shader declares it writes at a place ([`places_of`]).
+///
+/// A submission has some 1,200 steps, thousands of fills and a few copies:
+/// only the copies (and the fills that meet one) are looked at, and the
+/// context is made only for those.
 pub(super) fn forward(
     does: &mut [Does],
-    places: &[(usize, usize)],
-    shader_writes: &[((usize, usize), (usize, usize))],
+    context: impl FnOnce() -> (Vec<(usize, usize)>, Vec<((usize, usize), (usize, usize))>),
 ) -> usize {
-    if !on() || crate::picked::on() || does.iter().any(|d| matches!(d, Does::Run)) {
+    if !on() || crate::picked::on() {
         return 0;
     }
-    let mut n = 0;
+    // The steps that write title memory as copies, in order: few.
+    let writers: Vec<usize> = (0..does.len())
+        .filter(|&j| writes(&does[j]).is_some())
+        .collect();
+    if !writers
+        .iter()
+        .any(|&j| matches!(does[j], Does::Placed { .. }))
+        || does.iter().any(|d| matches!(d, Does::Run))
+    {
+        return 0;
+    }
+    // The last writer ahead of `i` that meets `range`.
+    let last_writer = |i: usize, range: (usize, usize)| {
+        let ahead = writers.partition_point(|&j| j < i);
+        writers[..ahead]
+            .iter()
+            .rev()
+            .copied()
+            .find(|&j| writes(&does[j]).is_some_and(|w| meet(w, range)))
+    };
+    // (fill, copy at its place, the source's bytes it would read)
+    let mut candidates: Vec<(usize, usize, (usize, usize))> = Vec::new();
     for i in 0..does.len() {
         let Does::Fill {
             src: at,
@@ -82,11 +105,7 @@ pub(super) fn forward(
             continue;
         }
         let read = (at, at + len);
-        // The last step ahead of it that writes what it reads.
-        let Some(p) = (0..i)
-            .rev()
-            .find(|&j| writes(&does[j]).is_some_and(|w| meet(w, read)))
-        else {
+        let Some(p) = last_writer(i, read) else {
             continue;
         };
         let Does::Placed {
@@ -100,10 +119,21 @@ pub(super) fn forward(
         if at < dst || at + len > dst + copied {
             continue;
         }
-        let from = (src + (at - dst), src + (at - dst) + len);
+        candidates.push((i, p, (src + (at - dst), src + (at - dst) + len)));
+    }
+    if candidates.is_empty() {
+        return 0;
+    }
+    let (places, shader_writes) = context();
+    let mut taken = Vec::new();
+    for (i, p, from) in candidates {
+        let Does::Fill { src: at, len, .. } = does[i] else {
+            continue;
+        };
+        let read = (at, at + len);
         // Nothing of the submission writes the source's bytes ahead of the
         // copy; no shader writes what the fill reads between the two.
-        let ahead = (0..p).any(|j| writes(&does[j]).is_some_and(|w| meet(w, from)));
+        let ahead = last_writer(p, from).is_some();
         let (copy, fill) = (places[p], places[i]);
         let source = shader_writes
             .iter()
@@ -122,15 +152,17 @@ pub(super) fn forward(
             LEFT[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
+        taken.push((i, from.0, len));
+    }
+    for &(i, src, len) in &taken {
         does[i] = Does::Fill {
-            src: from.0,
+            src,
             len,
             asked: true,
             to: true,
         };
-        n += 1;
     }
-    n
+    taken.len()
 }
 
 /// The places (run, step) of `steps` (list by address, step) in `runs`, and
@@ -189,7 +221,7 @@ mod tests {
             fill(0x9100, 0x10),
         ];
         let places: Vec<(usize, usize)> = (0..4).map(|k| (0, k)).collect();
-        assert_eq!(forward(&mut does, &places, &[]), 2);
+        assert_eq!(forward(&mut does, || (places.clone(), Vec::new())), 2);
         assert_eq!(does[1], fill(0x1000, 0xf0));
         assert_eq!(does[2], fill(0x1010, 0x20));
         // Past the copy's bytes: left.
@@ -216,21 +248,30 @@ mod tests {
             placed,
             fill(0x9000, 0xf0),
         ];
-        assert_eq!(forward(&mut does, &places, &[]), 0);
+        assert_eq!(forward(&mut does, || (places.clone(), Vec::new())), 0);
         // A shader writes the source ahead of the copy, or the ring between it and the fill.
         let mut does = [fill(0x7000, 4), placed, fill(0x9000, 0xf0)];
         assert_eq!(
-            forward(&mut does, &places, &[((0, 0), (0x1080, 0x1090))]),
+            forward(&mut does, || (
+                places.clone(),
+                vec![((0, 0), (0x1080, 0x1090))]
+            )),
             0
         );
         let mut does = [placed, fill(0x7000, 4), fill(0x9000, 0xf0)];
         assert_eq!(
-            forward(&mut does, &places, &[((0, 1), (0x9000, 0x9004))]),
+            forward(&mut does, || (
+                places.clone(),
+                vec![((0, 1), (0x9000, 0x9004))]
+            )),
             0
         );
         // A shader writing the source after the copy changes nothing of it.
         assert_eq!(
-            forward(&mut does, &places, &[((0, 1), (0x1000, 0x1004))]),
+            forward(&mut does, || (
+                places.clone(),
+                vec![((0, 1), (0x1000, 0x1004))]
+            )),
             1
         );
         // Another copy writes the fill's bytes after the placed one: that one is the last.
@@ -244,9 +285,9 @@ mod tests {
             },
             fill(0x9000, 0xf0),
         ];
-        assert_eq!(forward(&mut does, &places, &[]), 0);
+        assert_eq!(forward(&mut does, || (places.clone(), Vec::new())), 0);
         // A step of ours runs: nothing.
         let mut does = [placed, Does::Run, fill(0x9000, 0xf0)];
-        assert_eq!(forward(&mut does, &places, &[]), 0);
+        assert_eq!(forward(&mut does, || (places.clone(), Vec::new())), 0);
     }
 }

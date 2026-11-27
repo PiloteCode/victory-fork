@@ -143,8 +143,20 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Of [`C::ResetNs`], what the thread of ours that prepares submissions
+    /// did ("victory-submit") and what other threads of ours did; the rest
+    /// is the title's threads'.
+    ResetSubmitNs,
+    ResetOursNs,
+    /// Landed lists given back (`host::land`, the resets among them), by
+    /// the same threads as [`C::ResetSubmitNs`], and the title's.
+    LandSubmitNs,
+    LandOursNs,
+    LandTitleNs,
+    /// Not a counter: how many there are. New ones go above it.
+    Count,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = C::Count as usize;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -506,6 +518,25 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
 #[global_allocator]
 static HEAP: Counting = Counting;
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    /// Every counter can be added to, and the lines read each of them: a
+    /// counter past the banks' length panicked the meter's thread and the
+    /// submitting thread on the card (run integ-p15a-def).
+    #[test]
+    fn every_counter_is_counted_and_logged() {
+        for i in 0..COUNTERS {
+            COUNT[bank()].0[i].fetch_add(1, Relaxed);
+        }
+        add(C::LandTitleNs, 1);
+        reset(1);
+        landed(1);
+        crate::every_line::with_every_line(|| log(1.0));
+    }
+}
 
 #[cfg(test)]
 mod command_tests {
@@ -1100,7 +1131,7 @@ static SUBMITTED_SINCE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 
 /// What a thread that submits did between its submissions and in them
 /// (microseconds; list calls in nanoseconds).
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct Submitter {
     submissions: u64,
     /// From a submission's return to the next one's call: wall time, of it
@@ -1109,10 +1140,15 @@ struct Submitter {
     between_user: u64,
     between_kernel: u64,
     between_ours: u64,
-    /// Waiting for the submission lock; running inside submissions.
+    /// From the call to the start of the preparing (the submission lock,
+    /// the steps done on the card planned, flights waited for, the sweep);
+    /// running inside submissions.
     lock: u64,
     inside_user: u64,
     inside_kernel: u64,
+    /// The thread's name: with `VICTORY_ASYNC_SUBMIT` the submissions are
+    /// ours to prepare, on our "victory-submit" thread, not the title's.
+    name: String,
 }
 
 /// By thread: the submitting threads, and list-call time (nanoseconds,
@@ -1130,6 +1166,40 @@ thread_local! {
     static OURS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// List-call time not yet added to `RECORDERS` (nanoseconds, calls).
     static UNSENT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// What kind of thread this is, for the lines that split time by thread:
+/// 0 the thread of ours that prepares submissions ("victory-submit", with
+/// `VICTORY_ASYNC_SUBMIT`), 1 another thread of ours, 2 one of the title's.
+pub(crate) fn thread_kind() -> usize {
+    thread_local! {
+        static KIND: usize = match std::thread::current().name() {
+            Some("victory-submit") => 0,
+            Some(name) if name.starts_with("victory-") => 1,
+            _ => 2,
+        };
+    }
+    KIND.with(|k| *k)
+}
+
+/// Host lists were reset in `ns`, on this thread.
+pub(crate) fn reset(ns: u64) {
+    add(C::ResetNs, ns);
+    match thread_kind() {
+        0 => add(C::ResetSubmitNs, ns),
+        1 => add(C::ResetOursNs, ns),
+        _ => {}
+    }
+}
+
+/// Landed lists were given back in `ns`, on this thread.
+pub(crate) fn landed(ns: u64) {
+    let at = match thread_kind() {
+        0 => C::LandSubmitNs,
+        1 => C::LandOursNs,
+        _ => C::LandTitleNs,
+    };
+    add(at, ns);
 }
 
 fn thread_id() -> u32 {
@@ -1167,7 +1237,8 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     let at = match all.iter().position(|s| s.0 == id) {
         Some(at) => at,
         None => {
-            all.push((id, Submitter::default()));
+            let name = std::thread::current().name().unwrap_or("a thread of the title").to_owned();
+            all.push((id, Submitter { name, ..Submitter::default() }));
             all.len() - 1
         }
     };
@@ -1395,7 +1466,9 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "frame account per frame: after a present {:.1} ms until the first list call and {:.1} ms \
          until the first submission; {:.1} ms from the last submission to the present call; \
-         lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
+         lists reset in {:.1} ms ({:.1} on the thread of ours that prepares submissions, {:.1} on our other \
+         threads, {:.1} on the title's); landed lists given back in {:.1} ms on the first, {:.1} on our others, \
+         {:.1} on the title's (the resets among them); the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
          putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
@@ -1405,6 +1478,12 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::UntilSubmitUs as usize]),
         ms(c[C::TailUs as usize]),
         c[C::ResetNs as usize] / 1e6,
+        c[C::ResetSubmitNs as usize] / 1e6,
+        c[C::ResetOursNs as usize] / 1e6,
+        (c[C::ResetNs as usize] - c[C::ResetSubmitNs as usize] - c[C::ResetOursNs as usize]).max(0.0) / 1e6,
+        c[C::LandSubmitNs as usize] / 1e6,
+        c[C::LandOursNs as usize] / 1e6,
+        c[C::LandTitleNs as usize] / 1e6,
         ms(c[C::BackScanUs as usize]),
         c[C::BackDiffer as usize],
         ms(c[C::BackSyncUs as usize]),
@@ -1563,9 +1642,11 @@ pub(crate) fn log(frames: f64) {
     for (id, s) in submitters.into_iter().take(4) {
         let per = |v: u64| v as f64 / 1e3 / frames;
         tracing::info!(
-            "  thread {id} submitted {:.1}x/frame: between its submissions {:.1} ms (running \
+            "  thread {id} ({}) submitted {:.1}x/frame: between its submissions {:.1} ms (running \
              {:.1} ms user + {:.1} ms kernel; {:.1} ms in list calls), in them running {:.1} ms \
-             user + {:.1} ms kernel, {:.1} ms waiting for the submission lock",
+             user + {:.1} ms kernel, {:.1} ms from a call to its preparing (the submission lock, the steps on the \
+             card planned, flights waited for, the sweep)",
+            s.name,
             s.submissions as f64 / frames,
             per(s.between),
             per(s.between_user),
