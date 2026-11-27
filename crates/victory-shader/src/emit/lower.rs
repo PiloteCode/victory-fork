@@ -94,6 +94,12 @@ mod descriptors;
 #[path = "image.rs"]
 mod image;
 
+/// Forms only the FidelityFX upscaler's compiler makes (byte dot products, `src_scc`, counter
+/// textures, one lane of what a whole-wave section leaves), a child module so it shares the
+/// emitter's state.
+#[path = "upscaler.rs"]
+mod upscaler;
+
 /// Buffer instructions (loads, stores, atomics, typed loads), a child module so it shares the
 /// emitter's state.
 #[path = "buffer.rs"]
@@ -117,11 +123,6 @@ mod export;
 /// the emitter's state.
 #[path = "official.rs"]
 mod official;
-
-/// Forms only the FidelityFX upscaler's compiler makes (byte dot products, `src_scc`), a
-/// child module so it shares the emitter's state.
-#[path = "upscaler.rs"]
-mod upscaler;
 
 type Why = &'static str;
 
