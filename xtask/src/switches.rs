@@ -6,7 +6,9 @@
 //! appear quoted in at least one Rust file. xtask's own files are left out
 //! of the search: this module's tests name switches of their own.
 //! `CHANGELOG.md` is left out of the documents: it tells what earlier
-//! versions had, switches since gone among them.
+//! versions had, switches since gone among them. So is `docs/taynangt/`:
+//! another tree's own documents, kept as it wrote them, which name switches
+//! of its translator that ours does not read.
 
 use std::collections::BTreeSet;
 
@@ -50,7 +52,10 @@ fn documented_switches_are_read() {
     let read = |path: &String| std::fs::read_to_string(root.join(path)).ok();
     let mut documented = BTreeSet::new();
     let mut doc_of = Vec::new();
-    for path in files.iter().filter(|p| p.ends_with(".md") && p.as_str() != "CHANGELOG.md") {
+    for path in files
+        .iter()
+        .filter(|p| p.ends_with(".md") && p.as_str() != "CHANGELOG.md" && !p.starts_with("docs/taynangt/"))
+    {
         for name in names(&read(path).unwrap_or_default()) {
             doc_of.push((name.clone(), path.clone()));
             documented.insert(name);
