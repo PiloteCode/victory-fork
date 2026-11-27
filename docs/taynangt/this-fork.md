@@ -1,6 +1,13 @@
-# What this repository adds
+# What TaynanGT's tree adds
 
-Vice-Tay carries the work of the trees it comes from (see the README's
+(The documents in this folder are TaynanGT's tree's own, kept for reference
+as it wrote them, apart from its name. "This repository", "the README" and
+`scripts\play.ps1 -Machine ...` mean that tree's; PiloteBox's `play.ps1` has
+no machine presets, the switches they set are named below and in
+[rtx4070-performance.md](rtx4070-performance.md). Where PiloteBox differs
+from what is described here, CHANGELOG.md says so.)
+
+TaynanGT's tree carries the work of the trees it comes from (see the README's
 credits) and the changes below, made and measured on one PC: RTX 4090, Ryzen 9
 9950X3D, 48 GB of RAM, a 4K screen. Each change names the switch that controls it
 where there is one; the default is the behaviour described.

@@ -30,7 +30,7 @@ what each recent session played and measured. Newest first.
 ### Performance panel, 2026-11-26
 
 Build `5963f415`, the branch of
-[#57](https://github.com/TaynanGT/Vice-Tay/pull/57) (main at `22c6eac8` plus the
+#57 (in TaynanGT's tree) (main at `22c6eac8` plus the
 panel). Scripted route, 5 minutes in the world.
 
 | Start screen / world | fps median (p10-p90; 1% low) | ms per frame: preparing, copying back | Game memory median / max | Card memory max, load | Draws / dropped |

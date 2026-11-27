@@ -27,7 +27,7 @@ On top of the NVIDIA settings (threads, the wave-wide list, placed order), which
 | `VICTORY_LEVELS_ON_DEMAND=1` | Texture levels get the card's memory as they're written. |
 | `VICTORY_OUTPUT=1920x1080`, `VICTORY_UPSCALER=6`, `VICTORY_RENDER_SCALE=0.5` | 1080p output drawn at half size by the title's own upscaler: the card stays at about 4.2 GB of its 5.2 GB budget, and the GPU's share of a world frame is small. |
 
-The preset sets no RAM throttle and leaves the title's heartbeat watchdog alone: with these settings the world load passes with the watchdog on (below). The experimental changes in [#96](https://github.com/TaynanGT/Vice-Tay/pull/96) and [#126](https://github.com/TaynanGT/Vice-Tay/pull/126) are separate from the preset (see "Longer sessions").
+The preset sets no RAM throttle and leaves the title's heartbeat watchdog alone: with these settings the world load passes with the watchdog on (below). The experimental changes in #96 (in TaynanGT's tree) and #126 (in TaynanGT's tree) are separate from the preset (see "Longer sessions").
 
 All of them stay under `-Safe`, since without them the world load runs out of RAM. Any one can be overridden with `-More`.
 
@@ -48,7 +48,7 @@ Without a throttle, free RAM in the world touches a few MB at moments, and the g
 
 ### Watchdog-on runs with the list pool disabled
 
-On the same 16 GB laptop, [seven later runs](https://github.com/TaynanGT/Vice-Tay/pull/147#issuecomment-7213344061)
+On the same 16 GB laptop, seven later runs (in TaynanGT's tree)
 used Series S and `-Machine laptop` with
 `-More @{VICTORY_LIST_POOL='0'; VICTORY_OUTPUT='1280x720'; VICTORY_RENDER_SCALE='0.75'}`.
 The control was `main` at `791648b`. The experimental #147 build used a 600 MiB

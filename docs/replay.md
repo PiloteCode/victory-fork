@@ -11,7 +11,7 @@ For one frame's operation listing, create the capture folder first. Use a
 diagnostics build and add the folder and frame number to your usual launch.
 
 ```powershell
--More @{VICTORY_CAPTURE='C:\captures\vice-tay'; VICTORY_CAPTURE_FRAMES='1000'}
+-More @{VICTORY_CAPTURE='C:\captures\frames'; VICTORY_CAPTURE_FRAMES='1000'}
 ```
 
 Read `frame-1000-ops.txt` in the capture folder. A failed preparation for a

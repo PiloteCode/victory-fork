@@ -45,7 +45,7 @@ the window occupancy threshold stays at 80%. `-More` can override individual set
   than repeatedly reading upload memory. This informs the buffer/window
   placement changes here.
 
-Vice-Tay already contains group-uniform barrier checks and wave64 correctness
+TaynanGT's tree already contains group-uniform barrier checks and wave64 correctness
 fixes. They remain intact. The observed baseline spends substantial time on
 submission preparation and CPU snapshots, so memory placement is the first
 optimization tested; no shader speedup is claimed without shader timings.
@@ -73,8 +73,8 @@ stability. Later sampled frames had no CPU buffer snapshots. Memory pressure
 remains: the patched run reached about 25.6 GB private memory on this 32 GB PC.
 
 Raw logs for this local test are in the sibling checkout's ignored `target`
-folder: `D:\Games\cool_fox-archive\target\vice-baseline.err.log` and
-`D:\Games\cool_fox-archive\target\vice-4070.err.log`.
+folder: `D:\Games\cool_fox-archive\target\baseline.err.log` and
+`D:\Games\cool_fox-archive\target\4070.err.log`.
 
 ## Series S check on an RTX 5070 Ti (2026-11-26)
 
@@ -83,7 +83,7 @@ RAM ran the Series S profile with 1920×1080 full-screen output. Both runs used
 the same native Windows release executable based on `e1067ca`, the same local
 water-height readback fixes and measurement code, and identical starting copies of
 the checkpoint, translated shaders, and host pipeline library. Pipeline scheduling
-history was disabled in both. The explicit 4070 preset from [#69](https://github.com/TaynanGT/Vice-Tay/pull/69)
+history was disabled in both. The explicit 4070 preset from #69 (in TaynanGT's tree)
 ran first. It changes the worker counts and the GPU buffer and window budgets together.
 
 The stationary sample starts 400 seconds after launch with the camera facing

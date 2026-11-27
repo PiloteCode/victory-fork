@@ -1,4 +1,4 @@
-# VIctory-NVIDIA changes in Vice-Tay
+# VIctory-NVIDIA changes in TaynanGT's tree
 
 The comparison used [VIctory-NVIDIA at `9d6300f`](https://github.com/trustno1-coder/VIctory-NVIDIA/tree/9d6300fa2dd29cd85ef22b3d6198572a9b5ffe25),
 including its earlier renderer history. Both projects use GPL-3.0-or-later.
@@ -44,7 +44,7 @@ in a diagnostics build. Once the log reports that the capture was written,
 run `scripts\faultbook.ps1 C:\traces\faults.0.bin`. The frequency defaults to
 10 MHz and can be supplied in ticks per second with `-Frequency`.
 
-Vice-Tay already has a 16 GB NVIDIA laptop preset, an opt-in Agility SDK,
+TaynanGT's tree already has a 16 GB NVIDIA laptop preset, an opt-in Agility SDK,
 `VICTORY_D3D12_ADAPTER` for hardware selection, the frame-interval override,
 and diagnostics-only placed-texture filler tracking. The fork's F1 menu and
 live DLSS multipliers belong to its foxhound and Streamline stack. NVIDIA's
