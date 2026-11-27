@@ -8953,7 +8953,8 @@ impl Meter {
         }
         // This fork's caption: its own name, then the frame's figures (the
         // window's own text is not kept in front of them).
-        let text = format!("Pilote Victory | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let name = victory_core::product::NAME;
+        let text = format!("{name} | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

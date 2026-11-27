@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# This fork's program is `pilotebox.exe` (`victory_core::product`); the
+# package and its crate keep upstream's name, `victory`.
+[[bin]]
+name = "pilotebox"
+path = "src/main.rs"
+
 [dependencies]
 victory-core.workspace = true
 victory-pe.workspace = true
@@ -19,6 +25,24 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# `pilotebox doctor` asks the graphics card what a run asks it; `bench`
+# closes a run's window; both read the time, memory, free space, processes.
+windows = { workspace = true, features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true
